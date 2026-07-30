@@ -1,0 +1,59 @@
+# build artifacts
+/bin/
+/bin-pv/
+/bin-probe/
+/obj/
+/vis/
+/out/
+/logs/
+/scratchpad/
+*.data
+
+
+# dev symlinks to local dependency checkouts (to be replaced by pinned submodules)
+extern/*
+/data
+
+# large / generated data (never commit)
+*.vtu
+*.vtp
+*.vti
+*.msh
+*.csv
+*.out
+*.geom
+*.png
+*.svg
+
+# python cache
+__pycache__/
+*.pyc
+
+# fmm3dbie benchmark: compiled drivers + generated meshes/results/logs
+/bench/fmm3dbie/dump_rvnodes
+/bench/fmm3dbie/s_init_sweep
+/bench/fmm3dbie/stell_sinit
+/bench/fmm3dbie/bie_total_setup
+/bench/fmm3dbie/lap_total_setup
+/bench/fmm3dbie/stok_total_setup
+/bench/fmm3dbie/stok_self_setup
+/bench/fmm3dbie/rvnodes_o*.txt
+/bench/fmm3dbie/*.srcvals
+/bench/fmm3dbie/**/*.srcvals
+/bench/fmm3dbie/*_1core.txt
+/bench/fmm3dbie/*_8core.txt
+/bench/fmm3dbie/*.raw.txt
+/build-fmm3d.log
+/build-fmm3dbie.log
+*.pdf
+
+# Claude-generated docs/instructions
+CLAUDE.md
+docs/*.md
+
+# bash scripts
+*.sh
+
+# run artifacts
+*.log
+*.txt
