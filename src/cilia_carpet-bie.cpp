@@ -10,7 +10,10 @@
  * targets, so periodic runs must exceed that (the banner prints node/target counts). Run with
  *   PVFMM_DIR=extern/pvfmm OMP_NUM_THREADS=8 ./bin/cilia_carpet-bie ...
  *
- *   ./bin/cilia_carpet-bie [Npatch order tol Naz R_shaft H_shaft r_fil pressure_drop Nvis fingers]
+ *   ./bin/cilia_carpet-bie [Npatch order tol Naz bot_tip top_tip tilt_deg pdrop Nvis fingers fourier cheb n_axial]
+ *
+ * The cilium shaft radius is LOCKED to R_shaft = 0.25*S (S = L/(2*Npatch)); r_fil = 0.1*R_shaft. This
+ * thin patch-relative shaft is scale-invariant in Npatch (same look / same volume fraction at every grid).
  */
 #include <csbq.hpp>
 #include <stokes_bio.hpp>
@@ -18,6 +21,7 @@
 #include <quad_junctions/plane_cilia_geom.hpp>
 #include <quad_junctions/plane_cilia_hybrid_geom.hpp>   // hybrid base (collar+fillet+cap, no shaft) + slender shafts
 #include <quad_junctions/periodic_flow_utils.hpp>
+#include <chrono>
 #include <cstdlib>
 #include <iomanip>
 #include <iostream>
@@ -100,10 +104,14 @@ void run_flow(const QuadElemList<Real>& base, const SlenderElemList<Real>& shaft
               const Real pressure_drop, const Long Nvis, const bool fingers,
               const Real z_bottom, const Real z_top, const Real R_shaft,
               const std::vector<CiliumCurveFlat<Real>>& curves) {
-  const Real SL_scal = 100.0, DL_scal = 1.0;
+  const Real SL_scal = 1.0, DL_scal = 1.0;
   const Real gmres_tol = std::max(tol, (Real)1e-8);
   const Long gmres_max_iter = 400;
-  constexpr Integer KDIM = 3;
+  constexpr Integer COORD_DIM = 3;   // geometric coordinate dimension (always 3)
+  constexpr Integer KDIM = 3;        // KERNEL TARGET dimension: components of the potential field per point
+                                     // (Stokes velocity = 3; a Laplace kernel would be 1). StokesBIO fixes
+                                     // Stokes so KDIM==3 here, but the visualization below is written in terms
+                                     // of KDIM (not a hardcoded 3) so it follows the kernel's target dimension.
 
   // Combined [base ; shaft] nodes (name-sorted "0_base"<"1_shaft"); the DL jump/mean act on these DOFs.
   Vector<Real> X0, Xn0; Long Nb = 0, Ns = 0;
@@ -137,18 +145,49 @@ void run_flow(const QuadElemList<Real>& base, const SlenderElemList<Real>& shaft
   };
 
   GMRES<Real> solver(comm);
-  KrylovPrecond<Real> krylov;
   Vector<Real> sigma;
   Long niter = 0;
   Vector<Real> rhs = bg_flow_2peri(X0); rhs *= (pressure_drop / L);
-  // SCTL profiling scoped to the GMRES solve (prints t_avg/t_max/f-per-s_avg/f-per-s_max over solver()).
-  // GMRES prints its residual history to stdout as it iterates (SCTL_VERBOSE).
-  Profile::Enable(true); Profile::reset();
-  Profile::Tic("cilia_carpet_gmres_solve", &comm, true);
-  solver(&sigma, BIO, rhs, gmres_tol, gmres_max_iter, false, &niter, &krylov);
+
+  // ===== PROFILING: separately-timed SETUP phase + 5-repeat GMRES solve (averaged per-iteration time). =====
+  // (1) A warm-up solve at loose tol first pages in the PVFMM precomputed operators / CSBQ special-quad tables
+  //     from disk so the timed Setup below measures COMPUTE, not one-off I/O.
+  // (2) ClearSetup -> Tic -> Op.Setup() -> Toc times the near-singular + FMM setup. StokesBIO::Setup() runs
+  //     LayerPotenSL.Setup() then LayerPotenDL.Setup(); each BoundaryIntegralOp::Setup prints child
+  //     SetupSingular / SetupNear timers, so Profile::print shows two "Setup" blocks in order -- SL first,
+  //     then DL -- each with its own SetupSingular / SetupNear (the four setup numbers).
+  // (3) The solve is repeated n_rep times with a FRESH (cleared) Krylov basis each time; each repeat is
+  //     Tic'd as cilia_carpet_gmres_solve<k> so Profile::print reports per-repeat t_avg/t_max/f-per-s, and
+  //     we also print the wall-time average and the averaged per-ITERATION solve time (avg_solve / niter).
+  Profile::Enable(true);
+  { Vector<Real> sigma_warm; KrylovPrecond<Real> kw;                       // warm-up: load matrices (not timed)
+    solver(&sigma_warm, BIO, rhs, (Real)1e-2, gmres_max_iter, false, nullptr, &kw); }
+
+  Profile::reset(); Op.ClearSetup();
+  Profile::Tic("cilia_carpet_setup", &comm, true);
+  Op.Setup();                                                             // SL then DL (see note above)
   Profile::Toc();
-  if (!comm.Rank()) std::cout << "  flow: GMRES converged in " << niter << " iters\n";
+  Profile::print(&comm, {"t_avg", "t_max"});                             // SetupSingular/SetupNear per SL,DL
+  Profile::reset();
+
+  const Integer n_rep = 5;
+  double t_solve_sum = 0;
+  for (Integer rep = 0; rep < n_rep; rep++) {
+    KrylovPrecond<Real> krylov;                                          // cleared each repeat
+    sigma.ReInit(0);
+    const std::string lbl = "cilia_carpet_gmres_solve" + std::to_string(rep);
+    const auto t0 = std::chrono::high_resolution_clock::now();
+    Profile::Tic(lbl.c_str(), &comm, true);
+    solver(&sigma, BIO, rhs, gmres_tol, gmres_max_iter, false, &niter, &krylov);
+    Profile::Toc();
+    t_solve_sum += std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - t0).count();
+  }
   Profile::print(&comm, {"t_avg", "t_max", "f/s_avg", "f/s_max"});
+  const double t_solve_avg = GlobalReduce(t_solve_sum, comm, CommOp::MAX) / n_rep;   // max over ranks, per repeat
+  if (!comm.Rank())
+    std::cout << std::setprecision(6) << "  flow: GMRES converged in " << niter << " iters (" << n_rep
+              << " repeats, cleared Krylov each);  avg solve = " << t_solve_avg
+              << " s,  avg per-iter = " << (niter ? t_solve_avg / niter : 0) << " s\n";
 
   // ---- Dump the SOLVED density sigma onto BOTH element lists for inspection (per-rank layout matches
   // combined_nodes: first Nb*KDIM = base collocation density, next Ns*KDIM = shaft). A qualitatively wrong
@@ -174,10 +213,14 @@ void run_flow(const QuadElemList<Real>& base, const SlenderElemList<Real>& shaft
   // Induced velocity u = BIO(sigma) - u_bg at arbitrary targets (both are XY-periodic).
   const Real zc = (Real)0.5 * (z_bottom + z_top);
   auto eval_induced = [&](const Vector<Real>& Xt) {
+    const Long Nt = Xt.Dim() / COORD_DIM;               // #targets (COORD_DIM coords each)
     Op.SetTargetCoord(Xt);
-    Vector<Real> U(Xt.Dim()); U = 0; BIO(&U, sigma);
-    Vector<Real> Ub = bg_flow_2peri(Xt); Ub *= (pressure_drop / L);
-    U -= Ub; return U;
+    Vector<Real> U(Nt * KDIM); U = 0; BIO(&U, sigma);   // potential field: KDIM comps/target (Laplace 1, Stokes 3)
+    if (KDIM == COORD_DIM) {                            // background flow is a VELOCITY (vector) field -- Stokes only
+      Vector<Real> Ub = bg_flow_2peri(Xt); Ub *= (pressure_drop / L);
+      U -= Ub;
+    }
+    return U;
   };
 
   // ===== Verification 1: periodicity across the x and y faces =====
@@ -223,37 +266,51 @@ void run_flow(const QuadElemList<Real>& base, const SlenderElemList<Real>& shaft
   std::vector<Vec3<Real>> fpts;   // all cilia centerline samples (world coords)
   if (fingers) { std::vector<Vec3<Real>> tmp; for (const auto& c : curves) { cilium_samples<Real>(c, tmp, 128); for (const auto& p : tmp) fpts.push_back(p); } }
   // Mask radius (distance from the tube CENTERLINE). The layer-potential evaluation is inaccurate in a thin
-  // near-field shell just OUTSIDE the surface -> velocity spikes at grid points adjacent to a shaft. A fixed
-  // R_shaft-based margin cannot cover that shell here because the vis-grid spacing h (~0.015) is LARGER than
-  // R_shaft (~0.01): the tube is sub-grid, so the nearest grid points sit in the spiky shell, not inside the
-  // tube. Tie the buffer to the grid resolution instead -- blank anything within ~one cell of the tube
-  // surface: mask_r = R_shaft + QJ_VIS_MASK_CELLS * h (default 1 cell). This also absorbs the centerline-
-  // polyline sampling gap. Over-masks by <=1 cell (sub-grid, and u ~ 0 there by no-slip). Env-tunable.
+  // near-field shell just OUTSIDE the surface -> velocity spikes at grid points adjacent to a shaft. The
+  // buffer is tied to the grid resolution (not just R_shaft) so it covers that shell regardless of tube
+  // size: mask_r = max(rfrac*R_shaft, R_shaft + QJ_VIS_MASK_CELLS * h) (default 1 cell). The h term matters
+  // most when the tube is sub-grid (R_shaft < h). Also absorbs the centerline-polyline sampling gap.
   const Real hgrid = (Real)0.9 * L / (Real)(Nvis > 1 ? Nvis - 1 : 1);   // CubeVolumeVisShifted node spacing
   const char* mc_env = std::getenv("QJ_VIS_MASK_CELLS");
   const Real mask_cells = mc_env ? (Real)std::atof(mc_env) : (Real)1.0;
-  const Real mask_r  = std::max((Real)1.1 * R_shaft, R_shaft + mask_cells * hgrid);
+  // The near-field shell (where the layer-potential FMM eval is inaccurate) scales with the TUBE, not a fixed
+  // grid-cell count, so scale the mask with R: mask_r = max(rfrac*R_shaft, R_shaft + mask_cells*h). rfrac~2
+  // (env QJ_VIS_MASK_RFRAC) covers the shell (~R past the surface) while the h term keeps a sub-grid tube masked.
+  const char* rf_env = std::getenv("QJ_VIS_MASK_RFRAC");
+  const Real mask_rfrac = rf_env ? (Real)std::atof(rf_env) : (Real)2.0;
+  const Real mask_r  = std::max(mask_rfrac * R_shaft, R_shaft + mask_cells * hgrid);
   const Real mask_r2 = mask_r * mask_r;
+  // Near-wall shell: the fat cilium FEET (collar+fillet+cap on the base, not on the slender centerline) and
+  // the wall panels leak the same near-field shell just inside the slab. Blank a layer of thickness mask_r
+  // above the bottom wall / below the top wall. Scales with R, so the thin tube (whose vis grid never samples
+  // this close) is unaffected; the true velocity there is ~0 by no-slip anyway. Env QJ_VIS_WALL_MARGIN.
+  const char* wm_env = std::getenv("QJ_VIS_WALL_MARGIN");
+  const Real wall_margin = wm_env ? (Real)std::atof(wm_env) : mask_r;
   if (!comm.Rank()) std::cout << std::setprecision(4) << "  flow: vis finger mask radius = " << mask_r
-                              << " (R_shaft=" << R_shaft << " + " << mask_cells << " grid-cell h=" << hgrid << ")\n";
+                              << " (=" << (mask_r/R_shaft) << "*R_shaft; R=" << R_shaft << ", h=" << hgrid
+                              << ")   near-wall margin = " << wall_margin << "\n";
 
   CubeVolumeVisShifted<Real> vv(Nvis, (Real)0.9, comm);
   Vector<Real> Xv = vv.GetCoord();
-  const Long Ntrg = Xv.Dim() / 3;
+  const Long Ntrg = Xv.Dim() / COORD_DIM;
   if (!comm.Rank()) std::cout << "  flow: volume grid " << Nvis << "^3, " << (Nvis*Nvis*Nvis) << " targets\n";
-  Vector<Real> U = eval_induced(Xv);
-  Vector<Real> Ubg = bg_flow_2peri(Xv); Ubg *= (pressure_drop / L);
+  Vector<Real> U = eval_induced(Xv);                                 // field: Ntrg*KDIM (KDIM comps/target)
+  Vector<Real> Ubg = bg_flow_2peri(Xv); Ubg *= (pressure_drop / L);  // background VELOCITY (used only for KDIM==3)
   Real umax = 0, uxsum = 0, uysum = 0, uzsum = 0; Long nmid = 0;
   for (Long i = 0; i < Ntrg; i++) {
-    const Real x = Xv[i*3], y = Xv[i*3+1], z = Xv[i*3+2];
-    bool masked = (z < z_bottom || z > z_top);
+    const Real x = Xv[i*COORD_DIM], y = Xv[i*COORD_DIM+1], z = Xv[i*COORD_DIM+2];
+    bool masked = (z < z_bottom + wall_margin || z > z_top - wall_margin);
     if (!masked) for (const auto& p : fpts) {   // inside any cilium tube/cap?
       const Real dx = x-p[0], dy = y-p[1], dz = z-p[2];
       if (dx*dx + dy*dy + dz*dz < mask_r2) { masked = true; break; }
     }
-    if (masked) for (int c = 0; c < 3; c++) U[i*3+c] = 0;
-    umax = std::max(umax, std::sqrt(U[i*3]*U[i*3] + U[i*3+1]*U[i*3+1] + U[i*3+2]*U[i*3+2]));
-    if (std::fabs((double)(z - zc)) < 0.03 && !masked) { uxsum += U[i*3]+Ubg[i*3]; uysum += U[i*3+1]+Ubg[i*3+1]; uzsum += U[i*3+2]+Ubg[i*3+2]; nmid++; }
+    if (masked) for (Integer c = 0; c < KDIM; c++) U[i*KDIM+c] = 0;   // blank all KDIM field components
+    Real u2 = 0; for (Integer c = 0; c < KDIM; c++) u2 += U[i*KDIM+c]*U[i*KDIM+c];
+    umax = std::max(umax, std::sqrt(u2));
+    // mid-gap mean TOTAL velocity (induced + background) -- a Stokes-velocity (KDIM==3) diagnostic only.
+    if (KDIM == 3 && std::fabs((double)(z - zc)) < 0.03 && !masked) {
+      uxsum += U[i*KDIM]+Ubg[i*3]; uysum += U[i*KDIM+1]+Ubg[i*3+1]; uzsum += U[i*KDIM+2]+Ubg[i*3+2]; nmid++;
+    }
   }
   umax = GlobalReduce((double)umax, comm, CommOp::MAX);
   uxsum = GlobalReduce((double)uxsum, comm, CommOp::SUM); uysum = GlobalReduce((double)uysum, comm, CommOp::SUM);
@@ -273,29 +330,44 @@ int main(int argc, char** argv) {
   {
     Comm comm = Comm::World();
 
-    // CLI: [Npatch order tol Naz R_shaft bot_tip top_tip r_fil tilt_deg pdrop Nvis fingers fourier cheb n_axial]
-    // Defaults = the 4x4 slender-shaft carpet: cilia REACH the midplane z=0.5 (both planes), tilted +-x, with
-    // a random per-cilium sine wiggle + collision resolution (env QJ_CILIA_SEED sets the RNG seed).
-    const Integer Npatch   = (argc > 1)  ? std::atoi(argv[1])  : 4;
+    // CLI: [Npatch order tol Naz bot_tip top_tip tilt_deg pdrop Nvis fingers fourier cheb n_axial]
+    // The slender-shaft carpet: cilia REACH the midplane z=0.5 (both planes), tilted +-x, with a random
+    // per-cilium sine wiggle + collision resolution (env QJ_CILIA_SEED sets the RNG seed).
+    const Integer Npatch   = (argc > 1)  ? std::atoi(argv[1])  : 4;   // >=3 required (see guard below)
+    // GUARD: require at least 3x3 patches per wall. At 2x2 the same-column top/bottom cilia both reaching
+    // z=0.5 cannot be reliably separated within the box by the tilt-adjust; >=3x3 gives the cap tilt-adjust +
+    // bounded wiggle enough room to keep them disjoint.
+    SCTL_ASSERT_MSG(Npatch >= 3, "cilia carpet requires Npatch >= 3 (2x2 cilia cannot be separated at the midplane)");
     const Integer order    = (argc > 2)  ? std::atoi(argv[2])  : 12;    // QuadElemList base order (multiple of 4)
     const Real    tol      = (argc > 3)  ? std::atof(argv[3])  : 1e-8;
     const Integer Naz      = (argc > 4)  ? std::atoi(argv[4])  : 8;
-    const Real    R_shaft  = (argc > 5)  ? std::atof(argv[5])  : 0.01;
-    const Real    bot_tip  = (argc > 6)  ? std::atof(argv[6])  : 0.50;  // bottom cilia reach the midplane z=0.5
-    const Real    top_tip  = (argc > 7)  ? std::atof(argv[7])  : 0.50;  // top cilia reach the midplane z=0.5
-    const Real    r_fil    = (argc > 8)  ? std::atof(argv[8])  : 0.004;
-    const Real    tilt_deg = (argc > 9)  ? std::atof(argv[9])  : 30.0;  // nominal tilt (reduced per-column to fit the box)
-    const Real    pdrop    = (argc > 10) ? std::atof(argv[10]) : -1.0;
-    const Long    Nvis     = (argc > 11) ? std::atol(argv[11]) : 60;
-    const bool    fingers  = (argc > 12) ? (std::atoi(argv[12]) != 0) : true;  // volume-vis finger mask toggle
-    const Long    fourier  = (argc > 13) ? std::atol(argv[13]) : 36;    // slender azimuthal Fourier order
-    const Long    cheb     = (argc > 14) ? std::atol(argv[14]) : 10;    // slender Chebyshev order (CSBQ tables)
-    const Integer n_axial_in = (argc > 15) ? std::atoi(argv[15]) : -1;  // slender axial panels/fiber (-1 = auto)
+    // PATCH-RELATIVE shaft (LOCKED): R_shaft = 0.25*S (S = L/(2*Npatch)) -- the thin cilium; r_fil = 0.1*R_shaft.
+    // Scale-invariant: the shaft radius tracks the patch pitch, so the carpet looks the same at every Npatch and
+    // its solid volume fraction is Npatch-independent. H_reach stays box-driven (bot_tip/top_tip). See
+    // cilium_scale_from_patch() in stud_sphere_geom.hpp.
+    const Real    L_box    = 1.0, S_patch = L_box / (Real)(2 * Npatch);
+    const Real    R_shaft  = (Real)0.25 * S_patch;
+    const Real    r_fil    = (Real)0.1 * R_shaft;
+    const Real    bot_tip  = (argc > 5)  ? std::atof(argv[5])  : 0.50;  // bottom cilia reach the midplane z=0.5
+    const Real    top_tip  = (argc > 6)  ? std::atof(argv[6])  : 0.50;  // top cilia reach the midplane z=0.5
+    const Real    tilt_deg = (argc > 7)  ? std::atof(argv[7])  : 10.0;  // nominal tilt (reduced per-column to fit the box).
+                                                                        // 10deg is the largest non-overlapping tilt at the dense
+                                                                        // 8x8 pitch (lateral swing < pitch); larger tilts overlap
+                                                                        // same-plane neighbours. Eases as Npatch drops (wider pitch).
+    const Real    pdrop    = (argc > 8)  ? std::atof(argv[8])  : -1.0;
+    const Long    Nvis     = (argc > 9)  ? std::atol(argv[9])  : 60;
+    const bool    fingers  = (argc > 10) ? (std::atoi(argv[10]) != 0) : true;  // volume-vis finger mask toggle
+    const Long    fourier  = (argc > 11) ? std::atol(argv[11]) : 36;    // slender azimuthal Fourier order
+    const Long    cheb     = (argc > 12) ? std::atol(argv[12]) : 10;    // slender Chebyshev order (CSBQ tables)
+    const Integer n_axial_in = (argc > 13) ? std::atoi(argv[13]) : -1;  // slender axial panels/fiber (-1 = auto)
 
-    const Real L = 1.0, z_bottom = 0.01, z_top = 0.99, S = L / (Real)(2 * Npatch);
+    const Real L = L_box, z_bottom = 0.01, z_top = 0.99, S = S_patch;
     const Real core_frac = 0.40, grade_exp = 1.0;
     const Real tilt_rad = tilt_deg * const_pi<Real>() / 180;
-    const Integer n_straight = 3, n_trans = 3;   // straight base panels, then POU-transition panels
+    // Straight base panels, then POU-transition panels. Each is n*az long with az = 2*pi*R_shaft/Naz.
+    // Env-tunable QJ_N_STRAIGHT / QJ_N_TRANS (default 3).
+    const Integer n_straight = std::getenv("QJ_N_STRAIGHT") ? std::atoi(std::getenv("QJ_N_STRAIGHT")) : 3;
+    const Integer n_trans    = std::getenv("QJ_N_TRANS")    ? std::atoi(std::getenv("QJ_N_TRANS"))    : 3;
     const char* seed_env = std::getenv("QJ_CILIA_SEED");
     const uint64_t seed = seed_env ? (uint64_t)std::strtoull(seed_env, nullptr, 10) : (uint64_t)12345;
     // x&y box-containment buffer: keep every cilium tube+cap at least this far from the periodic cell edges.
@@ -352,7 +424,14 @@ int main(int argc, char** argv) {
                                   << " (>0 => no overlap)  closest pair (" << pci << "," << pcj << ")\n";
     }
 
-    run_flow<Real>(base, shaft, comm, tol, L, pdrop, Nvis, fingers, z_bottom, z_top, R_shaft, curves);
+    // QJ_GEOM_ONLY=1: stop after the geometry build + overlap/watertight/containment report and the
+    // geom/shaft VTK dump (no BIE solve). Lets the (cheap, serial-ish) geometry be validated -- clearance,
+    // box/z containment, node counts -- without paying for the multi-million-node periodic Stokes solve.
+    if (std::getenv("QJ_GEOM_ONLY") && std::atoi(std::getenv("QJ_GEOM_ONLY")) != 0) {
+      if (!comm.Rank()) std::cout << "  QJ_GEOM_ONLY set -- geometry only, skipping the flow solve.\n";
+    } else {
+      run_flow<Real>(base, shaft, comm, tol, L, pdrop, Nvis, fingers, z_bottom, z_top, R_shaft, curves);
+    }
   }
   Comm::MPI_Finalize();
   return 0;

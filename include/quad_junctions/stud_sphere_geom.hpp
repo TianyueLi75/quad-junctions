@@ -86,7 +86,7 @@ template <class Real> void add_cubedsphere(Vector<Real>& X, Integer order, Long 
   for (Integer face = 0; face < 6; face++)
     for (Long iu = 0; iu < PatchPerFace; iu++)
       for (Long iv = 0; iv < PatchPerFace; iv++) {
-        if (face == skipFace && iu == skipIu && iv == skipIv) continue;
+        if ((skipFace < 0 || face == skipFace) && iu == skipIu && iv == skipIv) continue;  // skipFace<0 => skip this (iu,iv) on EVERY face
         for (Integer i = 0; i < order; i++) {
           const Real a = 2 * (iu + nds[i]) / (Real)PatchPerFace - 1;
           for (Integer j = 0; j < order; j++) {
@@ -213,6 +213,18 @@ template <class Real> Vec2<Real> collar_point(Real R_foot, Real S, Real tha, Rea
 template <class Real> Integer collar_Nc(Real R_foot, Real S, Integer Naz) {
   const double pi = (double)const_pi<Real>();
   return std::max<Integer>(1, (Integer)std::ceil(std::log((double)(std::sqrt((Real)2) * S / R_foot)) / std::log(1.0 + 2 * pi / Naz)));
+}
+
+// PATCH-RELATIVE cilium sizing (single source of truth). A cilium is made self-similar to its patch by
+// tying the shaft radius to the patch half-width S: R_shaft = frac*S (frac 0.25 => the thin cilium, a
+// slender collar with ~2 rings at Naz=8, INDEPENDENT of patch count). r_fil and the (sphere) shaft depth
+// H_shaft scale with R_shaft so the finger keeps constant aspect at any density. Carpet H_reach is
+// box-driven and NOT set here. Drivers pass a positive absolute R_shaft to override.
+template <class Real> struct CiliumScale { Real R_shaft, r_fil, H_shaft; };
+template <class Real> CiliumScale<Real> cilium_scale_from_patch(Real S, Real frac = (Real)0.25,
+                                                                Real rfil_k = (Real)0.1, Real hshaft_k = (Real)3) {
+  const Real Rs = frac * S;
+  return CiliumScale<Real>{Rs, rfil_k * Rs, hshaft_k * Rs};
 }
 // ---- NEW on-sphere exact-circle collar (2026-07-24) ----------------------------------------------
 // The legacy collar (collar_point above) builds the annulus in TANGENT-plane 2D coords and applies the
@@ -665,9 +677,9 @@ template <class Real> void add_cilium_stud(Vector<Real>& Xout, Integer order, co
 
 // Does the stud (unflipped) have inward collar normals w.r.t. the sphere? If so we must
 // flip to match the cubed sphere's outward normals.
-template <class Real> bool stud_needs_flip(Integer order, Real R, Real S, Integer Naz, Real r_fil, Real R_shaft = 0.015) {
+template <class Real> bool stud_needs_flip(Integer order, Real R, Real S, Integer Naz, Real r_fil, Real R_shaft = 0.015, Real H_shaft = 0.05) {
   Vector<Real> Xs;
-  add_cilium_stud<Real>(Xs, order, SphereMount<Real>(R), R_shaft, (Real)0.05, r_fil, S, Naz, /*flip=*/false);
+  add_cilium_stud<Real>(Xs, order, SphereMount<Real>(R), R_shaft, H_shaft, r_fil, S, Naz, /*flip=*/false);
   QuadElemList<Real> stud(order, Xs);
   Vector<Real> X, Xn; stud.GetNodeCoord(&X, &Xn, nullptr);
   Real acc = 0; Long n = 0;
@@ -684,7 +696,7 @@ template <class Real> QuadElemList<Real> BuildCiliumStuddedSphere(Integer order,
                                                                  const Comm& comm = Comm::Self(), bool with_shaft = true, bool invert_normals = false, Real H_shaft = 0.05) {
   SCTL_ASSERT_MSG(PatchPerFace % 2 == 1, "PatchPerFace must be odd so the replaced patch is centered on the pole");
   const Real S = R / (Real)PatchPerFace; // stud collar half-width = center-patch half-extent
-  const bool flip = stud_needs_flip<Real>(order, R, S, Naz, r_fil, R_shaft);
+  const bool flip = stud_needs_flip<Real>(order, R, S, Naz, r_fil, R_shaft, H_shaft);
   if (!comm.Rank()) std::cout << "  stud normals " << (flip ? "FLIPPED" : "kept") << " to match sphere outward"
                               << (invert_normals ? " (then whole surface INVERTED -> inward)" : "") << "\n";
   Vector<Real> X;   // built identically on every rank; the ctor slices per `comm`
@@ -741,7 +753,7 @@ template <class Real> QuadElemList<Real> BuildSphereWithCollarFill(Integer order
 // like the plain cubed sphere). Tests whether the single-patch collarfill accuracy holds when the whole
 // surface is collar-tiled — and, at higher Naz, whether a uniformly finer outer rim (no longer a mismatch
 // against plain neighbours) recovers the floor.
-template <class Real> QuadElemList<Real> BuildAllCollarFillSphere(Integer order, Long PatchPerFace, Real R, Integer Naz, Real r_fil, Real grade_exp, Real R_shaft, Integer Nc_in = -1, Integer Ndisk_in = -1, Real core_frac = (Real)0.40, bool with_finger = false, bool circularize = false, const Comm& comm = Comm::Self()) {
+template <class Real> QuadElemList<Real> BuildAllCollarFillSphere(Integer order, Long PatchPerFace, Real R, Integer Naz, Real r_fil, Real grade_exp, Real R_shaft, Integer Nc_in = -1, Integer Ndisk_in = -1, Real core_frac = (Real)0.40, bool with_finger = false, bool circularize = false, const Comm& comm = Comm::Self(), Real H_shaft = (Real)0.05) {
   const Real pi = const_pi<Real>(), R_foot = R_shaft + r_fil, S = R / (Real)PatchPerFace, az = 2*pi*R_shaft/Naz;
   const Integer Nc    = (Nc_in    >= 1) ? Nc_in    : collar_Nc<Real>(R_foot, S, Naz);
   const Integer Ndisk = (Ndisk_in >= 1) ? Ndisk_in : std::max<Integer>(1, (Integer)std::llround((double)(R_foot/az)));
@@ -760,7 +772,7 @@ template <class Real> QuadElemList<Real> BuildAllCollarFillSphere(Integer order,
         const bool is_finger = with_finger;
         Vector<Real> Xp;
         if (is_finger) {
-          add_cilium_stud<Real>(Xp, order, mnt, R_shaft, (Real)0.05, r_fil, S, Naz, /*flip=*/false,
+          add_cilium_stud<Real>(Xp, order, mnt, R_shaft, H_shaft, r_fil, S, Naz, /*flip=*/false,
                                 /*Ns*/-1, /*Nf*/-1, /*Nc*/Nc, /*Ncap*/-1, grade_exp, /*with_shaft*/true, circularize, core_frac);
         } else {
           const CollarField<Real> CF = build_collar_field<Real>(mnt, R_foot, S, Naz, Nc, order, grade_exp);

@@ -4,14 +4,16 @@
  * Builds the studded-sphere QuadElemList BASE (cubed sphere with one pole patch = collar + fillet +
  * butterfly cap, NO shaft) and a CSBQ SlenderElemList straight-cylinder SHAFT, adds BOTH to one
  * BoundaryIntegralOp, and runs the identity checks (DL constant-density identity -> -1/2; interior
- * Green's identity) for Laplace and Stokes. The stud_sphere counterpart of ybifurc-hybrid-bie.cpp;
- * the acceptance bar is PARITY with the pure-quad one-finger floor (stud_sphere-bie).
+ * Green's identity) for Laplace and Stokes. The stud_sphere counterpart of ybifurc-hybrid-bie.cpp.
  *
  * Global node/density ordering is the operator's NAME-SORTED list concatenation: the lists are added
  * as "0_base" then "1_shaft", so every global array here is [base nodes ; shaft nodes] in that order.
  *
+ * A mode keyword is REQUIRED: "centerfinger" (fingers on the 6 face-centre patches) or "flagella"
+ * (every patch a twirling finger). The single-finger default and the "allfinger" mode were removed.
+ *
  *   make bin/stud_sphere-hybrid-bie
- *   OMP_NUM_THREADS=8 ./bin/stud_sphere-hybrid-bie \
+ *   OMP_NUM_THREADS=8 ./bin/stud_sphere-hybrid-bie <centerfinger|flagella> \
  *       [tol Nbeta max_depth R_shaft Nc Naz order r_fil n_axial fourier cheb PatchPerFace flip]
  */
 
@@ -195,37 +197,56 @@ int main(int argc, char** argv) {
   using Real = double;
   {
     const Comm comm = Comm::World();
-    // Optional string mode at argv[1]: "allfinger" = EVERY patch is a straight-shaft hybrid finger;
-    // "flagella" = EVERY patch is a TWIRLING (spiral-centerline) finger (flagella_centerline.hpp). Either
-    // keyword shifts all remaining positional numeric args by one. Otherwise the default single-finger case.
-    const bool allfinger = (argc > 1 && std::string(argv[1]) == "allfinger");
+    // REQUIRED string mode at argv[1]:
+    //   "centerfinger" = hybrid fingers ONLY on the 6 on-axis (face-centre) patches; all other patches plain
+    //                    cubed sphere.
+    //   "flagella"     = EVERY patch is a TWIRLING (spiral-centerline) finger (flagella_centerline.hpp).
+    // The keyword shifts all remaining positional numeric args by one (o=1). The former single-finger default
+    // and the "allfinger" (every-patch straight finger) mode were removed (2026-07-31) -- a mode keyword is
+    // now mandatory.
     const bool flagella  = (argc > 1 && std::string(argv[1]) == "flagella");
-    const int  o = (allfinger || flagella) ? 1 : 0;   // arg offset
-    // Positional CLI (defaults match the pure-quad one-finger case in stud_sphere-bie.cpp).
+    const bool centerfinger = (argc > 1 && std::string(argv[1]) == "centerfinger");
+    SCTL_ASSERT_MSG(flagella || centerfinger,
+        "stud_sphere-hybrid: a mode keyword is required -- 'centerfinger' or 'flagella' "
+        "(the single-finger default and 'allfinger' modes were removed)");
+    const int  o = 1;   // arg offset (a mode keyword is always present)
+    // Positional CLI (numeric args follow the mode keyword; see per-arg comments).
     const Real    tol       = (argc > 1+o) ? (Real)atof(argv[1+o])  : (Real)1e-8;
     const Integer Nbeta     = (argc > 2+o) ? (Integer)atoi(argv[2+o])  : 400;
     const Integer max_depth = (argc > 3+o) ? (Integer)atoi(argv[3+o])  : 30;
-    const Real    R_shaft   = (argc > 4+o) ? (Real)atof(argv[4+o])  : (flagella ? (Real)0.05 : (Real)0.015);   // flagella: match the python tube (0.05)
-    const Integer Nc        = (argc > 5+o) ? (Integer)atoi(argv[5+o])  : -1;
+    const Real    R         = (Real)1;
+    const Long    PatchPerFace = (argc > 12+o) ? (Long)atoi(argv[12+o]) : (flagella ? 1 : 3);   // centerfinger default 3
+    const Real    S         = R / (Real)PatchPerFace;   // patch half-width (drives the patch-relative shaft)
+    // PATCH-RELATIVE cilium sizing: a cilium is self-similar to its patch. By default the shaft radius
+    // R_shaft = frac*S (frac from env QJ_RSHAFT_FRAC, default 0.25 -- the thin cilium), r_fil = 0.1*R_shaft,
+    // and the sphere shaft depth H_shaft = k*R_shaft (k from env QJ_HSHAFT_K, default 3). Passing a POSITIVE
+    // explicit value on the CLI overrides any of them (absolute back-compat). See cilium_scale_from_patch().
+    const Real    rshaft_frac = std::getenv("QJ_RSHAFT_FRAC") ? (Real)atof(std::getenv("QJ_RSHAFT_FRAC")) : (Real)0.25;
+    const Real    hshaft_k    = std::getenv("QJ_HSHAFT_K")    ? (Real)atof(std::getenv("QJ_HSHAFT_K"))    : (Real)3;
+    const CiliumScale<Real> csc = cilium_scale_from_patch<Real>(S, rshaft_frac, (Real)0.1, hshaft_k);
+    const Real    R_shaft_arg = (argc > 4+o)  ? (Real)atof(argv[4+o])  : (Real)-1;   // >0 => absolute override
+    const Real    r_fil_arg   = (argc > 8+o)  ? (Real)atof(argv[8+o])  : (Real)-1;
+    const Real    H_shaft_arg = (argc > 14+o) ? (Real)atof(argv[14+o]) : (Real)-1;
+    const Real    R_shaft   = (R_shaft_arg > 0) ? R_shaft_arg : csc.R_shaft;
+    const Real    r_fil     = (r_fil_arg   > 0) ? r_fil_arg   : (Real)0.1 * R_shaft;
+    const Real    H_shaft   = (H_shaft_arg  > 0) ? H_shaft_arg : hshaft_k * R_shaft;   // shaft depth (length ~ H_shaft - r_fil)
+    const Integer Nc        = (argc > 5+o) ? (Integer)atoi(argv[5+o])  : -1;   // -1 => collar_Nc auto (~2 rings at frac 0.5)
     const Integer Naz       = (argc > 6+o) ? (Integer)atoi(argv[6+o])  : 8;
     const Integer order     = (argc > 7+o) ? (Integer)atoi(argv[7+o])  : 16;
-    const Real    r_fil     = (argc > 8+o) ? (Real)atof(argv[8+o])  : (Real)0.005;
     const Integer n_axial_in= (argc > 9+o) ? (Integer)atoi(argv[9+o])  : -1;
     const Long    fourier   = (argc > 10+o) ? (Long)atoi(argv[10+o]) : 12;
     const Long    cheb      = (argc > 11+o) ? (Long)atoi(argv[11+o]) : 10;
-    const Long    PatchPerFace = (argc > 12+o) ? (Long)atoi(argv[12+o]) : (flagella ? 1 : (allfinger ? 3 : 7));
     // Base normal orientation: invert=1 (default) flips the whole base to INWARD normals so the surface
     // matches CSBQ's native radially-outward-from-axis slender normal (consistent orientation).
     const bool    invert    = (argc > 13+o) ? (atoi(argv[13+o]) != 0) : true;
-    const Real    H_shaft   = (argc > 14+o) ? (Real)atof(argv[14+o]) : (allfinger ? (Real)0.4 : (Real)0.05);   // shaft depth (length ~ H_shaft - r_fil)
     // Mesh-geometry knobs for the quad foot (collar+fillet+cap); defaults reproduce prior behaviour.
     const Real    grade_exp = (argc > 15+o) ? (Real)atof(argv[15+o]) : (Real)1;      // collar radial grading
     const Real    core_frac = (argc > 16+o) ? (Real)atof(argv[16+o]) : (Real)0.40;   // butterfly-cap core half-size
     const Integer cap_Naz   = (argc > 17+o) ? (Integer)atoi(argv[17+o]) : -1;        // cap azimuthal, DECOUPLED from foot Naz (-1 => = Naz)
     const Real    axial_grade = (argc > 18+o) ? (Real)atof(argv[18+o]) : (Real)0;    // slender axial clustering toward both seams (0=uniform..1=cosine)
     const Integer Nf_in     = (argc > 19+o) ? (Integer)atoi(argv[19+o]) : -1;        // fillet (rounded lip) panels; -1=auto (~1 for small r_fil)
-    const Real    trans_depth = (argc > 20+o) ? (Real)atof(argv[20+o]) : (Real)0;    // POU transition-tube depth beyond the fillet (0=fillet only); slender attaches at r_fil+trans_depth
-    const Integer Ns_trans  = (argc > 21+o) ? (Integer)atoi(argv[21+o]) : 3;         // transition-tube cylinder panels (ybifurc recipe: >=3)
+    // (argv 20+o and 21+o are now unused dead slots -- they were the POU transition-tube depth / panel
+    //  count consumed only by the removed "allfinger" mode; centerfinger/flagella don't take them.)
     // Near-quadrature coverage order for the QuadElemList base's Hybrid scheme. Must be in {6,10}
     // (the fork's RectPolar-covered tables; ybifurc-hybrid uses 6, this driver historically pinned 10).
     // Exposed to A/B the base<->slender cross-list near quadrature against ybifurc's 1e-10 configuration.
@@ -235,7 +256,6 @@ int main(int argc, char** argv) {
     const Integer lead_panels   = (argc > 23+o) ? (Integer)atoi(argv[23+o]) : 3;
     const Integer corner_panels = (argc > 24+o) ? (Integer)atoi(argv[24+o]) : 8;
     const Integer Ntaper        = (argc > 25+o) ? (Integer)atoi(argv[25+o]) : 5;
-    const Real    R         = (Real)1;
 
     if (flagella) {
       FlagellaCfg<Real> cfg;
@@ -291,81 +311,33 @@ int main(int argc, char** argv) {
       return 0;
     }
 
-    if (allfinger) {
+    if (centerfinger) {
       if (!comm.Rank())
-        std::cout << "\n=== HYBRID all-finger sphere (EVERY patch = QuadElemList foot [collar+fillet+cap]  +  one SlenderElemList radial shaft) ===\n"
+        std::cout << "\n=== HYBRID centre-finger sphere (fingers ONLY on the 6 on-axis face-centre patches; other patches PLAIN cubed sphere) ===\n"
                   << "  order=" << order << " Naz=" << Naz << " R_shaft=" << R_shaft << " r_fil=" << r_fil << " H_shaft=" << H_shaft
                   << " tol=" << tol << " Nbeta=" << Nbeta << " max_depth=" << max_depth
-                  << " fourier=" << fourier << " cheb=" << cheb << " PatchPerFace=" << PatchPerFace << " (fingers=" << (6*PatchPerFace*PatchPerFace) << ")"
+                  << " fourier=" << fourier << " cheb=" << cheb << " PatchPerFace=" << PatchPerFace << " (fingers=6)"
                   << " Nc=" << Nc << " grade_exp=" << grade_exp << " core_frac=" << core_frac
-                  << " cap_Naz=" << cap_Naz << " axial_grade=" << axial_grade << " Nf=" << Nf_in
-                  << " trans_depth=" << trans_depth << " Ns_trans=" << Ns_trans << " cov_q=" << cov_q << "\n";
+                  << " cap_Naz=" << cap_Naz << " axial_grade=" << axial_grade << " Nf=" << Nf_in << " cov_q=" << cov_q << "\n";
       Vector<Real> axis, a_bot, a_top, rho_bot, rho_top;
-      QuadElemList<Real> base = BuildAllFingerSphereBase<Real>(order, PatchPerFace, R, Naz, r_fil, axis, a_bot, a_top, rho_bot, rho_top, grade_exp, R_shaft, H_shaft, comm, invert, core_frac, Nc, cap_Naz, Nf_in, trans_depth, Ns_trans);
-      // overlap safety check
+      QuadElemList<Real> base = BuildCenterFingerSphereBase<Real>(order, PatchPerFace, R, Naz, r_fil, axis, a_bot, a_top, rho_bot, rho_top, grade_exp, R_shaft, H_shaft, comm, invert, core_frac, Nc, cap_Naz, Nf_in);
       Long pi = -1, pj = -1; const Real gap = finger_min_clearance<Real>(axis, a_bot, rho_top, pi, pj);
       if (!comm.Rank()) std::cout << std::setprecision(6) << "  [overlap] min finger clearance = " << gap
                                   << " (>0 => no overlap)  closest pair (" << pi << "," << pj << ")\n";
       SCTL_ASSERT_MSG(gap > 0, "fingers overlap -- reduce PatchPerFace or R_shaft/H_shaft");
+      SCTL_ASSERT_MSG(a_bot[0] > 0, "shaft too deep (a_bot<=0, crosses origin) -- reduce H_shaft/QJ_HSHAFT_K or PatchPerFace");
       Real rho_rep = 0; for (Long i = 0; i < rho_top.Dim(); i++) rho_rep += rho_top[i]; rho_rep /= std::max<Long>(1, rho_top.Dim());
       const Integer n_axial = (n_axial_in >= 1) ? n_axial_in : cilium_shaft_n_axial<Real>(rho_rep, a_bot[0], a_top[0], fourier);
       SlenderElemList<Real> shaft = BuildAllFingerShaftsSlender<Real>(axis, a_bot, a_top, rho_bot, rho_top, n_axial, cheb, fourier, comm, axial_grade);
       if (!comm.Rank()) std::cout << std::setprecision(6) << "  shafts: rho~" << rho_rep << " axial~[" << a_bot[0] << "," << a_top[0] << "] n_axial/finger=" << n_axial << "\n";
-      const std::string tag = "vis/stud_sphere-allfinger-ppf" + std::to_string((long)PatchPerFace) + "-ord" + std::to_string((long)order);
+      const std::string tag = "vis/stud_sphere-centerfinger-ppf" + std::to_string((long)PatchPerFace) + "-ord" + std::to_string((long)order);
       run_hybrid<Real>(base, shaft, comm, tol, cov_q, Nbeta, max_depth, tag);
       Comm::MPI_Finalize();
       return 0;
     }
 
-    if (!comm.Rank())
-      std::cout << "\n=== HYBRID cilium finger (QuadElemList base [sphere-with-hole + collar + fillet + cap]  +  SlenderElemList shaft) ===\n"
-                << "  order=" << order << " Naz=" << Naz << " R_shaft=" << R_shaft << " r_fil=" << r_fil << " H_shaft=" << H_shaft
-                << " tol=" << tol << " Nbeta=" << Nbeta << " max_depth=" << max_depth
-                << " fourier=" << fourier << " cheb=" << cheb << " PatchPerFace=" << PatchPerFace
-                << " invert_base_to_inward=" << invert << "\n";
-
-    // ---- build the two halves ----
-    Real rho = 0, z_lo = 0, z_hi = 0;
-    QuadElemList<Real> base = BuildCiliumStuddedSphereBase<Real>(order, PatchPerFace, R, Naz, r_fil, rho, z_lo, z_hi, Nc, /*grade_exp=*/1, R_shaft, comm, invert, H_shaft);
-    const Integer n_axial = (n_axial_in >= 1) ? n_axial_in : cilium_shaft_n_axial<Real>(rho, z_lo, z_hi, fourier);
-    SlenderElemList<Real> shaft = BuildCiliumShaftSlender<Real>(rho, z_lo, z_hi, n_axial, /*flip_normal=*/false, cheb, fourier, comm);
-    if (!comm.Rank())
-      std::cout << std::setprecision(8) << "  shaft slender: rho=" << rho << " z=[" << z_lo << ", " << z_hi
-                << "]  n_axial=" << n_axial << "\n";
-
-    // ---- seam connectivity diagnostic: do the slender end rings coincide with the base open edges? ----
-    {
-      Vector<Real> Xb, Nb_, Xs, Ns_; base.GetNodeCoord(&Xb, &Nb_, nullptr); shaft.GetNodeCoord(&Xs, &Ns_, nullptr);
-      const Long Nb = Xb.Dim()/3, Nsn = Xs.Dim()/3;
-      Real szmin = 1e30, szmax = -1e30, srmin = 1e30, srmax = -1e30;
-      Real gap_hi = 1e30, gap_lo = 1e30;   // nearest base-node distance for slender nodes at the top/bottom ring
-      const Real band = (Real)0.02 * (z_hi - z_lo);
-      // avg radial component of the normal (n . rhat, rhat = in-plane away-from-axis) at the top ring
-      Real snr = 0; Long snc = 0;   // slender top-ring
-      for (Long i = 0; i < Nsn; i++) {
-        const Real x = Xs[i*3], y = Xs[i*3+1], z = Xs[i*3+2], r = std::sqrt(x*x+y*y);
-        szmin = std::min(szmin, z); szmax = std::max(szmax, z); srmin = std::min(srmin, r); srmax = std::max(srmax, r);
-        const bool top = (z > z_hi - band), bot = (z < z_lo + band);
-        if (top && r > 1e-12) { snr += (Ns_[i*3]*x + Ns_[i*3+1]*y)/r; snc++; }
-        if (!top && !bot) continue;
-        Real best = 1e30;
-        for (Long jb = 0; jb < Nb; jb++) { const Real dx=x-Xb[jb*3],dy=y-Xb[jb*3+1],dz=z-Xb[jb*3+2]; best = std::min(best, std::sqrt(dx*dx+dy*dy+dz*dz)); }
-        if (top) gap_hi = std::min(gap_hi, best);
-        if (bot) gap_lo = std::min(gap_lo, best);
-      }
-      Real bnr = 0; Long bnc = 0;   // base fillet open-edge ring (near z_hi, small r)
-      for (Long i = 0; i < Nb; i++) {
-        const Real x = Xb[i*3], y = Xb[i*3+1], z = Xb[i*3+2], r = std::sqrt(x*x+y*y);
-        if (z > z_hi - band && r < 2*rho && r > 1e-12) { bnr += (Nb_[i*3]*x + Nb_[i*3+1]*y)/r; bnc++; }
-      }
-      if (!comm.Rank()) std::cout << std::setprecision(6)
-        << "  [seam] slender surf z=[" << szmin << "," << szmax << "] r=[" << srmin << "," << srmax << "]  (want z=[" << z_lo << "," << z_hi << "] r~" << rho << ")\n"
-        << "  [seam] nearest base node to slender top-ring=" << gap_hi << " bottom-ring=" << gap_lo << " (node spacing ~" << (2*const_pi<Real>()*rho/(Naz*order)) << ")\n"
-        << "  [seam] avg n.rhat  slender-top=" << (snc?snr/snc:0) << " (n=" << snc << ")  base-fillet-edge=" << (bnc?bnr/bnc:0) << " (n=" << bnc << ")  [same sign => consistent orientation]\n";
-    }
-
-    const std::string tag = "vis/stud_sphere-hybrid-ord" + std::to_string((long)order) + "-Naz" + std::to_string((long)Naz);
-    run_hybrid<Real>(base, shaft, comm, tol, cov_q, Nbeta, max_depth, tag);
+    // Unreachable: the mode-keyword assert above guarantees flagella || centerfinger, each of which returns.
+    SCTL_ASSERT_MSG(false, "stud_sphere-hybrid: no mode ran (expected centerfinger or flagella)");
   }
   Comm::MPI_Finalize();
   return 0;

@@ -1,14 +1,16 @@
 /**
  * Stud/collar-on-sphere BIE driver (cilia mount migrated from SCTL_quad_element/src/test-gmsh-geom.cpp).
  * Runs the double-layer constant-density identity (= -1/2) and Green's identity (Laplace + Stokes),
- * on-surface and off-surface, for the studded finger / collarfill / all-collar geometries.
+ * on-surface and off-surface, for the collarfill / all-collar / plain-sphere geometries + a manufactured BVP.
  *
  * csbq.hpp is included to keep the hybrid include path (CSBQ SlenderElemList + the fork's enhanced
  * QuadElemList) compiling in this project; SlenderElemList is used from a later milestone.
  *
  *   make bin/stud_sphere-bie
- *   OMP_NUM_THREADS=8 ./bin/stud_sphere-bie [mode] [tol Nbeta max_depth R_shaft Nc Naz order Ndisk core_frac*100 trg_dist PatchPerFace]
- * modes: (none)=studded finger | sphere | collarfill | allcollar | allcollarfinger | greenoff | dump | collarsrc | manufactured
+ *   OMP_NUM_THREADS=8 ./bin/stud_sphere-bie <mode> [tol Nbeta max_depth R_shaft Nc Naz order Ndisk core_frac*100 trg_dist PatchPerFace]
+ * modes (a keyword is REQUIRED): sphere | collarfill | allcollar | greenoff | manufactured
+ *   (the single-finger studded-sphere modes -- default finger, dump, collarsrc -- and allcollarfinger were
+ *    removed 2026-07-31; the single studded finger now lives only in the hybrid driver's centerfinger mode.)
  *   manufactured: exterior + interior Stokes BVPs on the all-finger cilia sphere from a point-source
  *     Stokeslet (Dirichlet BC -> CFIE via GMRES -> near/far shells vs the exact field). Defaults ppf=1;
  *     trg_dist is reused as the near-shell offset. Exterior: source inside, shells at R+off & 2R. Interior:
@@ -55,66 +57,7 @@ template <class Real> QuadElemList<Real> BuildCollarOnly(Integer order, Real R_f
 // kernel. Reports, per region, max |t . rhat|/|t| (tangent tilt, rhat=X/|X|) and 1-|n . rhat|
 // (normal deviation from radial). Geometry-only (no BIE solve).
 
-// Test (1): isolate the collar SOURCE's DL contribution at the cubed-sphere seam targets. Builds
-// the full studded sphere (for targets + the full-solve error we're explaining), then evaluates a
-// collar-ONLY source list's Laplace DL potential at those OFF-collar sphere nodes for ksub=1,2,4.
-// If the collar contribution is inaccurate at baseline, it CONVERGES as ksub resolves the collar
-// geometry, and |contribution(ksub=1) - converged| ~= the full-solve seam error => the collar
-// source's near evaluation is what pollutes the sphere targets.
-template <class Real> void diagnose_collar_source(const Comm& comm, Integer order, Long PatchPerFace, Real R, Real tol, Integer Naz, Real r_fil, Real grade_exp, Integer Nbeta, Integer max_depth, Integer cov_q, Real R_shaft) {
-  using KerDL = Laplace3D_DxU;
-  const Real R_foot = R_shaft + r_fil, S = R/(Real)PatchPerFace;
-  const Integer Nc = collar_Nc<Real>(R_foot, S, Naz);
-  const bool flip = stud_needs_flip<Real>(order, R, S, Naz, r_fil, R_shaft);
-  if (!comm.Rank())
-    std::cout << "\n=== diagnose_collar_source (order=" << order << " Naz=" << Naz << " r_fil=" << r_fil
-              << " Nc=" << Nc << " flip=" << flip << " tol=" << tol << " Nbeta=" << Nbeta << " mxd=" << max_depth << ") ===\n";
-  // This diagnostic indexes nodes by their GLOBAL (serial) ordering -- cubed-sphere nodes precede the
-  // stud, and it hand-picks near-pole targets by that flat index. Under MPI each rank sees only its
-  // slice, so the selection is not meaningful; restrict it to a single rank.
-  if (comm.Size() > 1) {
-    if (!comm.Rank()) std::cout << "  [collarsrc] serial-only diagnostic (relies on global node ordering); run with one rank.\n";
-    return;
-  }
-
-  // Full studded sphere: source of targets + the full-solve seam error being explained.
-  QuadElemList<Real> full = BuildCiliumStuddedSphere<Real>(order, PatchPerFace, R, Naz, r_fil, -1, -1, -1, -1, grade_exp, R_shaft, comm);
-  full.SetQuadScheme(QuadElemList<Real>::QuadScheme::Hybrid, cov_q, Nbeta, max_depth);
-  Vector<Real> X; full.GetNodeCoord(&X, nullptr, nullptr);
-  const Long Nnode = X.Dim()/3;
-  const Long n_cs_nodes = (6*PatchPerFace*PatchPerFace - 1)*order*order; // cubed-sphere nodes precede the stud
-
-  // Full DL identity (constant density) -> error at each node.
-  Vector<Real> Ufull, qf(Nnode); qf = 1;
-  { BoundaryIntegralOp<Real,KerDL> BIOp(KerDL(), false, comm); SetPVFMMKer(BIOp); BIOp.SetAccuracy(tol); BIOp.AddElemList(full); BIOp.ComputePotential(Ufull, qf); }
-
-  // Targets = cubed-sphere nodes near the pole (adjacent sphere patches; guaranteed OFF the collar).
-  std::vector<Long> sel; Vector<Real> Xtrg;
-  for (Long i = 0; i < n_cs_nodes; i++) {
-    const Real x = X[i*3], y = X[i*3+1], z = X[i*3+2];
-    if (z > 0.9 && std::sqrt(x*x+y*y+z*z) > 0.999) { sel.push_back(i); Xtrg.PushBack(x); Xtrg.PushBack(y); Xtrg.PushBack(z); }
-  }
-  Real e_full_max = 0; Long e_arg = -1;
-  for (size_t k = 0; k < sel.size(); k++) { const Real e = std::fabs(Ufull[sel[k]] + (Real)0.5); if (e > e_full_max) { e_full_max = e; e_arg = (Long)k; } }
-  std::cout << "  targets: " << sel.size() << " cubed-sphere near-pole (off-collar) nodes; full-solve DL |error| max = "
-            << e_full_max << " at rho=" << std::sqrt(Xtrg[e_arg*3]*Xtrg[e_arg*3]+Xtrg[e_arg*3+1]*Xtrg[e_arg*3+1]) << "\n";
-
-  // Collar-only contribution at those targets, refining the collar geometry (ksub=1,2,4).
-  Vector<Real> Uprev;
-  for (Integer ksub : {1, 2, 4}) {
-    QuadElemList<Real> collar = BuildCollarOnly<Real>(order, R_foot, S, Naz, Nc, grade_exp, R, ksub, flip, comm);
-    collar.SetQuadScheme(QuadElemList<Real>::QuadScheme::Hybrid, cov_q, Nbeta, max_depth);
-    Vector<Real> Xc; collar.GetNodeCoord(&Xc, nullptr, nullptr); const Long Ncol = Xc.Dim()/3;
-    BoundaryIntegralOp<Real,KerDL> BIOp(KerDL(), false, comm); SetPVFMMKer(BIOp); BIOp.SetAccuracy(tol); BIOp.AddElemList(collar); BIOp.SetTargetCoord(Xtrg);
-    Vector<Real> Ucol, qc(Ncol); qc = 1; BIOp.ComputePotential(Ucol, qc);
-    Real dmax = 0; if (Uprev.Dim() == Ucol.Dim()) for (Long i = 0; i < Ucol.Dim(); i++) dmax = std::max<Real>(dmax, std::fabs(Ucol[i]-Uprev[i]));
-    Real cmax = 0; for (Long i = 0; i < Ucol.Dim(); i++) cmax = std::max<Real>(cmax, std::fabs(Ucol[i]));
-    std::cout << "  ksub=" << ksub << "  collar panels=" << (Naz*Nc*ksub*ksub) << "  max|collar contribution|=" << cmax;
-    if (Uprev.Dim() == Ucol.Dim()) std::cout << "  max change vs prev ksub = " << dmax << "  (<- collar-source self-convergence)";
-    std::cout << "\n";
-    Uprev = Ucol;
-  }
-}
+// (removed 2026-07-31: diagnose_collar_source -- the one-finger collar-source DL diagnostic)
 
 // =====================================================================================================
 // ACCURACY TESTS + DRIVERS (DL-identity and Green's-identity; the test_* drivers below build a mesh via
@@ -291,28 +234,7 @@ template <class Real, class KerSL, class KerDL, class KerGrad> void test_greens_
   }
 }
 
-template <class Real> void test_CiliumStuddedSphere(const Comm& comm, Integer ElemOrder, Long PatchPerFace, Real R, Real tol,
-                                                    Integer Naz = 12, Real r_fil = 0.005, Integer Ns = -1, Integer Nf = -1, Integer Nc = -1, Integer Ncap = -1, Real grade_exp = 1,
-                                                    Integer Nbeta = 400, Integer max_depth = 30, Integer cov_q = 10, Real R_shaft = 0.015, std::string dump_prefix = "") {
-  const Integer order = ElemOrder;
-  if (!comm.Rank())
-    std::cout << "\n=== Full-surface test: cubed sphere " << PatchPerFace << "x" << PatchPerFace
-              << "/face, 1 patch replaced by a capped cilium finger (order=" << order << " Naz=" << Naz
-              << " R_shaft=" << R_shaft << " r_fil=" << r_fil << " grade_exp=" << grade_exp << " tol=" << tol
-              << " Nbeta=" << Nbeta << " max_depth=" << max_depth << " cov_q=" << cov_q << ") ===\n";
-  QuadElemList<Real> elem_lst = BuildCiliumStuddedSphere<Real>(order, PatchPerFace, R, Naz, r_fil, Ns, Nf, Nc, Ncap, grade_exp, R_shaft, comm);
-  report_area<Real>(elem_lst, comm);
-  elem_lst.SetQuadScheme(QuadElemList<Real>::QuadScheme::Hybrid, cov_q, Nbeta, max_depth);
-  const std::string tag = "cilium-studded-sphere-rfil" + std::to_string((double)r_fil) + "-tol" + std::to_string((double)tol)
-                        + "-Nb" + std::to_string((long)Nbeta) + "-md" + std::to_string((long)max_depth); // unique per config so concurrent runs don't clobber
-  elem_lst.WriteVTK(tag, Vector<Real>(), comm);
-  if (!comm.Rank()) std::cout << "  wrote " << tag << ".pvtu / .vtu\n";
-  const Vector<Real> X0{1.3, 1.2, 0.2}; // exterior source for interior Green's identity
-  if (!comm.Rank()) { std::cout << "[Laplace] "; }test_DLIdentity<Real, Laplace3D_DxU>(elem_lst, comm, tol, dump_prefix.empty() ? "" : dump_prefix + "_Laplace.csv");
-  if (!comm.Rank()) { std::cout << "[Stokes]  "; }test_DLIdentity<Real, Stokes3D_DxU>(elem_lst, comm, tol, dump_prefix.empty() ? "" : dump_prefix + "_Stokes.csv");
-  if (!comm.Rank()) { std::cout << "[Laplace] "; }test_greens_identity<Real, Laplace3D_FxU, Laplace3D_DxU, Laplace3D_FxdU>(elem_lst, comm, tol, X0);
-  if (!comm.Rank()) { std::cout << "[Stokes]  "; }test_greens_identity<Real, Stokes3D_FxU, Stokes3D_DxU, Stokes3D_FxT>(elem_lst, comm, tol, X0);
-}
+// (removed 2026-07-31: test_CiliumStuddedSphere -- the single studded-finger DL/Green's test)
 
 // Control: the SAME cubed sphere with NO finger (nothing skipped/replaced). Establishes the
 // achievable identity floor for this discretization+quad settings, isolating the finger's cost.
@@ -418,7 +340,6 @@ template <class Real> void test_ManufacturedStokes(const Comm& comm, Integer ord
                                                    Integer Naz, Real r_fil, Real grade_exp, Integer Nbeta, Integer max_depth, Integer cov_q,
                                                    Real R_shaft, Real near_off, Integer Nc_in = -1, Real core_frac = (Real)0.40, bool circularize = false) {
   using KerSL = Stokes3D_FxU;   // Stokeslet single-layer (also the exact-field kernel)
-  using KerDL = Stokes3D_DxU;   // stresslet double-layer
   if (!comm.Rank())
     std::cout << "\n=== MANUFACTURED Stokes BVPs (exterior + interior): all-finger cilia sphere (point-source"
               << " Stokeslet -> Dirichlet BC -> CFIE via GMRES -> shell of off-domain targets)\n    (PatchPerFace="
@@ -518,29 +439,34 @@ int main(int argc, char** argv) {
     const Comm comm = Comm::World();
     // Positional CLI: argv[2..12] = tol Nbeta max_depth R_shaft Nc Naz order Ndisk core_frac*100 trg_dist PatchPerFace
     const bool control    = (argc > 1 && std::string(argv[1]) == "sphere");           // finger-free plain cubed sphere (floor)
-    const bool dump       = (argc > 1 && std::string(argv[1]) == "dump");             // studded run + per-node DL error CSV
-    const bool collarsrc  = (argc > 1 && std::string(argv[1]) == "collarsrc");        // isolate collar-source DL at sphere targets
     const bool collarfill = (argc > 1 && std::string(argv[1]) == "collarfill");       // single collar+disk patch, NO finger
     const bool greenoff   = (argc > 1 && std::string(argv[1]) == "greenoff");         // off-surface Green's on the single-collar sphere
     const bool allcollar  = (argc > 1 && std::string(argv[1]) == "allcollar");        // every patch = collar+disk
-    const bool allfinger  = (argc > 1 && std::string(argv[1]) == "allcollarfinger");  // all-collar sphere + one cilium finger
     const bool manufac    = (argc > 1 && std::string(argv[1]) == "manufactured");     // manufactured exterior Stokes BVP (interior Stokeslet)
-    const Real r_fil      = (argc > 1 && !control && !dump && !collarsrc && !collarfill && !greenoff && !allcollar && !allfinger && !manufac) ? (Real)atof(argv[1]) : (Real)0.005;
+    // REMOVED (2026-07-31): the single-finger studded-sphere modes -- the default (no-keyword) studded finger,
+    // "dump" (its per-node DL CSV), "collarsrc" (its collar-source diagnostic) -- and "allcollarfinger"
+    // (all-collar sphere + one finger). A mode keyword is now REQUIRED (see the dispatch below).
+    const Integer ppf_cli   = (argc > 12) ? (Integer)atoi(argv[12]) : 7;
+    // PATCH-RELATIVE shaft: default R_shaft = frac*S (S=1/ppf), r_fil = 0.1*R_shaft; frac from env
+    // QJ_RSHAFT_FRAC (default 0.25 -- the thin cilium). A POSITIVE argv[5] (R_shaft) or argv[13] (r_fil)
+    // overrides with an absolute value (back-compat). See cilium_scale_from_patch() in stud_sphere_geom.hpp.
+    const Real rshaft_frac  = std::getenv("QJ_RSHAFT_FRAC") ? (Real)atof(std::getenv("QJ_RSHAFT_FRAC")) : (Real)0.25;
+    const Real S_ref        = (Real)1 / (Real)ppf_cli;   // patch half-width at the primary PPF
+    const Real R_shaft_arg  = (argc > 5) ? (Real)atof(argv[5]) : (Real)-1;   // >0 => absolute override
+    const Real R_shaft      = (R_shaft_arg > 0) ? R_shaft_arg : rshaft_frac * S_ref;
+    const Real r_fil      = (Real)0.1 * R_shaft;   // (the numeric-argv[1] r_fil override went with the removed default finger mode)
     const Real tol          = (argc > 2) ? (Real)atof(argv[2]) : (Real)1e-8;
     const Integer Nbeta     = (argc > 3) ? (Integer)atoi(argv[3]) : 400;
     const Integer max_depth = (argc > 4) ? (Integer)atoi(argv[4]) : 30;
-    const Real R_shaft      = (argc > 5) ? (Real)atof(argv[5]) : (Real)0.015;
     const Integer Nc_cli    = (argc > 6) ? (Integer)atoi(argv[6]) : -1;
     // Azimuthal panel count (mult of 4), decoupled per mode; argv[7] overrides all.
     const Integer naz_arg      = (argc > 7) ? (Integer)atoi(argv[7]) : -1;
-    const Integer naz_finger   = (naz_arg > 0) ? naz_arg : 8;   // studded finger (+ coupled collar)
     const Integer naz_collar   = (naz_arg > 0) ? naz_arg : 4;   // single collar patch: collarfill / greenoff
     const Integer naz_allcollar= (naz_arg > 0) ? naz_arg : 8;   // every-patch collar sphere
     const Integer ord_cli   = (argc > 8) ? (Integer)atoi(argv[8]) : 16;
     const Integer Ndisk_cli = (argc > 9) ? (Integer)atoi(argv[9]) : -1;
     const Real corefr_cli   = (argc > 10) ? (Real)atof(argv[10])/100 : (Real)0.40;
     const Real trgdist_cli  = (argc > 11) ? (Real)atof(argv[11]) : (Real)1e-4;
-    const Integer ppf_cli   = (argc > 12) ? (Integer)atoi(argv[12]) : 7;
     // New trailing knobs (keyword modes can't set r_fil via argv[1]): r_fil override, radial grading,
     // and the fillet/cap circularization toggle. Defaults keep pre-existing invocations bit-identical.
     const Real rfil_cli     = (argc > 13) ? (Real)atof(argv[13]) : r_fil;
@@ -556,20 +482,18 @@ int main(int argc, char** argv) {
 
     if (allcollar)
       test_AllCollarFillSphere<Real>(comm, ord_cli, ppf_cli, 1.0, tol, naz_allcollar, rfil_cli, grade_cli, Nbeta, max_depth, 10, R_shaft, trgdist_cli, Nc_cli, -1, corefr_cli, false, circ_cli);
-    else if (allfinger)
-      test_AllCollarFillSphere<Real>(comm, ord_cli, ppf_cli, 1.0, tol, naz_allcollar, rfil_cli, grade_cli, Nbeta, max_depth, 10, R_shaft, trgdist_cli, Nc_cli, -1, corefr_cli, true, circ_cli);
     else if (manufac)
       test_ManufacturedStokes<Real>(comm, ord_cli, ppf_mfg, 1.0, tol, naz_allcollar, rfil_cli, grade_cli, Nbeta, max_depth, 10, R_shaft, near_off, Nc_cli, corefr_cli, circ_cli);
     else if (greenoff)
       test_SphereCollarFillOffSurface<Real>(comm, ord_cli, ppf_cli, 1.0, tol, naz_collar, r_fil, 1, Nbeta, max_depth, 10, R_shaft, trgdist_cli, Nc_cli, -1, corefr_cli);
     else if (collarfill)
       test_SphereCollarFill<Real>(comm, ord_cli, ppf_cli, 1.0, tol, naz_collar, r_fil, 1, Nbeta, max_depth, 10, R_shaft, Nc_cli, Ndisk_cli, corefr_cli);
-    else if (collarsrc)
-      diagnose_collar_source<Real>(comm, ord_cli, 7, 1.0, tol, naz_finger, r_fil, 1, Nbeta, max_depth, 10, R_shaft);
     else if (control)
       test_PlainSphere<Real>(comm, 16, 7, 1.0, tol, Nbeta, max_depth);
     else
-      test_CiliumStuddedSphere<Real>(comm, ord_cli, 7, 1.0, tol, naz_finger, r_fil, -1, -1, Nc_cli, -1, 1, Nbeta, max_depth, 10, R_shaft, dump ? "dlerr" : "");
+      SCTL_ASSERT_MSG(false, "stud_sphere-bie: a mode keyword is required -- one of "
+          "sphere | collarfill | allcollar | greenoff | manufactured "
+          "(the single-finger default, 'dump', 'collarsrc', and 'allcollarfinger' modes were removed)");
   }
   Comm::MPI_Finalize();
   return 0;
