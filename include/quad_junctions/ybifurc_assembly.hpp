@@ -549,10 +549,15 @@ template <class Real> class HybridAssembly {
   // slope at t=0,1 so the terminal rings stay circles perpendicular to u (seam-conforming). Optional
   // `rad(t)` gives a per-node radius PROFILE (t = arc fraction); when absent every node uses the constant
   // R0. rad(t) must equal the neighbouring seam radii at t=0,1 for a seam-conforming (watertight) join.
+  // Optional `orient(t)` supplies a per-node frame reference e1 (t = arc fraction), used instead of the
+  // constant `e1` -- needed for a 3D-bent centerline where a single constant e1 would go parallel to the
+  // tangent somewhere (CSBQ GetGeom divides by |e1_perp|). When absent, the constant `e1` is pushed exactly
+  // as before, so every existing (planar) caller is byte-for-byte identical.
   void add_slender_fiber(const Vec3<Real>& C0, const Vec3<Real>& u, Real R0, const Vec3<Real>& e1,
                          Real length, Integer n_axial, Long cheb, Long fourier,
                          const std::function<Vec3<Real>(Real)>& disp = {},
-                         const std::function<Real(Real)>& rad = {}) {
+                         const std::function<Real(Real)>& rad = {},
+                         const std::function<Vec3<Real>(Real)>& orient = {}) {
     for (Integer p = 0; p < n_axial; p++, npanel_++) {
       elem_order_.PushBack(cheb); forder_.PushBack(fourier);
       const Vector<Real>& cn = SlenderElemList<Real>::CenterlineNodes(cheb);
@@ -563,7 +568,8 @@ template <class Real> class HybridAssembly {
         if (disp) { const Vec3<Real> d = disp(t); P[0]+=d[0]; P[1]+=d[1]; P[2]+=d[2]; }
         coord_.PushBack(P[0]); coord_.PushBack(P[1]); coord_.PushBack(P[2]);
         radius_.PushBack(rad ? rad(t) : R0);
-        orient_.PushBack(e1[0]); orient_.PushBack(e1[1]); orient_.PushBack(e1[2]);
+        const Vec3<Real> o = orient ? orient(t) : e1;
+        orient_.PushBack(o[0]); orient_.PushBack(o[1]); orient_.PushBack(o[2]);
       }
     }
   }
@@ -581,13 +587,16 @@ template <class Real> class HybridAssembly {
     return J;
   }
 
-  // Free (capped) arm off `seam`: a slender fiber from the seam ring (station a0) out to arc station
-  // s_cap along seam.u, then a hemisphere cap on the far ring. Reproduces the single-hybrid free arm.
+  // Free arm off `seam`: a slender fiber from the seam ring (station a0) out to arc station s_cap along
+  // seam.u, then (with_cap) a hemisphere cap on the far ring. Reproduces the single-hybrid free arm.
+  // `with_cap=false` emits ONLY the stub fiber, leaving the far end an OPEN circular ring -- a port for a
+  // periodic / externally-closed problem (used by the singly-periodic vessels geometry).
   void add_free_arm(const ArmSeam<Real>& seam, Real s_cap, Integer n_axial, Integer Ncap,
-                    Long cheb = 10, Long fourier = 12, Real core_frac = (Real)0.40) {
+                    Long cheb = 10, Long fourier = 12, Real core_frac = (Real)0.40, bool with_cap = true) {
     const Real L = s_cap - seam.a0;
     SCTL_ASSERT_MSG(L > 0, "add_free_arm: s_cap must exceed the seam axial station a0.");
     add_slender_fiber(seam.C, seam.u, seam.R0, seam.e1, L, n_axial, cheb, fourier);
+    if (!with_cap) return;
     ArmSeam<Real> far = seam;
     far.C = Vec3<Real>{seam.C[0]+L*seam.u[0], seam.C[1]+L*seam.u[1], seam.C[2]+L*seam.u[2]};
     add_cap_hemisphere_frame<Real>(Xquad_, far, order_, Ncap, core_frac);
@@ -673,7 +682,8 @@ template <class Real> class HybridAssembly {
   // run plunges straight into b.C so r'(1)||b.u (watertight). Endpoints/tangents exact as in the racetrack.
   static Vec3<Real> bent_centerline(const ArmSeam<Real>& a, const ArmSeam<Real>& b, Real t,
                                     Integer lead_panels = 2, Integer corner_panels = 6,
-                                    Integer n_axial = 40, bool single_corner = false) {
+                                    Integer n_axial = 40, bool single_corner = false,
+                                    bool skew_safe = false) {
     auto dot = [](const Vec3<Real>& p, const Vec3<Real>& q){ return p[0]*q[0]+p[1]*q[1]+p[2]*q[2]; };
     auto sub = [](const Vec3<Real>& p, const Vec3<Real>& q){ return Vec3<Real>{p[0]-q[0],p[1]-q[1],p[2]-q[2]}; };
     auto mix = [](const Vec3<Real>& p, const Vec3<Real>& q, Real w){ return Vec3<Real>{(1-w)*p[0]+w*q[0], (1-w)*p[1]+w*q[1], (1-w)*p[2]+w*q[2]}; };
@@ -685,7 +695,14 @@ template <class Real> class HybridAssembly {
       const Real c = dot(a.u, b.u), p = dot(chord, a.u), q = dot(chord, b.u);
       const Real denom = (Real)1 - c*c;                          // >0: axes non-parallel (add_bent_arm asserts)
       const Real r_ = (p*c - q)/denom, s_ = p + r_*c;            // Q = a.C + s_*a.u = b.C + r_*b.u  (s_,r_>0)
-      const Vec3<Real> Q{a.C[0]+s_*a.u[0], a.C[1]+s_*a.u[1], a.C[2]+s_*a.u[2]};
+      const Vec3<Real> Q{a.C[0]+s_*a.u[0], a.C[1]+s_*a.u[1], a.C[2]+s_*a.u[2]};   // Q_a: lead endpoint on line A
+      // Skew-safe corner: when the two seam axes and the chord are NOT coplanar (3D placement, e.g. tangent
+      // on a sphere) line A and line B do not intersect, so a single vertex Q on line A would send the run
+      // Q->b.C off-axis (r'(1) not || b.u) and the terminal ring would not conform to seam b -> a leak. End
+      // the corner instead at Q_b = b.C + r_*b.u (the closest point on line B): then lineB leaves b.C exactly
+      // along b.u (watertight) and the corner bridges the O(1/R) skew gap Q_a->Q_b. When coplanar Q_b == Q_a,
+      // so with skew_safe off (every planar caller) this is byte-for-byte the original single-corner curve.
+      const Vec3<Real> Qb = skew_safe ? Vec3<Real>{b.C[0]+r_*b.u[0], b.C[1]+r_*b.u[1], b.C[2]+r_*b.u[2]} : Q;
       // Place the corner at Q's TRUE arc fraction tQ=s_/(s_+r_): the lead (length s_) maps to t in [0,tQ]
       // and the run (length r_) to [tQ,1] at the SAME speed s_+r_ -> uniform panels. Center a cp-panel window
       // on the nearest panel boundary. (Forcing Q to a fixed small parameter crushes the lead panels ~10x --
@@ -695,8 +712,8 @@ template <class Real> class HybridAssembly {
       Integer kc = (Integer)std::lround((double)(tQ*n));
       kc = std::max<Integer>(hcpL, std::min<Integer>(n - hcpR, kc));
       const Real e1L = (Real)(kc - hcpL)/n, e1R = (Real)(kc + hcpR)/n;
-      auto lineA = [&](Real x){ return mix(a.C, Q, x/tQ); };
-      auto lineB = [&](Real x){ return mix(Q, b.C, (x-tQ)/((Real)1-tQ)); };
+      auto lineA = [&](Real x){ return mix(a.C, Q,  x/tQ); };
+      auto lineB = [&](Real x){ return mix(Qb, b.C, (x-tQ)/((Real)1-tQ)); };
       if (t <= e1L) return lineA(t);
       if (t <  e1R) return mix(lineA(t), lineB(t), pou_ramp((t-e1L)/(e1R-e1L)));
       return lineB(t);
@@ -718,6 +735,34 @@ template <class Real> class HybridAssembly {
     return lineB(t);
   }
 
+  // Pull a centerline point radially onto the sphere of centre O so the arm HUGS the surface instead of
+  // chording through it (which both looks stiff and lets neighbouring runs dip toward one another under the
+  // surface). The pull is windowed to ZERO over the first/last `lead_panels` panels (so the straight,
+  // seam-coaxial lead is untouched -> terminal rings stay perpendicular to the seam axes, watertight) and
+  // ramps up over the next `corner_panels` via the same smootherstep POU used for the corner; the run is
+  // pulled fully onto the target radius (linearly interpolated between the two seam radii, both ~= R). This
+  // matches the two-corner window exactly; for the single-corner arm it still keeps the lead panels straight.
+  static Vec3<Real> hug_to_sphere(Vec3<Real> r, const Vec3<Real>& aC, const Vec3<Real>& bC, Real t,
+                                  Integer lead_panels, Integer corner_panels, Integer n_axial, const Vec3<Real>& O) {
+    const Integer n = std::max<Integer>(6, n_axial);
+    const Integer lp = std::max<Integer>(1, lead_panels), cp = std::max<Integer>(1, corner_panels);
+    Real w0 = (Real)lp/n, w1 = (Real)(lp+cp)/n, w2 = (Real)(n-lp-cp)/n, w3 = (Real)(n-lp)/n;
+    if (w1 >= w2) { const Real m = (w0+w3)/2; w1 = w2 = m; }        // short arm: single peak, no flat run
+    Real W;
+    if (t <= w0 || t >= w3) W = (Real)0;
+    else if (t < w1)  W = pou_ramp((t-w0)/(w1-w0));
+    else if (t <= w2) W = (Real)1;
+    else              W = pou_ramp((w3-t)/(w3-w2));
+    if (W <= (Real)0) return r;
+    auto sub = [](const Vec3<Real>& p, const Vec3<Real>& q){ return Vec3<Real>{p[0]-q[0],p[1]-q[1],p[2]-q[2]}; };
+    auto nrm = [](const Vec3<Real>& p){ return sqrt<Real>(p[0]*p[0]+p[1]*p[1]+p[2]*p[2]); };
+    const Real Ra = nrm(sub(aC,O)), Rb = nrm(sub(bC,O)), Rt = Ra + t*(Rb-Ra);   // target radius ~= R
+    const Vec3<Real> d = sub(r, O); const Real rr = nrm(d);
+    if ((double)rr <= 1e-30) return r;
+    const Real f = (Rt - rr)/rr * W;                                // radial move to reach Rt, windowed
+    return Vec3<Real>{r[0]+d[0]*f, r[1]+d[1]*f, r[2]+d[2]*f};
+  }
+
   // Racetrack connector: ONE slender fiber joining two seams whose axes need NOT be coaxial (unlike
   // add_shared_arm, which requires them collinear and facing). The centerline (see bent_centerline) leaves
   // each junction STRAIGHT along its arm axis (coaxial, zero curvature at the seam), bends smoothly through
@@ -731,9 +776,26 @@ template <class Real> class HybridAssembly {
   // chord. The driver arranges this by rotating both junctions about their shared e1 axis (so all arm axes,
   // seam centers, QA/QB and the run lie in the plane perpendicular to e1); then r'(t) is a combination of
   // vectors all perpendicular to e1, so e1 . r'(t) == 0 for every t.
+  //
+  // transported=true relaxes the PLANAR-turn requirement (shared e1 perpendicular to both axes and the
+  // chord): the two seams may sit on a curved surface (e.g. tangent to a sphere) so the lead/corner/run
+  // centerline bends in full 3D. A single constant e1 would then go parallel to the tangent somewhere and
+  // divide-by-zero in CSBQ GetGeom; instead a rotation-minimizing (double-reflection) frame is carried per
+  // node, seeded by a.e1 at t=0 and re-projected onto the CSBQ tangent inside GetGeom. The straight lead/run
+  // keep r'(0)||a.u, r'(1)||b.u, so the terminal rings stay perpendicular to the seam axes (watertight).
+  // transported=false is byte-for-byte the original planar arm (no orient functor is passed).
+  //
+  // tilt_offset adds a transverse mid-arm displacement tilt_offset*sin^2(pi*t) to the centerline: a C-inf
+  // bump that vanishes with zero slope at both seams (terminal rings stay perpendicular to the seam axes ->
+  // watertight) and peaks (= tilt_offset) at mid-arm. Used to nudge two otherwise-touching arms apart, one
+  // "up" and one "down" out of the local tangent plane. Zero (default) leaves the arm unchanged.
+  // hug_O (optional): when non-null the run/corner is pulled radially onto the sphere of that centre (see
+  // hug_to_sphere) so the arm follows the surface; the leads stay straight. Null (default) = chord path.
   void add_bent_arm(const ArmSeam<Real>& a, const ArmSeam<Real>& b, Integer n_axial,
                     Long cheb = 10, Long fourier = 12, Integer lead_panels = 2, Integer corner_panels = 6,
-                    bool single_corner = false) {
+                    bool single_corner = false, bool transported = false,
+                    Vec3<Real> tilt_offset = Vec3<Real>{(Real)0,(Real)0,(Real)0},
+                    const Vec3<Real>* hug_O = nullptr) {
     auto dot = [](const Vec3<Real>& p, const Vec3<Real>& q){ return p[0]*q[0]+p[1]*q[1]+p[2]*q[2]; };
     const Vec3<Real> chord{b.C[0]-a.C[0], b.C[1]-a.C[1], b.C[2]-a.C[2]};
     const Real L = sqrt<Real>(dot(chord, chord));
@@ -758,23 +820,72 @@ template <class Real> class HybridAssembly {
                       "add_bent_arm: need lead_panels,corner_panels>=1 and 2*(lead+corner)<n_axial (nonempty run).");
     }
     const Vec3<Real>& e1 = a.e1;
-    SCTL_ASSERT_MSG(std::fabs((double)dot(e1, b.e1)) > (Real)0.999, "add_bent_arm: the two seams must share the orient e1.");
-    const Real tolp = (Real)1e-6;
-    SCTL_ASSERT_MSG(std::fabs((double)dot(e1, a.u)) < tolp && std::fabs((double)dot(e1, b.u)) < tolp
-                    && std::fabs((double)dot(e1, cdir)) < tolp,
-                    "add_bent_arm: orient e1 must be perpendicular to both seam axes and the chord (planar turn).");
+    if (!transported) {
+      SCTL_ASSERT_MSG(std::fabs((double)dot(e1, b.e1)) > (Real)0.999, "add_bent_arm: the two seams must share the orient e1.");
+      const Real tolp = (Real)1e-6;
+      SCTL_ASSERT_MSG(std::fabs((double)dot(e1, a.u)) < tolp && std::fabs((double)dot(e1, b.u)) < tolp
+                      && std::fabs((double)dot(e1, cdir)) < tolp,
+                      "add_bent_arm: orient e1 must be perpendicular to both seam axes and the chord (planar turn).");
+    }
     const ArmSeam<Real> sa = a, sb = b;
     const Integer na = n_axial, lp = lead_panels, cp = corner_panels;
     const bool sc = single_corner;
     // disp(t) = r(t) - straight_chord(t); add_slender_fiber adds this onto C0 + s*cdir (= chord(t)),
     // so the emitted centerline is exactly bent_centerline(t). Vanishes at t=0,1 (endpoints match).
     std::function<Vec3<Real>(Real)> disp = [=](Real t) -> Vec3<Real> {
-      const Vec3<Real> r = bent_centerline(sa, sb, t, lp, cp, na, sc);
-      return Vec3<Real>{r[0] - (a.C[0] + t*chord[0]), r[1] - (a.C[1] + t*chord[1]), r[2] - (a.C[2] + t*chord[2])};
+      Vec3<Real> r = bent_centerline(sa, sb, t, lp, cp, na, sc, /*skew_safe*/transported);
+      Real env = sin<Real>(const_pi<Real>()*t); env *= env;               // sin^2(pi t): 0+flat at ends
+      r = Vec3<Real>{r[0]+tilt_offset[0]*env, r[1]+tilt_offset[1]*env, r[2]+tilt_offset[2]*env};
+      if (hug_O) r = hug_to_sphere(r, a.C, b.C, t, lead_panels, corner_panels, n_axial, *hug_O);
+      return Vec3<Real>{r[0]-(a.C[0]+t*chord[0]), r[1]-(a.C[1]+t*chord[1]), r[2]-(a.C[2]+t*chord[2])};
     };
     const Real rA = a.R0, rB = b.R0;
     std::function<Real(Real)> rad = [=](Real t) -> Real { return rA + t*(rB - rA); };
-    add_slender_fiber(a.C, cdir, a.R0, e1, L, n_axial, cheb, fourier, disp, rad);
+    if (!transported) {
+      add_slender_fiber(a.C, cdir, a.R0, e1, L, n_axial, cheb, fourier, disp, rad);
+      return;
+    }
+    // Rotation-minimizing (double-reflection, Wang et al.) reference frame along the 3D-bent centerline,
+    // tabulated on a fine uniform grid and linearly interpolated (CSBQ re-orthonormalizes against its own
+    // tangent, so a smooth, non-degenerate e1 is all that is required). Seed = a.e1 projected perp to a.u.
+    auto sub = [](const Vec3<Real>& p, const Vec3<Real>& q){ return Vec3<Real>{p[0]-q[0],p[1]-q[1],p[2]-q[2]}; };
+    auto unit = [&dot](Vec3<Real> p){ const Real n = sqrt<Real>(dot(p,p)); if ((double)n>1e-30){p[0]/=n;p[1]/=n;p[2]/=n;} return p; };
+    const Integer Ng = std::max<Integer>((Integer)200, (Integer)20*n_axial);
+    auto pos = [&](Real tt){ Vec3<Real> r = bent_centerline(sa, sb, tt, lp, cp, na, sc, /*skew_safe*/transported);
+      Real e = sin<Real>(const_pi<Real>()*tt); e *= e;
+      r = Vec3<Real>{r[0]+tilt_offset[0]*e, r[1]+tilt_offset[1]*e, r[2]+tilt_offset[2]*e};
+      if (hug_O) r = hug_to_sphere(r, a.C, b.C, tt, lead_panels, corner_panels, n_axial, *hug_O);
+      return r; };
+    auto tang = [&](Integer i) -> Vec3<Real> {
+      const Real h = (Real)1/Ng;
+      if (i <= 0)  return unit(sub(pos(h), pos((Real)0)));
+      if (i >= Ng) return unit(sub(pos((Real)1), pos((Real)1-h)));
+      return unit(sub(pos((i+1)*h), pos((i-1)*h)));
+    };
+    std::vector<Vec3<Real>> Rtab((size_t)Ng+1);
+    Vec3<Real> ti = tang(0);
+    Vec3<Real> r = unit(sub(a.e1, Vec3<Real>{dot(a.e1,ti)*ti[0], dot(a.e1,ti)*ti[1], dot(a.e1,ti)*ti[2]}));
+    Rtab[0] = r;
+    for (Integer i = 0; i < Ng; i++) {
+      const Vec3<Real> xi = pos(i/(Real)Ng), xi1 = pos((i+1)/(Real)Ng);
+      const Vec3<Real> ti1 = tang(i+1);
+      const Vec3<Real> v1 = sub(xi1, xi); const Real c1 = dot(v1, v1);
+      const Vec3<Real> rL = ((double)c1>0) ? sub(r,  Vec3<Real>{2*dot(v1,r )/c1*v1[0], 2*dot(v1,r )/c1*v1[1], 2*dot(v1,r )/c1*v1[2]}) : r;
+      const Vec3<Real> tL = ((double)c1>0) ? sub(ti, Vec3<Real>{2*dot(v1,ti)/c1*v1[0], 2*dot(v1,ti)/c1*v1[1], 2*dot(v1,ti)/c1*v1[2]}) : ti;
+      const Vec3<Real> v2 = sub(ti1, tL); const Real c2 = dot(v2, v2);
+      Vec3<Real> r1 = ((double)c2>0) ? sub(rL, Vec3<Real>{2*dot(v2,rL)/c2*v2[0], 2*dot(v2,rL)/c2*v2[1], 2*dot(v2,rL)/c2*v2[2]}) : rL;
+      r1 = unit(r1);
+      Rtab[(size_t)i+1] = r1; r = r1; ti = ti1;
+    }
+    std::function<Vec3<Real>(Real)> orient = [Rtab, Ng](Real t) -> Vec3<Real> {
+      Real g = t*Ng; if ((double)g < 0) g = 0; if (g > (Real)Ng) g = (Real)Ng;
+      Integer i = (Integer)g; if (i >= Ng) i = Ng-1; const Real f = g - i;
+      const Vec3<Real>& p0 = Rtab[(size_t)i]; const Vec3<Real>& p1 = Rtab[(size_t)i+1];
+      Vec3<Real> o{p0[0]+f*(p1[0]-p0[0]), p0[1]+f*(p1[1]-p0[1]), p0[2]+f*(p1[2]-p0[2])};
+      const Real n = sqrt<Real>(o[0]*o[0]+o[1]*o[1]+o[2]*o[2]);
+      if ((double)n > 1e-30) { o[0]/=n; o[1]/=n; o[2]/=n; return o; } return p0;
+    };
+    add_slender_fiber(a.C, cdir, a.R0, e1, L, n_axial, cheb, fourier, disp, rad, orient);
   }
 
   // Combined quad list: ctor replicate-then-slices X across `comm`.

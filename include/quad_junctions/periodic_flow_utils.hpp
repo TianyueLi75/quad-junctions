@@ -12,6 +12,23 @@
 #include <sctl.hpp>
 #include <string>
 
+// Singly-periodic (x) pressure-driven background flow: PIPE Poiseuille, a radial parabola about the axis
+// (y,z)=(0.5,0.5) driving flow in +x. Ported from ../stokes-periodize-numtest/include/utils_tests.cpp
+// (bg_flow_1peri). Its axial Laplacian is a constant (-1), i.e. a uniform x-pressure-gradient particular
+// solution; the (0.5,0.5) centering is a harmonic shift absorbed by the layer potential, so it drives the
+// same pressure drop regardless of where the geometry sits. Used by the singly-periodic vessels driver.
+template <class Real> sctl::Vector<Real> bg_flow_1peri(const sctl::Vector<Real>& X) {
+  const sctl::Long N = X.Dim() / 3;
+  sctl::Vector<Real> U(N * 3);
+  for (sctl::Long i = 0; i < N; i++) {
+    const auto x = X.begin() + i * 3;
+    U[i*3+0] = -(((x[1] - (Real)0.5) * (x[1] - (Real)0.5) + (x[2] - (Real)0.5) * (x[2] - (Real)0.5)) / (Real)4);
+    U[i*3+1] = 0;
+    U[i*3+2] = 0;
+  }
+  return U;
+}
+
 // Doubly-periodic pressure-driven background flow (plane Poiseuille between walls at z=0 and z=1).
 template <class Real> sctl::Vector<Real> bg_flow_2peri(const sctl::Vector<Real>& X) {
   const sctl::Long N = X.Dim() / 3;

@@ -52,7 +52,8 @@
  *   make bin/ybifurc-channel-bie
  *   OMP_NUM_THREADS=8 ./bin/ybifurc-channel-bie [mode] \
  *       [level ord nref eta_join Ns_trans s_cap nAxFree fourier tol Nbeta max_depth cov_q \
- *        sep tiltDeg nBent lead_panels corner_panels geomOnly SL_scal DL_scal Ngrid p_in p_out gmres_max_iter]
+ *        sep tiltDeg nBent lead_panels corner_panels geomOnly SL_scal DL_scal Ngrid p_in p_out gmres_max_iter Nvis]
+ *   (Nvis is flow-only: junction-box per-axis sample count for the 3D interior point cloud; 0 => cbrt(Ngrid).)
  *   (SL_scal/DL_scal are the combined-field weights for mfg AND flow, default 1/1; Ngrid is mfg+flow;
  *    p_in/p_out/gmres_max_iter are flow-only, defaults 10/10/400. All ignored by lens/tilt. For the flow
  *    genus-1 LOOP, try SL_scal=30 -- CSBQ's slender-loop SL scaling -- to condition the circulation mode.)
@@ -69,6 +70,7 @@
 
 #include <csbq.hpp>                                  // CSBQ SlenderElemList
 #include <quad_junctions/ybifurc_assembly.hpp>       // composable component API (add_bent_arm)
+#include <quad_junctions/interior_viz.hpp>           // build_arm_panel_targets / build_box_targets (interior viz)
 #include <quad_junctions/hybrid_bie_tests.hpp>       // shared BIE identity / watertightness tests
 #include <array>
 #include <cctype>
@@ -360,7 +362,7 @@ void run_flow(QuadElemList<Real>& junc, SlenderElemList<Real>& arms, const Comm&
               const HybridJunction<Real>& JA, const HybridJunction<Real>& JB, const Real s_cap,
               const std::string& tag, const Real tol, const Integer Nbeta, const Integer md,
               const Integer cov_q, const Real p_in, const Real p_out, const Long gmres_max_iter,
-              const Long Ngrid, const Real SL_scal, const Real DL_scal) {
+              const Long Ngrid, const Real SL_scal, const Real DL_scal, const Long Nvis) {
   // The only two open (capped) seams are the stems: A.arm0 (-x, inlet) and B.arm0 (+x, outlet).
   std::vector<FlowCap<Real>> caps;
   {
@@ -446,14 +448,39 @@ void run_flow(QuadElemList<Real>& junc, SlenderElemList<Real>& arms, const Comm&
     const Real mx = (Real)0.15*(xhi-xlo), my = (Real)0.15*(yhi-ylo); xlo -= mx; xhi += mx; ylo -= my; yhi += my;
   }
   const Long Nx = Ngrid, Ny = std::max<Long>(2, (Long)std::lround((double)Ngrid*(yhi-ylo)/(xhi-xlo)));
-  Vector<Real> Xgrid; Long Ngrid_pts = 0;
+  // Interior point cloud (in addition to the z=0 slice): arm cross-section stars at each CSBQ panel's first
+  // Chebyshev node + junction-body boxes (interior_viz.hpp). build_arm_panel_targets uses per-rank GetGeom,
+  // so it is COLLECTIVE and must run on every rank; junction boxes are pure rank-0 geometry.
+  Vector<Real> Xarm; build_arm_panel_targets<Real>(arms, comm, /*cheb=*/10, Xarm);
+  Vector<Real> Xgrid; Long Ngrid_pts = 0, Nslice = 0, Narm = 0, Njunc = 0, Nax = 0;
   if (!comm.Rank()) {
     for (Long ix = 0; ix < Nx; ix++) { const Real xx = xlo + (xhi-xlo)*ix/(Nx-1);
       for (Long iy = 0; iy < Ny; iy++) { const Real yy = ylo + (yhi-ylo)*iy/(Ny-1);
         Xgrid.PushBack(xx); Xgrid.PushBack(yy); Xgrid.PushBack((Real)0); } }
-    Ngrid_pts = Nx*Ny;
-    std::cout << "  [grid] z=0 slice " << Nx << " x " << Ny << " = " << Ngrid_pts << " points over x["
-              << std::setprecision(4) << xlo << "," << xhi << "] y[" << ylo << "," << yhi << "]\n" << std::setprecision(6);
+    Nslice = Nx*Ny;
+    for (Long i = 0; i < Xarm.Dim(); i++) Xgrid.PushBack(Xarm[i]);
+    Narm = Xgrid.Dim()/3 - Nslice;
+    // Junction cubes: center = mean of the junction's 3 seam-ring centers; half = farthest seam ring + 15%.
+    Vector<Real> jc(6), jh(2);
+    const HybridJunction<Real>* JJ[2] = {&JA, &JB};
+    for (int j = 0; j < 2; j++) {
+      Real cx = 0, cy = 0, cz = 0;
+      for (int k = 0; k < 3; k++) { const ArmSeam<Real>& s = JJ[j]->seam(k); cx += s.C[0]; cy += s.C[1]; cz += s.C[2]; }
+      cx /= 3; cy /= 3; cz /= 3;
+      Real h = 0;
+      for (int k = 0; k < 3; k++) { const ArmSeam<Real>& s = JJ[j]->seam(k);
+        const Real dx = s.C[0]-cx, dy = s.C[1]-cy, dz = s.C[2]-cz; h = std::max(h, std::sqrt(dx*dx+dy*dy+dz*dz)); }
+      jc[3*j] = cx; jc[3*j+1] = cy; jc[3*j+2] = cz; jh[j] = (Real)1.15*h;
+    }
+    Nax = (Nvis > 0) ? Nvis : std::max<Long>(3, (Long)std::lround(std::cbrt((double)Ngrid)));
+    Vector<Real> Xjb; build_box_targets<Real>(jc, jh, Nax, Xjb);
+    for (Long i = 0; i < Xjb.Dim(); i++) Xgrid.PushBack(Xjb[i]);
+    Njunc = Xgrid.Dim()/3 - Nslice - Narm;
+    Ngrid_pts = Xgrid.Dim()/3;
+    std::cout << "  [grid] z=0 slice " << Nx << " x " << Ny << " = " << Nslice << " + " << Narm
+              << " arm stars (" << (Narm/16) << " panels x16) + " << Njunc << " junction-box (2 x " << Nax
+              << "^3) over x[" << std::setprecision(4) << xlo << "," << xhi << "] y[" << ylo << "," << yhi
+              << "]\n" << std::setprecision(6);
   }
 
   // Solve the INTERIOR Stokes Dirichlet BVP (jump=-1/2*DL_scal). SL_scal is the SINGLE-LAYER weight (the
@@ -467,8 +494,10 @@ void run_flow(QuadElemList<Real>& junc, SlenderElemList<Real>& arms, const Comm&
       junc, arms, comm, tol, bc, /*interior=*/true, SL_scal, DL_scal,
       Xgrid, &Ugrid, "stokes pressure-drop (interior)", gmres_max_iter);
 
-  // Interior mask: Laplace-DL const-density indicator (~ -1 interior, ~0 exterior). KEEP the fluid
-  // interior (|ind|>0.5) and zero the exterior (eye + far field) -- the physical flow lives in the lumen.
+  // Interior mask/filter: Laplace-DL const-density indicator (~ -1 interior, ~0 exterior). On the z=0
+  // slice, KEEP the fluid interior and zero the exterior. For the 3D cloud, arm stars are interior by
+  // construction (always kept) and junction-box points are kept only where |ind|>0.5 (the "check inside").
+  Vector<Real> Xvis, Uvis;
   {
     BoundaryIntegralOp<Real, Laplace3D_DxU> IndOp((Laplace3D_DxU()), false, comm);
     SetPVFMMKer(IndOp);
@@ -479,15 +508,24 @@ void run_flow(QuadElemList<Real>& junc, SlenderElemList<Real>& arms, const Comm&
     Vector<Real> ind; IndOp.ComputePotential(ind, ones);
     if (!comm.Rank()) {
       Long n_in = 0;
-      for (Long i = 0; i < Ngrid_pts; i++) {
+      for (Long i = 0; i < Nslice; i++) {
         if (std::fabs((double)ind[i]) > 0.5) n_in++;
         else { Ugrid[3*i] = 0; Ugrid[3*i+1] = 0; Ugrid[3*i+2] = 0; }
       }
-      std::cout << "  [grid] interior points (|DL indicator|>0.5): " << n_in << " / " << Ngrid_pts << "\n";
+      Long n_junc_in = 0;
+      for (Long i = Nslice; i < Nslice + Narm; i++)                 // arm stars: interior by construction
+        for (Integer k = 0; k < 3; k++) { Xvis.PushBack(Xgrid[3*i+k]); Uvis.PushBack(Ugrid[3*i+k]); }
+      for (Long i = Nslice + Narm; i < Ngrid_pts; i++)              // junction box: keep interior only
+        if (std::fabs((double)ind[i]) > 0.5) {
+          for (Integer k = 0; k < 3; k++) { Xvis.PushBack(Xgrid[3*i+k]); Uvis.PushBack(Ugrid[3*i+k]); }
+          n_junc_in++;
+        }
+      std::cout << "  [grid] slice interior " << n_in << " / " << Nslice << "; cloud = " << Narm
+                << " arm + " << n_junc_in << " / " << Njunc << " junction = " << (Xvis.Dim()/3) << " pts\n";
     }
   }
 
-  // Output: surface density + prescribed BC velocity + interior flow slice (VTU) + slice CSV.
+  // Output: surface density + prescribed BC velocity + z=0 flow slice + 3D interior cloud (VTU) + slice CSV.
   {
     Vector<Real> sj(Nj*3), sa_(Na*3), bcj(Nj*3);
     for (Long i = 0; i < Nj*3; i++) { sj[i] = sigma[i]; bcj[i] = bc[i]; }
@@ -498,14 +536,15 @@ void run_flow(QuadElemList<Real>& junc, SlenderElemList<Real>& arms, const Comm&
   }
   if (!comm.Rank()) {
     write_plane_vtu<Real>(tag + "-flow-slice", Xgrid, Ugrid, Nx, Ny);
+    write_points_vtu<Real>(tag + "-flow-box", Xvis, Uvis, Xvis.Dim()/3);
     std::ofstream csv(tag + "-flow-slice.csv");
     csv << "x,y,ux,uy,uz,umag\n";
-    for (Long i = 0; i < Ngrid_pts; i++) {
+    for (Long i = 0; i < Nslice; i++) {
       const Real ux = Ugrid[3*i], uy = Ugrid[3*i+1], uz = Ugrid[3*i+2];
       csv << Xgrid[3*i] << "," << Xgrid[3*i+1] << "," << ux << "," << uy << "," << uz << ","
           << std::sqrt(ux*ux+uy*uy+uz*uz) << "\n";
     }
-    std::cout << "  [viz] wrote " << tag << "-sigma-{junc,arms}.pvtu, -bc-junc.pvtu, -flow-slice.vtu, -flow-slice.csv\n";
+    std::cout << "  [viz] wrote " << tag << "-sigma-{junc,arms}.pvtu, -bc-junc.pvtu, -flow-slice.vtu, -flow-box.vtu, -flow-slice.csv\n";
   }
 }
 
@@ -547,6 +586,7 @@ int main(int argc, char** argv) {
     const Real    p_in    = argf((Real)10);                      // flow: inlet (A stem) volumetric flux
     const Real    p_out   = argf((Real)10);                      // flow: outlet (B stem) volumetric flux
     const Long    gmresMax= (Long)argi(400);                     // flow: GMRES max iters (cap it to check stalling)
+    const Long    Nvis    = (Long)argi(0);                       // flow: junction-box per-axis samples (0 = cbrt(Ngrid))
     const Integer Ncap    = (Integer)(YSwept::Ncap0 * nref);
     const Long    cheb    = 10;
     pou_kind() = 1;   // smootherstep POU (order-exact)
@@ -703,7 +743,7 @@ int main(int argc, char** argv) {
       run_manufactured<Real>(junc, arms, comm, level, PA, PB, sep, JA, polys, freeseg, tag, tol,
                              Nbeta, md, cov_q, SL_scal, DL_scal, Ngrid);
     } else if (flow) {
-      run_flow<Real>(junc, arms, comm, JA, JB, s_cap, tag, tol, Nbeta, md, cov_q, p_in, p_out, gmresMax, Ngrid, SL_scal, DL_scal);
+      run_flow<Real>(junc, arms, comm, JA, JB, s_cap, tag, tol, Nbeta, md, cov_q, p_in, p_out, gmresMax, Ngrid, SL_scal, DL_scal, Nvis);
     } else {
       const std::string label = lens ? "diverging-converging channel (2 junctions, 2 bent walls)"
                                       : ("two junctions + one bent arm (turn " + std::to_string((long)tiltDeg) + " deg)");

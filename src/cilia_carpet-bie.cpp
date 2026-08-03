@@ -149,7 +149,7 @@ void run_flow(const QuadElemList<Real>& base, const SlenderElemList<Real>& shaft
   Long niter = 0;
   Vector<Real> rhs = bg_flow_2peri(X0); rhs *= (pressure_drop / L);
 
-  // ===== PROFILING: separately-timed SETUP phase + 5-repeat GMRES solve (averaged per-iteration time). =====
+  // ===== PROFILING: separately-timed SETUP phase + n_rep-repeat GMRES solve (averaged per-iteration time). =====
   // (1) A warm-up solve at loose tol first pages in the PVFMM precomputed operators / CSBQ special-quad tables
   //     from disk so the timed Setup below measures COMPUTE, not one-off I/O.
   // (2) ClearSetup -> Tic -> Op.Setup() -> Toc times the near-singular + FMM setup. StokesBIO::Setup() runs
@@ -170,7 +170,8 @@ void run_flow(const QuadElemList<Real>& base, const SlenderElemList<Real>& shaft
   Profile::print(&comm, {"t_avg", "t_max"});                             // SetupSingular/SetupNear per SL,DL
   Profile::reset();
 
-  const Integer n_rep = 5;
+  // const Integer n_rep = 5;
+  const Integer n_rep = 1;
   double t_solve_sum = 0;
   for (Integer rep = 0; rep < n_rep; rep++) {
     KrylovPrecond<Real> krylov;                                          // cleared each repeat
@@ -257,6 +258,14 @@ void run_flow(const QuadElemList<Real>& base, const SlenderElemList<Real>& shaft
   }
 
   // ---- Volume-flow VTU (targets outside the slab / inside a cilium masked to 0) ----
+  // Nvis<=1 means "no volume grid" (scaling/timing runs pass Nvis=1 to skip VTK I/O). CubeVolumeVisShifted
+  // returns EMPTY coords for N<2 (its N0<2 early-out), and an empty off-surface target set makes BIO fall
+  // back to the on-surface apply -> U sized Nsurf*KDIM while bg_flow is dim 0 -> `U -= Ub` dim-mismatch abort.
+  // So bail out here rather than feed the degenerate grid through eval_induced.
+  if (Nvis <= 1) {
+    if (!comm.Rank()) std::cout << "  flow: Nvis<=1, skipping the volume-vis slice (timing/scaling run)\n";
+    return;
+  }
   // Geometry-accurate finger mask: a target is inside solid iff it lies within ~R_shaft of some cilium's
   // (tilted, wiggled) centerline. The tubes have radius R_shaft and each hemispherical cap lies within
   // R_shaft of its tip -- both bounded by the sampled centerline polyline (same points cilium_clearance
@@ -268,16 +277,18 @@ void run_flow(const QuadElemList<Real>& base, const SlenderElemList<Real>& shaft
   // Mask radius (distance from the tube CENTERLINE). The layer-potential evaluation is inaccurate in a thin
   // near-field shell just OUTSIDE the surface -> velocity spikes at grid points adjacent to a shaft. The
   // buffer is tied to the grid resolution (not just R_shaft) so it covers that shell regardless of tube
-  // size: mask_r = max(rfrac*R_shaft, R_shaft + QJ_VIS_MASK_CELLS * h) (default 1 cell). The h term matters
+  // size: mask_r = max(rfrac*R_shaft, R_shaft + QJ_VIS_MASK_CELLS * h) (default 0.5 cell). The h term matters
   // most when the tube is sub-grid (R_shaft < h). Also absorbs the centerline-polyline sampling gap.
   const Real hgrid = (Real)0.9 * L / (Real)(Nvis > 1 ? Nvis - 1 : 1);   // CubeVolumeVisShifted node spacing
   const char* mc_env = std::getenv("QJ_VIS_MASK_CELLS");
-  const Real mask_cells = mc_env ? (Real)std::atof(mc_env) : (Real)1.0;
+  const Real mask_cells = mc_env ? (Real)std::atof(mc_env) : (Real)0.5;
   // The near-field shell (where the layer-potential FMM eval is inaccurate) scales with the TUBE, not a fixed
-  // grid-cell count, so scale the mask with R: mask_r = max(rfrac*R_shaft, R_shaft + mask_cells*h). rfrac~2
+  // grid-cell count, so scale the mask with R: mask_r = max(rfrac*R_shaft, R_shaft + mask_cells*h). rfrac~1.2
   // (env QJ_VIS_MASK_RFRAC) covers the shell (~R past the surface) while the h term keeps a sub-grid tube masked.
+  // Defaults (1.2, 0.5) blank a tight ~R sleeve (was 2.0/1.0, a ~2R sleeve) -- show more of the near-tube field;
+  // if near-tube velocity SPIKES reappear (inaccurate layer-potential eval just outside the surface), raise them.
   const char* rf_env = std::getenv("QJ_VIS_MASK_RFRAC");
-  const Real mask_rfrac = rf_env ? (Real)std::atof(rf_env) : (Real)2.0;
+  const Real mask_rfrac = rf_env ? (Real)std::atof(rf_env) : (Real)1.2;
   const Real mask_r  = std::max(mask_rfrac * R_shaft, R_shaft + mask_cells * hgrid);
   const Real mask_r2 = mask_r * mask_r;
   // Near-wall shell: the fat cilium FEET (collar+fillet+cap on the base, not on the slender centerline) and

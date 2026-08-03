@@ -122,6 +122,9 @@ INCDIR = ./include
 INCLUDES = -I$(INCDIR) -I$(CSBQ_INCLUDE_DIR) -I$(SCTL_INCLUDE_DIR) $(PVFMM_INCLUDES)
 
 TARGET_BIN = \
+	$(BINDIR)/bifurc-general-geom \
+	$(BINDIR)/bifurc-general-bie \
+	$(BINDIR)/bifurc-general-load-bie \
 	$(BINDIR)/ybifurc-hybrid-bie \
 	$(BINDIR)/ybifurc-multi-bie \
 	$(BINDIR)/ybifurc-tree-bie \
@@ -132,12 +135,11 @@ TARGET_BIN = \
 	$(BINDIR)/ybifurc-genmesh \
 	$(BINDIR)/ybifurc-export-fmm3dbie \
 	$(BINDIR)/ybifurc-bie-selfsetup \
+	$(BINDIR)/twisted-sphere-selfsetup \
 	$(BINDIR)/stud_sphere-geom \
 	$(BINDIR)/stud_sphere-bie \
 	$(BINDIR)/stud_sphere-hybrid-bie \
-	$(BINDIR)/cilia_carpet-bie \
-	$(BINDIR)/periodic-sphere-bie \
-	$(BINDIR)/probe-fmm-vs-direct
+	$(BINDIR)/cilia_carpet-bie
 
 all: $(TARGET_BIN)
 

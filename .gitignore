@@ -1,12 +1,10 @@
 # build artifacts
 /bin/
 /bin-pv/
-/bin-probe/
 /obj/
 /vis/
-/out/
+out/*
 /logs/
-/scratchpad/
 *.data
 
 
@@ -50,9 +48,6 @@ __pycache__/
 # Claude-generated docs/instructions
 CLAUDE.md
 docs/*.md
-
-# bash scripts
-*.sh
 
 # run artifacts
 *.log

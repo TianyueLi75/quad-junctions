@@ -99,6 +99,8 @@ int main(int argc, char** argv) {
     const Real    svgs    = (argc > 13) ? (Real)atof(argv[13]) : (Real)0.06;  // model units per SVG pixel
     const Integer geomOnly= (argc > 14) ? (Integer)atoi(argv[14]) : 0;
     const Real    gscale  = (argc > 15) ? (Real)atof(argv[15]) : (Real)1;   // global similarity scale
+    const Real    sphereDeg = (argc > 16) ? (Real)atof(argv[16]) : (Real)0; // 0=planar; >0 drapes onto a sphere (arc deg)
+    const Real    sphereTilt= (argc > 17) ? (Real)atof(argv[17]) : (Real)0; // tilt the 2 middle connectors +/- this many deg
     const Integer Ncap    = (Integer)(YSwept::Ncap0 * std::max<Integer>(1, nref));
     const Long    cheb    = 10;
     const Integer nAxFree = 3;
@@ -114,7 +116,8 @@ int main(int argc, char** argv) {
       std::cout << "\n=== ybifurc-vessels: 20-junction arterial/venous network ===\n";
       std::cout << "  order=" << ord << " level=" << level << " nref=" << nref << " eta_join=" << etajoin
                 << " Ns_trans=" << NsTrans << " fourier=" << fourier << " lead=" << leadP << " corner=" << cornerP
-                << " svg_scale=" << svgs << " gscale=" << gscale << (geomOnly ? "  [GEOM-ONLY]\n" : "\n");
+                << " svg_scale=" << svgs << " gscale=" << gscale << " sphere_deg=" << sphereDeg << " sphere_tilt=" << sphereTilt
+                << (geomOnly ? "  [GEOM-ONLY]\n" : "\n");
     }
 
     std::vector<Real> scale(NJ);   // per-junction 0.8^gen (also used in the collision report below)
@@ -124,14 +127,15 @@ int main(int argc, char** argv) {
     // shared builder; the identity tests below run on the SAME geometry the flow driver uses.
     HybridAssembly<Real> A(ord);
     const VesselsBuild<Real> vb = build_vessels_network<Real>(A, level, nref, etajoin, NsTrans, fourier,
-        leadP, cornerP, svgs, Ncap, cheb, nAxFree, tipLen, comm, gscale);
+        leadP, cornerP, svgs, Ncap, cheb, nAxFree, tipLen, comm, gscale, sphereDeg, sphereTilt);
     const std::vector<Placement<Real>>& P = vb.P;
     const std::vector<ArmSeg<Real>>& segs = vb.segs;
     const int n_caps = vb.n_caps;
 
     QuadElemList<Real> junc = A.quad(comm);
     SlenderElemList<Real> arms = A.slender(comm);
-    const std::string tag = "vis/ybifurc-vessels-ord" + std::to_string((long)ord) + "-nref" + std::to_string((long)nref);
+    const std::string tag = "vis/ybifurc-vessels-ord" + std::to_string((long)ord) + "-nref" + std::to_string((long)nref)
+                          + (sphereDeg > 0 ? "-sph" + std::to_string((long)std::lround((double)sphereDeg)) : std::string());
 
     // ---- geometry report + collision guard (min clearance between non-adjacent tubes / junction bodies) ----
     if (!comm.Rank()) {
@@ -163,12 +167,61 @@ int main(int argc, char** argv) {
                 << std::setprecision(6) << "\n";
       if (minclear <= 0 || minJclear <= 0)
         std::cout << "  *** WARNING: geometry self-intersection (clearance <= 0) -- increase svg_scale ***\n";
+
+      // ---- Centerline clearance on the ACTUAL (bent) centerlines: every pair of arm centerlines must stay
+      // >= 1.1*shaft_radius apart. On a strongly-curved (draped) network the arms bow toward the sphere
+      // centre, so the straight-chord guard above misses near-collisions -- measure seg.cl directly. For a
+      // pair that SHARES a junction ("adjacent") the two arms legitimately meet at that junction body, so
+      // samples inside it are excluded. Reports the tightest ADJACENT pair (the guarantee the user asked
+      // for) plus the two middle connectors explicitly (the pair the sphere_tilt separates). ----
+      auto cl_clear = [&](const ArmSeg<Real>& A, const ArmSeg<Real>& B, int js) {
+        const Real excl = (js >= 0) ? (Real)1.3 * scale[js] * (Real)1.3 : (Real)0;
+        Vec3<Real> Cs = (js >= 0) ? P[js].apply_point(Vec3<Real>{0,0,0}) : Vec3<Real>{0,0,0};
+        const Real thr = (Real)1.1 * std::max(A.rtube, B.rtube);
+        Real dmin = std::numeric_limits<Real>::max();
+        for (const auto& pa : A.cl) {
+          if (js >= 0 && nrm3(sub3(pa, Cs)) < excl) continue;
+          for (const auto& pb : B.cl) {
+            if (js >= 0 && nrm3(sub3(pb, Cs)) < excl) continue;
+            dmin = std::min(dmin, nrm3(sub3(pa, pb)));
+          }
+        }
+        return (dmin == std::numeric_limits<Real>::max()) ? dmin : dmin - thr;   // clearance = dist - 1.1*shaft_R
+      };
+      // Only ADJACENT pairs (sharing a junction) are checked: non-adjacent connectors deliberately run close
+      // as racetrack LENSES, so an all-pairs test would false-positive on that intended geometry.
+      Real minAdj = std::numeric_limits<Real>::max(); int ai=-1, aj=-1;
+      for (size_t a = 0; a < segs.size(); a++)
+        for (size_t b = a+1; b < segs.size(); b++) {
+          int js = -1;
+          if (segs[a].j0==segs[b].j0 || segs[a].j0==segs[b].j1) js = segs[a].j0;
+          else if (segs[a].j1==segs[b].j0 || segs[a].j1==segs[b].j1) js = segs[a].j1;
+          if (js < 0) continue;
+          const Real clr = cl_clear(segs[a], segs[b], js);
+          if (clr == std::numeric_limits<Real>::max()) continue;
+          if (clr < minAdj) { minAdj = clr; ai=(int)a; aj=(int)b; }
+        }
+      std::cout << std::setprecision(4)
+                << "  [collision] min ADJACENT-arm centerline clearance (dist - 1.1*shaft_R) = " << minAdj
+                << " (segs " << ai << "," << aj << ")" << std::setprecision(6) << "\n";
+      if (minAdj <= 0)
+        std::cout << "  *** WARNING: adjacent arm centerlines within 1.1*shaft_radius -- arms overlap "
+                  << "(reduce sphere_deg / increase svg_scale) ***\n";
+      // The two MIDDLE connectors (conn 4 & 5 -> seg indices (NJ-2)+4 and +5): report their centerline
+      // clearance explicitly (they are non-adjacent so the guard above skips them, but they are the pair the
+      // sphere_tilt nudges apart).
+      const int s4 = (NJ-2)+4, s5 = (NJ-2)+5;
+      if (s5 < (int)segs.size())
+        std::cout << "  [collision] middle connectors (segs " << s4 << "," << s5 << ") centerline clearance (dist - 1.1*shaft_R) = "
+                  << std::setprecision(4) << cl_clear(segs[s4], segs[s5], -1) << std::setprecision(6) << "\n";
     }
 
     junc.WriteVTK(tag + "-junc", Vector<Real>(), comm);
     arms.WriteVTK(tag + "-arms", Vector<Real>(), comm);
 
     if (geomOnly) {
+      // Geometry-only gate: global int n dA (watertightness / net orientation). Cheap, no quadrature.
+      divergence_check<Real>(junc, arms, tol, comm);
       if (!comm.Rank()) std::cout << "\n[geom-only] meshes written to " << tag << "-{junc,arms}.vtu; skipping BIE.\n";
       Comm::MPI_Finalize();
       return 0;

@@ -238,6 +238,7 @@ Real test_manufactured(const QuadElemList<Real>& junc, const ArmList& arms, cons
   StokesBIO<Real> Op(SL_scal, DL_scal, comm);
   Op.SetAccuracy(tol);
   Op.AddElemList(junc, "0_junc"); Op.AddElemList(arms, "1_arms");
+  Op.SetTargetCoord(X);
 
   const auto ApplyK = [&](Vector<Real>* U, const Vector<Real>& sigma) {
     Vector<Real> Uc;
@@ -311,9 +312,14 @@ Vector<Real> solve_dirichlet_bvp(const QuadElemList<Real>& junc, const ArmList& 
   // SL_scal*S + DL_scal*D and installs the PVFMM-safe translation kernels in its ctor (the default
   // BoundaryIntegralOp setup would register the DL kernel for M2M/M2L/L2L and corrupt the heap under
   // PVFMM -- see include/quad_junctions/fmm_kernels.hpp).
+  // Combined [base ; shaft] nodes (name-sorted "0_base"<"1_shaft"); the DL jump/mean act on these DOFs.
+  Vector<Real> X0, Xn0; Long Nb = 0, Ns = 0;
+  combined_nodes(junc, arms, X0, Xn0, Nb, Ns);
+
   StokesBIO<Real> Op(SL_scal, DL_scal, comm);
   Op.SetAccuracy(tol);
   Op.AddElemList(junc, "0_junc"); Op.AddElemList(arms, "1_arms");
+  Op.SetTargetCoord(X0);
 
   const auto ApplyK = [&](Vector<Real>* U, const Vector<Real>& sigma) {
     Vector<Real> Uc;
