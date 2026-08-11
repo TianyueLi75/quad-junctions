@@ -133,7 +133,6 @@ TARGET_BIN = \
 	$(BINDIR)/ybifurc-vessels-flow-bie \
 	$(BINDIR)/ybifurc-flow-bie \
 	$(BINDIR)/ybifurc-genmesh \
-	$(BINDIR)/ybifurc-export-fmm3dbie \
 	$(BINDIR)/ybifurc-bie-selfsetup \
 	$(BINDIR)/twisted-sphere-selfsetup \
 	$(BINDIR)/stud_sphere-geom \
