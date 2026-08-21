@@ -22,6 +22,11 @@ extern/*
 *.geom
 *.png
 *.svg
+# surface-mesh inputs (large; keep on disk, not in git)
+*.stl
+*.obj
+*.ply
+*.off
 
 # python cache
 __pycache__/
