@@ -41,7 +41,7 @@ void run_setup(const char* kername, Integer order, Long ppf, Real tol, Integer N
   using Ker = KerSL;
 
   QuadElemList<Real> surf = BuildTwistedSphere<Real>(order, ppf, R, theta_twist, comm);
-  surf.SetQuadScheme(QuadElemList<Real>::QuadScheme::Hybrid, cov_q, Nb, md);
+  surf.SetQuadScheme(QuadElemList<Real>::QuadScheme::Duffy, cov_q, Nb, md);   // Duffy is tolerance-driven; cov_q/Nb/md are inert here
 
   // ---- 1. set up the Laplace/Stokes single-layer BIO on the twisted sphere ----
   BoundaryIntegralOp<Real, Ker> BIOp((Ker()), false, comm);
@@ -58,11 +58,20 @@ void run_setup(const char* kername, Integer order, Long ppf, Real tol, Integer N
   const Long Nelem  = surf.Size();
   const Long Nnodes = Xs.Dim() / 3;
 
-  // ---- 3. clear any setup state, then TIME a single cold Setup() ----
+  // ---- 3. warm-up Setup() (first-touch the process-global static tables -- DuffyTable,
+  //         NearGradeTable's rung ladder, ParamNodes, DiffMat), then clear, then TIME a
+  //         single cold Setup(). Without this warm-up the first Setup in the process is
+  //         ~60% slower because those one-time table builds happen INSIDE SetupSingular/
+  //         SetupNear and would otherwise be counted in the profiled t_avg (~2x on small
+  //         meshes). ClearSetup only clears the operator's state, not the static tables, so
+  //         the tables stay warm for the timed run. Same pattern as run_stokes_greens below
+  //         and as bench-cubed-sphere's ConstSL/ConstDL-before-GreensSolError ordering.
+  BIOp.Setup();
+  BIOp.ClearSetup();
+
   // Setup() = SetupBasic + SetupFar + SetupSelf(=SetupSingular) + SetupNear. The fair apples-to-apples
   // against fmm3dbie's getnearquad is SetupSingular + SetupNear (self + near); SetupFarField is the
   // get_far_order analog and is excluded from that metric.
-  BIOp.ClearSetup();
   Profile::Enable(true);
   Profile::reset();
   BIOp.Setup();
@@ -71,7 +80,7 @@ void run_setup(const char* kername, Integer order, Long ppf, Real tol, Integer N
   std::cout << "\n" << kername << "-SL SETUP (SCTL twisted cubed sphere)"
             << "  order=" << order << " ppf=" << ppf << " R=" << R << " theta_twist=" << theta_twist
             << "  Nelem=" << Nelem << "  Nnodes=" << Nnodes
-            << "  (Hybrid cov_q=" << cov_q << " Nbeta=" << Nb << " max_depth=" << md
+            << "  (Duffy tol-driven; cov_q=" << cov_q << " Nbeta=" << Nb << " max_depth=" << md << " inert"
             << " tol=" << tol << ")\n"
             << "  -> speed = Nnodes / t_avg(SetupSingular + SetupNear)\n";
 }
@@ -84,7 +93,7 @@ template <class Real, class KerDL>
 void run_dl_accuracy(const char* kername, Integer order, Long ppf, Real tol, Integer Nb, Integer md,
                      Integer cov_q, Real R, Real theta_twist, const Comm& comm) {
   QuadElemList<Real> surf = BuildTwistedSphere<Real>(order, ppf, R, theta_twist, comm);
-  surf.SetQuadScheme(QuadElemList<Real>::QuadScheme::Hybrid, cov_q, Nb, md);
+  surf.SetQuadScheme(QuadElemList<Real>::QuadScheme::Duffy, cov_q, Nb, md);   // Duffy is tolerance-driven; cov_q/Nb/md are inert here
 
   BoundaryIntegralOp<Real, KerDL> BIOp((KerDL()), false, comm);
   SetPVFMMKer(BIOp);
@@ -119,8 +128,8 @@ void run_dl_accuracy(const char* kername, Integer order, Long ppf, Real tol, Int
 // exterior point source X0, the interior representation gives  SL[du/dn] - DL[u] = u  on the surface
 // (with the -1/2 jump of the DL self term), so the residual max|(SL[Fs] - (DL[Fd]-0.5 Fd)) - u| / max|u|
 // is the standard SL+DL near-quadrature accuracy probe. Densities: Fd = u|_surf, Fs = (grad u . n).
-// Kernels: KerSL=Stokes3D_FxU, KerDL=Stokes3D_DxU, KerGrad=Stokes3D_FxT (traction tensor). Ported from
-// src/stud_sphere-bie.cpp test_greens_identity.
+// Kernels: KerSL=Stokes3D_FxU, KerDL=Stokes3D_DxU, KerGrad=Stokes3D_FxT (traction tensor). The standard
+// on-surface Green's-identity probe (cf. hybrid_bie_tests.hpp).
 //
 // Instrumented for setup timing: SL and DL BIOps are each Setup() ONCE to warm caches, then ClearSetup()'d,
 // then the profiler is reset and a cold Setup() of both is TIMED and printed (SetupSingular + SetupNear)
@@ -132,7 +141,7 @@ void run_stokes_greens(Integer order, Long ppf, Real tol, Integer Nb, Integer md
   const Long pid = comm.Rank();
 
   QuadElemList<Real> surf = BuildTwistedSphere<Real>(order, ppf, R, theta_twist, comm);
-  surf.SetQuadScheme(QuadElemList<Real>::QuadScheme::Hybrid, cov_q, Nb, md);
+  surf.SetQuadScheme(QuadElemList<Real>::QuadScheme::Duffy, cov_q, Nb, md);   // Duffy is tolerance-driven; cov_q/Nb/md are inert here
 
   KerSL kernel_sl; KerDL kernel_dl; KerGrad kernel_grad;
   BoundaryIntegralOp<Real, KerSL> BIOpSL(kernel_sl, false, comm);

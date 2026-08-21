@@ -15,6 +15,7 @@
 #include <sctl.hpp>
 #include <csbq.hpp>                                  // CSBQ SlenderElemList (hybrid arms)
 #include <quad_junctions/ybifurc_hybrid_geom.hpp>   // BuildYJunctionWithTransitions, BuildYArmsSlender, YSwept
+#include <quad_junctions/quad_scheme.hpp>           // QJDefaultScheme (Duffy default, SCTL_SELF_SCHEME=hybrid opt-out)
 #include <quad_junctions/fmm_kernels.hpp>            // SetPVFMMKer (no-op without PVFMM)
 #include <cmath>
 #include <cstdlib>
@@ -43,7 +44,7 @@ void run_setup(const char* kername, Integer order, Integer nref, Real tol,
   SlenderElemList<Real> arms = BuildYArmsSlender<Real>(R0, a0, sc, nAxial, cheb_order, fourier, comm);
   // Junction quad list gets the Hybrid RP scheme; the slender arm list schemes itself off the
   // operator tol (set_arm_scheme is a no-op for SlenderElemList), so it takes no SetQuadScheme.
-  junc.SetQuadScheme(QuadElemList<Real>::QuadScheme::Hybrid, cov_q, Nb, md);
+  junc.SetQuadScheme(quad_junctions::QJDefaultScheme<Real>(), cov_q, Nb, md);
 
   // ---- 1. set up the Laplace/Stokes single-layer BIO on this hybrid surface ----
   BoundaryIntegralOp<Real, Ker> BIOp((Ker()), false, comm);

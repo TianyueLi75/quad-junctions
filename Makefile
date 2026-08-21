@@ -38,6 +38,18 @@ else
 	CXXFLAGS += -O3 -march=native -DNDEBUG
 endif
 
+# Opt-in per-phase near/self setup timers (include/sctl/experimental/bench_quad.hpp).
+# `make BENCH=1 ...` defines BENCH_QUAD, activating the BENCH_TIC/TOC/DUFFY_* macros in the
+# QuadElemList hot loops + the bench::Report/ReportMPI breakdown (e.g. the cilia [nearbench] line).
+# Without it those macros are no-ops and instrumented TUs compile byte-identical to the normal build.
+# As with DEBUG, opt in via BENCH=1 -- do NOT pass CXXFLAGS+=" -DBENCH_QUAD" on the command line,
+# which OVERRIDES (not appends to) the in-file flags and silently drops -O3/-fopenmp/MKL/FFTW. Object
+# files are not keyed by flags, so `make clean` when toggling BENCH on or off.
+BENCH ?= 0
+ifeq ($(BENCH), 1)
+	CXXFLAGS += -DBENCH_QUAD
+endif
+
 OS = $(shell uname -s)
 ifeq "$(OS)" "Darwin"
 	CXXFLAGS += -g -rdynamic -Wl,-no_pie

@@ -3,6 +3,7 @@
 
 #include <string>
 #include <utility>
+#include <vector>
 #include <sctl.hpp>
 
 namespace sctl {
@@ -23,14 +24,14 @@ namespace sctl {
       /**
        * Near/self singular-quadrature scheme: Adaptive (dyadic subdivision +
        * Alpert log correction, default), RectPolar (Bruno-2018 change of var),
-       * Hybrid (Adaptive near + RectPolar self), or LineQBX (Lu 2019 sec.3.1
-       * line-QBX near). For Hybrid the near phase is tolerance-driven (like
-       * Adaptive) while the self phase uses the RectPolar COV knobs (`q`,
-       * `cov_order`/Nbeta) passed to SetQuadScheme. LineQBX affects the near
-       * phase only; its self phase falls back to the Adaptive scheme and its
-       * near knobs are set via SetLineQBXParams.
+       * or Hybrid (Adaptive near + RectPolar self). For Hybrid the near phase is
+       * tolerance-driven (like Adaptive) while the self phase uses the RectPolar
+       * COV knobs (`q`, `cov_order`/Nbeta) passed to SetQuadScheme. Duffy is
+       * Adaptive's split-at-foot near paired with a Duffy edge-collapsed
+       * (sinh-substituted) self, ported from upstream; opt in explicitly, the
+       * tolerance drives it like Adaptive.
        */
-      enum class QuadScheme { Adaptive, RectPolar, Hybrid, LineQBX };
+      enum class QuadScheme { Adaptive, RectPolar, Hybrid, Duffy };
 
       /** Constructor. */
       QuadElemList() {}
@@ -73,15 +74,15 @@ namespace sctl {
       /** True if the near phase uses the RectPolar COV (RectPolar scheme only). */
       bool NearUsesRectPolar() const { return scheme_ == QuadScheme::RectPolar; }
 
-      /** True if the near phase uses the line-QBX scheme (LineQBX only). */
-      bool NearUsesLineQBX() const { return scheme_ == QuadScheme::LineQBX; }
-
       /** True if the self phase uses the RectPolar COV (RectPolar or Hybrid). */
       bool SelfUsesRectPolar() const { return scheme_ == QuadScheme::RectPolar || scheme_ == QuadScheme::Hybrid; }
 
+      /** True if the self phase uses the Duffy edge-collapsed scheme (Duffy only). */
+      bool SelfUsesDuffy() const { return scheme_ == QuadScheme::Duffy; }
+
       /**
        * Set the singular-quadrature scheme.
-       * @param[in] s scheme (Adaptive, RectPolar, or Hybrid).
+       * @param[in] s scheme (see QuadScheme; default Adaptive).
        * @param[in] q derivative-flattening parameter for RectPolar (ignored for Adaptive).
        * @param[in] cov_order RectPolar GL points per direction (Nbeta, Bruno 2018);
        * decoupled from field order. 0 falls back to the tolerance-derived order.
@@ -92,25 +93,6 @@ namespace sctl {
       void SetQuadScheme(QuadScheme s, Integer q = 6, Integer cov_order = 0, Integer max_depth = 30) {
         SCTL_ASSERT_MSG(max_depth == 4 || max_depth == 8 || max_depth == 12 || max_depth == 30, "Adaptive max_depth must be one of {4,8,12,30}.");
         scheme_ = s; cov_q_ = q; cov_order_ = cov_order; max_depth_ = max_depth;
-      }
-
-      /**
-       * Set the line-QBX / "hedgehog" near-quadrature parameters (LineQBX scheme only; Lu 2019
-       * sec.3.1). Check points are placed at heights R + i*r (i=0..p, units of the local patch size
-       * L = sqrt(patch area)) along the patch normal through the target, the potential is evaluated
-       * there with a 4^eta-subpaneled up_order GL rule (0 => 2*order), and extrapolated (degree-p
-       * polynomial) to the target.
-       *
-       * NOTE: accurate only when the target is FAR FROM PANEL SEAMS (edges/corners); near a seam the
-       * per-pair check-point line cannot resolve the adjacent panel's edge singularity (~5e-3 floor).
-       *
-       * Defaults R=r=0.02L, p=16, eta=2, up=72 target deep-near ~1e-10 for panel-interior targets
-       * (verified vs a RectPolar gold at d=1e-4). Accuracy is a U-curve in R and p; up_order/eta only
-       * need to resolve the check points at the chosen R. Paper's cheap ~1e-2 setting: R=r=0.15L, p=8,
-       * eta=1, up=0.
-       */
-      void SetLineQBXParams(Real R_h = 0.02, Real r_h = 0.02, Integer p = 16, Integer up_order = 72, Integer eta = 2) {
-        qbx_R_ = R_h; qbx_r_ = r_h; qbx_p_ = p; qbx_up_order_ = up_order; qbx_eta_ = eta;
       }
 
       /**
@@ -186,8 +168,11 @@ namespace sctl {
       Real GetClosestNode(Real& ustar, Real& vstar, const Long elem_idx, const Vector<Real>& Xtrg) const;
 
       /**
-       * Closest POINT on patch elem_idx to Xtrg over (u,v) in [0,1]^2 (GetClosestNode
-       * seed, then Gauss-Newton with grid-search fallback).
+       * Closest POINT on patch elem_idx to Xtrg over (u,v) in [0,1]^2 (GetClosestNode seed, then
+       * active-set Gauss-Newton with grid-search fallback). A coordinate pinned at a bound by an
+       * outward gradient is held FIXED and the reduced step is solved in the free subspace only,
+       * so metric coupling cannot contaminate the surviving component -- edge/corner feet converge
+       * cleanly rather than bailing to the fallback.
        * @param[out] ustar,vstar parameters of the closest point in [0,1].
        * @param[in] elem_idx element index.
        * @param[in] Xtrg target coordinates (COORD_DIM reals).
@@ -221,6 +206,22 @@ namespace sctl {
       void WriteNearInteracVTK(const std::string& fname, const Long elem_idx, const Vector<Real>& Xtrg, const Real tol, const Comm& comm = Comm::Self()) const;
 
       /**
+       * Visualize THE production adaptive near quadrature (off-surface target): the
+       * foot-graded separable tensor grid built by BuildNearTensorRule -- two 1D
+       * foot-graded partitions (in u and v) tensored over the whole panel, so the
+       * cells cluster toward the foot (u*,v*) and read as four quadrants meeting
+       * there. Writes `<fname>` (per-cell GL nodes as VTK_QUAD, colored by cell
+       * depth) and `<fname>-target`. Unlike WriteNearInteracVTK (which mirrors the
+       * SUPERSEDED isotropic graded-quadtree rule), this matches NearInteracBlockGraded.
+       * @param[in] fname output filename prefix.
+       * @param[in] elem_idx source element index.
+       * @param[in] Xtrg off-surface target coords (COORD_DIM reals).
+       * @param[in] tol accuracy tolerance (match the BIO's SetAccuracy).
+       * @param[in] comm communicator.
+       */
+      void WriteNearInteracGradedVTK(const std::string& fname, const Long elem_idx, const Vector<Real>& Xtrg, const Real tol, const Comm& comm = Comm::Self()) const;
+
+      /**
        * Visualize the on-surface self-interaction structure at (u0,v0) (graded u x
        * Alpert v): writes `<fname>` (quadrature node cloud) and `<fname>-singpt`.
        * @param[in] fname output filename prefix.
@@ -230,6 +231,23 @@ namespace sctl {
        * @param[in] comm communicator.
        */
       void WriteSelfInteracVTK(const std::string& fname, const Long elem_idx, const Real u0, const Real v0, const Real tol, const Comm& comm = Comm::Self()) const;
+
+      /**
+       * Visualize the adaptive self quadrature at (u0,v0) as PANELS (like the near
+       * grid), not a point cloud. The rule is a tensor of centered graded-GL u-panels
+       * x centered composite-v panels; every panel is a GL x GL patch EXCEPT the
+       * innermost v-row touching the singular node, whose v-nodes are the Alpert
+       * log-singular rule (still ordered within the panel). Each (u-panel, v-panel)
+       * cell is emitted as its own VTK_QUAD patch, with the point scalar flagging the
+       * Alpert singular row (1) vs the GL panels (0). Writes `<fname>` and
+       * `<fname>-singpt`.
+       * @param[in] fname output filename prefix.
+       * @param[in] elem_idx source element index.
+       * @param[in] u0,v0 on-surface target parameters in [0,1].
+       * @param[in] tol accuracy tolerance (match the BIO's SetAccuracy).
+       * @param[in] comm communicator.
+       */
+      void WriteSelfInteracGradedVTK(const std::string& fname, const Long elem_idx, const Real u0, const Real v0, const Real tol, const Comm& comm = Comm::Self()) const;
 
       /**
        * Visualize the rectangular-polar (Scheme 2) grid for an off-surface target:
@@ -254,6 +272,34 @@ namespace sctl {
       void WriteSelfInteracRPVTK(const std::string& fname, const Long elem_idx, const Real u0, const Real v0, const Integer Nbeta = 48, const Comm& comm = Comm::Self()) const;
 
       /**
+       * Visualize the Duffy edge-collapsed self rule (Scheme `Duffy`) at (u0,v0):
+       * the four target-anchored triangles, each a (ns x nt) sinh-graded grid that
+       * fans from the singular apex (SelfInteracBlockDuffy's layout). Writes `<fname>`
+       * (warped VTK_QUAD mesh, one point scalar = triangle index 0..3) and
+       * `<fname>-singpt`. `tol` fixes nt via DuffyTOrder just as the solver does.
+       * @param[in] fname output filename prefix.
+       * @param[in] elem_idx source element index.
+       * @param[in] u0,v0 on-surface target parameters in [0,1].
+       * @param[in] tol target tolerance (sets the sinh t-order).
+       * @param[in] comm communicator.
+       */
+      void WriteSelfInteracDuffyVTK(const std::string& fname, const Long elem_idx, const Real u0, const Real v0, const Real tol, const Comm& comm = Comm::Self()) const;
+
+      /**
+       * Visualize the Duffy near rule (Scheme `Duffy`) for an off-surface target:
+       * the split-at-foot cells with the anisotropic u/v refinement ladder of
+       * NearInteracBlockSplitDuffy, each a QuadOrder x QuadOrder GL-node patch of
+       * VTK_QUAD cells (point scalar = cell refinement level). Writes `<fname>` and
+       * `<fname>-target`. `tol` fixes QuadOrder / b_ellipse as the solver does.
+       * @param[in] fname output filename prefix.
+       * @param[in] elem_idx source element index.
+       * @param[in] Xtrg off-surface target coords (COORD_DIM reals).
+       * @param[in] tol target tolerance.
+       * @param[in] comm communicator.
+       */
+      void WriteNearInteracDuffyVTK(const std::string& fname, const Long elem_idx, const Vector<Real>& Xtrg, const Real tol, const Comm& comm = Comm::Self()) const;
+
+      /**
        * Copy the element-list, possibly at a different precision.
        * @param[in] elem_lst input element-list.
        */
@@ -261,7 +307,7 @@ namespace sctl {
 
       template<typename> friend class QuadElemList;
 
-      // Grants unit tests access to the private helpers below; defined in unit-test-quad-element.cpp.
+      // Grants unit tests access to the private helpers below; defined in test-quad-elem.cpp.
       template<typename> friend struct QuadElemTestAccess;
 
     private:
@@ -304,13 +350,15 @@ namespace sctl {
       template <Integer order> static void LagrangeAtOffset(Matrix<Real>& M, Matrix<Real>& dM, Matrix<Real>& MT, Matrix<Real>& dMT, const Vector<Real>& delta, const Integer ti);
       // Geometric panels marching outward from u0 to each end; `levels`+1 panels per side.
       static void BuildCenteredGraded1D(Vector<Real>& delta, Vector<Real>& w, const Real u0, const Integer levels, const Vector<Real>& qnds, const Vector<Real>& qwts);
-      // Offset-valued counterpart of LogSingularQuad1D (which is already outward-graded).
+      // Outward-graded log-singular 1D rule, emitted as offsets `delta` from v0 (singular node at
+      // offset exactly 0) so the innermost panels keep full relative precision.
       static void LogSingularQuad1DCentered(Vector<Real>& delta, Vector<Real>& w, const Real v0, const Integer Lvl, const Integer QuadOrder);
       template <Integer order, Integer digits> static const NodeRuleData& CenteredURule(const Integer ti, const Integer levels);
       template <Integer order, Integer digits> static const NodeRuleData& CenteredVRule(const Integer tj);
 
       // GL rule (nodes, weights) on [0,1] for compile-time count Nbeta (RP uses Nbeta>>50,
-      // beyond LegQuadRule's cache); function-local static, runtime value via dispatch over {128,256,512}.
+      // beyond LegQuadRule's cache); function-local static, runtime value via GLRuleNbetaDispatch
+      // over {48,100,200,300,400,512}.
       template <Integer Nbeta> static const std::pair<Vector<Real>, Vector<Real>>& GLRuleNbeta();
       static const std::pair<Vector<Real>, Vector<Real>>& GLRuleNbetaDispatch(const Integer Nbeta);
 
@@ -326,6 +374,9 @@ namespace sctl {
       // near/self map runtime tolerance to compile-time `digits` (CSBQ-style).
       template <Integer digits> static Integer DigitsQuadOrder();
       template <Integer digits> static Real DigitsBEllipse();
+      // Per-panel GL rule (nodes,weights) for `digits`, built once (ComputeNdsWts is an uncached
+      // O(N^2) Newton solve). Consumed by the foot-graded tensor near (NearInteracBlockGraded).
+      template <Integer digits> static const std::pair<Vector<Real>, Vector<Real>>& DigitsGLRule();
 
       // Number of geometric grading levels (per side) toward v0 in the composite Alpert v-rule,
       // as a function of requested accuracy. Runtime core + compile-time `digits` wrapper.
@@ -333,8 +384,8 @@ namespace sctl {
       template <Integer digits> static Integer DigitsVLevels();
 
       // Default RectPolar Nbeta (GL points per direction) for `digits`, used when cov_order_==0.
-      // Worst-case-calibrated ladder (theta=pi twist sphere, Nbeta_sweep.txt); returns a value
-      // in {128,256,384,512} (the GLRuleNbetaDispatch/RPSelfRuleDispatch ladders).
+      // Worst-case-calibrated ladder (theta=pi twist sphere, Nbeta_sweep.txt); returns a value in
+      // {100,300,400,512}, all within the GLRuleNbetaDispatch/RPSelfRuleDispatch set {48,100,200,300,400,512}.
       static Integer NbetaForDigits(const Integer digits);
 
       // Accumulate a tensor-product quadrature (u_param x v_param, weights wu (x) wv) on
@@ -392,8 +443,75 @@ namespace sctl {
       template <Integer order, Integer digits> static const Vector<GradeRule>& NearGradeTable();
       template <Integer digits, Integer order, class Kernel> static void NearInteracBlockSplit(Matrix<Real>& M_acc, const QuadElemList<Real>& qel, const Long elem_idx, const Vector<Real>& Xtrg, const Vector<Real>& normal_trg, const Kernel& ker);
 
+      // ---- Foot-graded separable-tensor near (QuadScheme::Adaptive / Hybrid) ----
+      // THE production near path for the non-Duffy adaptive schemes. Grade [0,1] toward u* and
+      // toward v* INDEPENDENTLY -- split each side AT the foot (u*,v*), grade geometrically outward
+      // (BuildFootGraded1DSegments) -- then take the FULL TENSOR PRODUCT and integrate the whole
+      // panel with ONE IntegrateBlock: no quadtree, no per-leaf loop, no interval dedup. Matches
+      // RectPolar near accuracy across parametric shear (the isotropic-quadtree split-at-foot rule
+      // it replaced lost ~2-3 orders on smooth geometry). Requires dist > 0 (foot on a cell
+      // boundary), so it must never serve the self path.
+      // One GL rule per segment, concatenated in segment order (contiguous runs -> contiguous slices).
+      static void ExpandSegments(Vector<Real>& param, Vector<Real>& w, const Vector<Real>& seg, const Vector<Real>& qnds, const Vector<Real>& qwts);
+      // Split [0,1] at `center`, grade geometrically outward on each side; innermost segment touches
+      // the foot (admissible only under the off-surface effective distance -> near targets only).
+      static void BuildFootGraded1DSegments(Vector<Real>& seg, Vector<Long>& seg_depth, const Real center, const Real b_ellipse, const Real w_min);
+      // Foot (u*,v*), off-surface distance, and depth cap from GetClosestPoint (the FOOT, not the
+      // nearest node). h_param (optional): off-surface distance in parameter units.
+      static Integer NearFootAndDepth(Real& ustar, Real& vstar, Real& dist, const QuadElemList<Real>& qel, const Long elem_idx, const Vector<Real>& Xtrg, const Real b_ellipse, const Integer max_depth, Real* h_param = nullptr);
+      // Foot-graded tensor rule over the whole panel (u_param x v_param, weights wu (x) wv).
+      static Integer BuildNearTensorRule(Vector<Real>& u_param, Vector<Real>& wu, Vector<Real>& v_param, Vector<Real>& wv,
+                                         Vector<Real>* useg, Vector<Long>* useg_depth, Vector<Real>* vseg, Vector<Long>* vseg_depth,
+                                         const QuadElemList<Real>& qel, const Long elem_idx, const Vector<Real>& Xtrg,
+                                         const Real b_ellipse, const Vector<Real>& qnds, const Vector<Real>& qwts, const Integer max_depth);
+      template <Integer digits, Integer order, class Kernel> static void NearInteracBlockGraded(Matrix<Real>& M_acc, const QuadElemList<Real>& qel, const Long elem_idx, const Vector<Real>& Xtrg, const Vector<Real>& normal_trg, const Kernel& ker);
+
+      // ---- Upstream-ported near path (QuadScheme::Duffy only) ----
+      // Same split-at-foot geometry as NearInteracBlockSplit, but with the upstream additions that
+      // let the near rule hold accuracy under strong parametric shear: (1) a corner-angle bump to
+      // the per-target GL order (the acute tangent angle at the foot sets how much the element
+      // wraps the target, which the parameter-space admissibility test cannot see), and (2) a
+      // deeper refinement ladder (MaxNearLvlCM = mantissa width, vs the 31 above). `digits` is
+      // runtime here, so the grade table is keyed on the runtime GL order q.
+      // The `…CM` suffix = channel-major: these are the caps of the near path that accumulates via
+      // IntegrateNearCM (into the channel-major `acc_cm` buffer), as opposed to the compile-time
+      // MaxNearLvl/NearQuadOrder used by NearInteracBlockSplit.
+      static constexpr Integer MaxNearLvlCM = GetSigBits<Real>::value();  // shell_k -> k, core_k -> MaxNearLvlCM + k
+      static constexpr Integer NearMaxQuadOrderCM = 60;
+      static constexpr Integer MaxDigitsCM = 1 + GetSigBits<Real>::value()*30103/100000;
+      static Integer NearQuadOrderRt(const Integer digits);   // runtime counterpart of NearQuadOrder<digits>
+      static Real NearBEllipseRt(const Integer digits);       // runtime counterpart of NearBEllipse<digits>
+      template <Integer order> static const Vector<GradeRule>& NearGradeTableQ(const Integer q);
+      template <Integer order, class Kernel> static void IntegrateNearCM(const Vector<Real>& normal_trg, const Vector<Real>& wu, const Vector<Real>& wv, const Kernel& ker,
+                                                                         const Matrix<Real>& Mu, const Matrix<Real>& MuT, const Matrix<Real>& MuD,
+                                                                         const Matrix<Real>& Mv, const Matrix<Real>& dMv, const Matrix<Real>& MvT,
+                                                                         const Vector<Real>& src_nodal, const Real nrm_sign, Vector<Real>& acc_cm);
+      template <Integer order, class Kernel> static void NearInteracBlockSplitDuffy(Matrix<Real>& M_acc, const QuadElemList<Real>& qel, const Long elem_idx, const Vector<Real>& Xtrg, const Vector<Real>& normal_trg, const Kernel& ker, const Integer digits);
+
       // Per-target singular self-interaction block at (u0,v0): graded u-refinement + 1D log rule in v.
       template <Integer digits, Integer order, class Kernel> static void SelfInteracBlock(Matrix<Real>& M_acc, const QuadElemList<Real>& qel, const Long elem_idx, const Integer ti, const Integer tj, const Vector<Real>& Xtrg, const Vector<Real>& normal_trg, const Kernel& ker);
+
+      // Duffy edge-collapsed self scheme (QuadScheme::Duffy; ported from upstream). The panel is split
+      // at the target (u0,v0) into four triangles, each parametrised P(s,t) = (u0,v0) + s*c(t) with
+      // |det| = s*|a x b|. The s factor cancels the 1/r singularity, so s takes a plain GL rule and t a
+      // sinh-substituted rule concentrated at the foot of the perpendicular. Only the t-rule depends on
+      // the metric and tolerance; everything below is fixed by (order, ti, tj, tri). `digits` is runtime.
+      struct DuffyTri {
+        bool swap_ab = false;    // collapsed (s-only) coordinate is u => local (alpha,beta) = (v,u)
+        Real nsign = 1;          // restores the sign of dX/du x dX/dv
+        Real J0 = 0;             // |a x b|
+        Matrix<Real> WbC;        // (order x 2*ns) = [Wb | Wb'], collapsed direction at the s-nodes
+        Matrix<Real> WbT;        // (ns x order), adjoint of the value half
+        Vector<Matrix<Real>> MiC, MiT;       // ns entries: (order x 2*order) = [Mi | Mi'], and (order x order)
+      };
+      struct DuffySelfTable {
+        Integer ns = 0;
+        Vector<Real> sn, sw;
+        std::vector<DuffyTri> tri;   // 4*order*order entries, indexed (ti*order + tj)*4 + tri
+      };
+      template <Integer order> static const DuffySelfTable& DuffyTable();
+      static Integer DuffyTOrder(const Integer digits, const Integer order, const Integer kdim0);
+      template <Integer order, class Kernel> static void SelfInteracBlockDuffy(Matrix<Real>& M_acc, const QuadElemList<Real>& qel, const Long elem_idx, const Integer ti, const Integer tj, const Vector<Real>& Xtrg, const Vector<Real>& normal_trg, const Kernel& ker, const Integer digits);
 
       // Rectangular-polar (Bruno-2018) change-of-variable 1D rule on [0,1]: maps {gl_nds,gl_wts}
       // via eta_alpha to cluster toward the singularity (alpha=2*sing-1) with vanishing weight;
@@ -403,22 +521,10 @@ namespace sctl {
       // Shared core for WriteNear/SelfInteracRPVTK: warped Nbeta x Nbeta CoV grid clustered toward (ustar,vstar).
       void WriteRectPolarGridVTK(const std::string& fname, const Long elem_idx, const Real ustar, const Real vstar, const Integer Nbeta) const;
 
-      // RP counterparts of NearInteracBlock/SelfInteracBlock; quadrature size is cov_order_ if set,
-      // else the tol-derived `nbeta_default` the caller passes (NbetaForDigits(digits)).
+      // RectPolar near/self blocks. Quadrature size is cov_order_ if set, else the tol-derived
+      // `nbeta_default` the caller passes (NbetaForDigits(digits)).
       template <Integer order, class Kernel> static void NearInteracBlockRP(Matrix<Real>& M_acc, const QuadElemList<Real>& qel, const Long elem_idx, const Vector<Real>& Xtrg, const Vector<Real>& normal_trg, const Kernel& ker, const Integer nbeta_default);
       template <Integer order, class Kernel> static void SelfInteracBlockRP(Matrix<Real>& M_acc, const QuadElemList<Real>& qel, const Long elem_idx, const Integer ti, const Integer tj, const Vector<Real>& Xtrg, const Vector<Real>& normal_trg, const Kernel& ker, const Integer nbeta_default);
-
-      // Line-QBX / hedgehog near-interaction block (Lu 2019 sec.3.1); knobs from SetLineQBXParams.
-      // Accurate only for panel-interior targets (see SetLineQBXParams seam caveat).
-      template <Integer order, class Kernel> static void NearInteracBlockQBX(Matrix<Real>& M_acc, const QuadElemList<Real>& qel, const Long elem_idx, const Vector<Real>& Xtrg, const Vector<Real>& normal_trg, const Kernel& ker);
-
-      // Batched Line-QBX / hedgehog near-interaction for ALL near targets of one element (the
-      // production path; NearInteracBlockQBX above is the equivalent per-target reference). The
-      // upsampled source-patch geometry and the sub-panel interp rules are target-independent, so
-      // they are precomputed ONCE per element and reused across every target and check point; only
-      // the kernel evaluation and the (accumulate-then-project) contraction remain per check point.
-      // Writes the full nnode*KDIM0 x Ntrg*KDIM1_out operator M (same layout as NearInteracHelper).
-      template <Integer order, class Kernel> static void NearInteracBatchedQBX(Matrix<Real>& M, const QuadElemList<Real>& qel, const Long elem_idx, const Vector<Real>& Xt, const Vector<Real>& normal_trg, const Kernel& ker);
 
       Long nelem = 0;
       Integer order = 0;
@@ -428,13 +534,6 @@ namespace sctl {
       Integer cov_q_ = 6;
       Integer cov_order_ = 0;
       Integer max_depth_ = 30;
-      // Line-QBX near knobs (LineQBX scheme only); see SetLineQBXParams. Defaults target deep-near
-      // accuracy ~1e-10 (verified vs a RectPolar gold at d=1e-4). L = sqrt(patch area).
-      Real qbx_R_ = 0.02;         // first check-point distance in units of patch size L
-      Real qbx_r_ = 0.02;         // check-point spacing in units of L
-      Integer qbx_p_ = 16;        // extrapolant degree (p+1 check points)
-      Integer qbx_up_order_ = 72; // per-subpatch smooth-rule GL order; 0 => 2*order
-      Integer qbx_eta_ = 2;       // sub-paneling level: 4^eta = (2^eta)^2 subpatches
   };
 
 }

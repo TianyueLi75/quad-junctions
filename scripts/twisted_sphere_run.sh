@@ -16,11 +16,11 @@
 # Nbeta in {48,100,200,300,400,512} and max_depth in {4,8,12,30}. (48,4) is the COARSEST rule, so the
 # 1e-3 row reuses it (SCTL's rule floor), differing from 1e-5 only in the tol handed to SetAccuracy.
 #
-# PARALLELISM: after the (serial) build, each (tol tier x twist) task is a SEPARATE single-threaded
-# process (OMP_NUM_THREADS=1 + MKL_NUM_THREADS=1) pinned to its OWN physical core via `taskset -c`. Cores
-# are discovered dynamically from `lscpu` and round-robin-assigned; tasks run in parallel in batches of
-# NCORES so no core is ever oversubscribed. Per-task output is buffered to a temp log and printed in
-# deterministic order after each batch.
+# PARALLELISM: after the (serial) build, each (tol tier x twist) task runs SEQUENTIALLY as a
+# SINGLE-CORE process (OMP_NUM_THREADS=1, MKL_NUM_THREADS=1), pinned via `taskset -c` to one physical
+# core (the first discovered). So every timing row is a true 1-core run -- the per-core baseline, with
+# no OpenMP scaling. MKL never multithreads anyway (the binary links -lmkl_sequential).
+# Tasks run one at a time.
 #
 # Then an OMP THREAD-SCALING sub-study runs a single process at OMP threads {1,2,4,8,16,32} for the 1e-9
 # tier at twist=pi, written to a SEPARATE log (out/twisted-sphere-omp-<job>.log) so the main parser is
@@ -32,7 +32,7 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=64
-#SBATCH --time=01:30:00
+#SBATCH --time=03:00:00
 #SBATCH --output=out/twisted-sphere-sweep-%j.log
 #SBATCH --error=out/twisted-sphere-sweep-%j.log
 
@@ -67,7 +67,7 @@ MDS=( 4    4    8    12   30  )       # max_depth per tol
 # 6 * PPF^2 * order^2. Held fixed here at order 12 / ppf 8 (the twist-angle degradation, not the
 # {ppf,order} plateau, is the variable of interest).
 ORDER=12
-PPF=8
+PPF=12
 
 # --- discover physical cores (one logical CPU per physical core) ---
 mapfile -t CORES < <(lscpu -p=CPU,CORE 2>/dev/null | grep -v '^#' | sort -t, -k2 -n -u | cut -d, -f1)
@@ -83,30 +83,21 @@ for k in "${!TOLS[@]}"; do
   done
 done
 NJOBS=${#JOBS[@]}
-echo "# dispatching $NJOBS tasks (order=$ORDER ppf=$PPF) in parallel batches of $NCORES"
+CORE=${CORES[0]}     # the single physical core every timing task is pinned to
+echo "# running $NJOBS tasks (order=$ORDER ppf=$PPF) SEQUENTIALLY, each on 1 core (core=$CORE)"
 
-LOGDIR=$(mktemp -d "${TMPDIR:-/tmp}/twist-greens.XXXXXX")
-trap 'rm -rf "$LOGDIR"' EXIT
-
-# --- run in batches of NCORES; each task pinned to its own physical core, output printed in order ---
-i=0
-while [ "$i" -lt "$NJOBS" ]; do
-  batch_logs=()
-  for ((c = 0; c < NCORES && i < NJOBS; c++, i++)); do
-    read -r tol nb md twist <<< "${JOBS[$i]}"
-    core=${CORES[$c]}
-    log="$LOGDIR/job-$(printf '%03d' "$i").log"
-    batch_logs+=("$log")
-    {
-      echo "########################################################################"
-      echo "# core=$core  tol=$tol  (Nbeta=$nb  max_depth=$md)  twist=$twist  order=$ORDER ppf=$PPF"
-      echo "########################################################################"
-      OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OMP_PROC_BIND=true \
-        taskset -c "$core" "$SCTL_BIN" stokes_greens "$ORDER" "$PPF" "$tol" "$nb" "$md" "$COVQ" "$R" "$twist"
-    } > "$log" 2>&1 &
-  done
-  wait || true            # let the sweep continue even if a task exits non-zero (its log still prints)
-  for log in "${batch_logs[@]}"; do echo ""; cat "$log"; done
+# --- run each task SINGLE-CORE (OMP_NUM_THREADS=1), pinned to one physical core, one at a time.
+#     This is the per-core baseline -- no OpenMP scaling. Output goes straight to stdout in job order;
+#     the '# core=' block header is kept as the anchor parse_twisted_sphere.sh reads. ---
+for ((i = 0; i < NJOBS; i++)); do
+  read -r tol nb md twist <<< "${JOBS[$i]}"
+  echo ""
+  echo "########################################################################"
+  echo "# core=$CORE  tol=$tol  (Nbeta=$nb  max_depth=$md)  twist=$twist  order=$ORDER ppf=$PPF"
+  echo "########################################################################"
+  OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OMP_PROC_BIND=true \
+    taskset -c "$CORE" "$SCTL_BIN" stokes_greens "$ORDER" "$PPF" "$tol" "$nb" "$md" "$COVQ" "$R" "$twist" \
+    || true            # keep the sweep going even if one task exits non-zero
 done
 
 # =====================================================================================================
