@@ -125,6 +125,9 @@ TARGET_BIN = \
 	$(BINDIR)/bifurc-general-geom \
 	$(BINDIR)/bifurc-general-bie \
 	$(BINDIR)/bifurc-general-load-bie \
+	$(BINDIR)/bifurc-network-assemble \
+	$(BINDIR)/bifurc-network-vtk \
+	$(BINDIR)/bifurc-network-flow-bie \
 	$(BINDIR)/ybifurc-hybrid-bie \
 	$(BINDIR)/ybifurc-multi-bie \
 	$(BINDIR)/ybifurc-tree-bie \
@@ -132,13 +135,12 @@ TARGET_BIN = \
 	$(BINDIR)/ybifurc-vessels-bie \
 	$(BINDIR)/ybifurc-vessels-flow-bie \
 	$(BINDIR)/ybifurc-flow-bie \
+	$(BINDIR)/ybifurc-yflow-bie \
 	$(BINDIR)/ybifurc-genmesh \
 	$(BINDIR)/ybifurc-bie-selfsetup \
 	$(BINDIR)/twisted-sphere-selfsetup \
-	$(BINDIR)/stud_sphere-geom \
-	$(BINDIR)/stud_sphere-bie \
-	$(BINDIR)/stud_sphere-hybrid-bie \
-	$(BINDIR)/cilia_carpet-bie
+	$(BINDIR)/cilia_carpet-bie \
+	$(BINDIR)/cilia_bridge-bie
 
 all: $(TARGET_BIN)
 

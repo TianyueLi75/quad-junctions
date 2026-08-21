@@ -45,9 +45,15 @@ __pycache__/
 /build-fmm3dbie.log
 *.pdf
 
-# Claude-generated docs/instructions
-CLAUDE.md
-docs/*.md
+# markdown docs (keep README.md tracked)
+*.md
+!README.md
+
+# LaTeX sources
+*.tex
+
+# generalized-bifurcation geometry bundles
+/geom/
 
 # run artifacts
 *.log
