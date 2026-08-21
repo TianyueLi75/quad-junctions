@@ -35,10 +35,51 @@ using namespace sctl;
 // caller wants. Invoked ONLY on a single serial rank, where the global node ordering is intact.
 template <class Real> using RegionReport = std::function<void(const Vector<Real>& err, Long Nj, Long Na)>;
 
-// Concatenate the two lists' node coords/normals in NAME-SORTED order (junc "0_..." then arms "1_...").
+// ---- CSBQ well-conditioned slender-body single-layer coefficient magnitude, per LOCAL arm surface node.
+//      Malhotra-Barnett 2024 (CSBQ) Eq. (33): the Stokes slender combined-field BIE K = I/2 + D + S*eta(s)
+//      with eta(s) = 1/(2*eps*log(1/eps)) has an O(1) condition number as the cross-section radius eps->0,
+//      versus a constant single-layer coefficient which blows up like 1/(eps*log(1/eps)). We apply this per
+//      node on the slender arms only (the bulky quad junction keeps its constant SL_scal). The magnitude is
+//      returned POSITIVE; the caller (solve_dirichlet_bvp) re-applies the interior/exterior SL sign.
+//
+//      eps is recovered per surface node EXACTLY from GetGeom's theta-tangent: with the tube parametrised as
+//      y = c + e1*eps*cos(theta) + e2*eps*sin(theta) and {e1,e2} orthonormal, dY/dtheta = e1*(-eps*sin) +
+//      e2*(eps*cos), so |dY/dtheta| = eps independent of theta (slender_element.cpp:3156). A single theta
+//      probe therefore suffices; eps is replicated across the panel's Nt fourier nodes (node = j*Nt + i,
+//      s-major/theta-minor -- slender_element.cpp:3163-3189). Only the slender regime eps <= eps_max is
+//      scaled; elsewhere eta=0 signals "keep the constant SL_scal". Output length = local arm node count,
+//      matching arms.GetNodeCoord() (which drives the "1_arms" slice of the combined density). ----
+template <class Real>
+void arm_slender_sl_eta(const SlenderElemList<Real>& arms, const Long cheb,
+                        Vector<Real>& eta, const Real eps_max = (Real)0.1) {
+  eta.ReInit(0);
+  const Long Nelem = arms.Size();                                   // LOCAL panels under MPI
+  if (!Nelem || cheb <= 0) return;
+  const Vector<Real>& snodes = SlenderElemList<Real>::CenterlineNodes((Integer)cheb);  // Ns = cheb s-nodes
+  Vector<Real> sin1(1), cos1(1); sin1[0] = 0; cos1[0] = 1;          // one theta probe (eps is theta-indep.)
+  Vector<Long> cnt; arms.GetNodeCoord(nullptr, nullptr, &cnt);      // cnt[e] = cheb * fourier(e)
+  for (Long e = 0; e < Nelem; e++) {
+    SCTL_ASSERT_MSG(cnt[e] % cheb == 0, "arm_slender_sl_eta: node count not a multiple of cheb");
+    const Long Nt = cnt[e] / cheb;                                  // fourier order of this panel
+    Vector<Real> dXdt;
+    arms.GetGeom(nullptr, nullptr, nullptr, nullptr, &dXdt, snodes, sin1, cos1, e);   // cheb nodes, AoS
+    for (Long j = 0; j < cheb; j++) {
+      Real r2 = 0; for (Integer k = 0; k < 3; k++) { const Real c = dXdt[j*3+k]; r2 += c*c; }
+      const Real r = sqrt<Real>(r2);
+      Real val = 0;
+      if (r > 0 && r <= eps_max) { const Real lg = log<Real>(1/r); if (lg > 0) val = 1 / (2*r*lg); }
+      for (Long i = 0; i < Nt; i++) eta.PushBack(val);              // replicate across theta (s-major order)
+    }
+  }
+}
+
+// Concatenate the lists' node coords/normals in NAME-SORTED order (junc "0_..." then arms "1_...",
+// then optional obstacles "2_..."). When `obst` is given, its node count is returned in *No_out and
+// its nodes are appended last (matching StokesBIO's name-sorted "2_obst" block).
 template <class Real, class ArmList>
 void combined_nodes(const QuadElemList<Real>& junc, const ArmList& arms,
-                    Vector<Real>& X, Vector<Real>& Xn, Long& Nj, Long& Na) {
+                    Vector<Real>& X, Vector<Real>& Xn, Long& Nj, Long& Na,
+                    const ArmList* obst = nullptr, Long* No_out = nullptr) {
   Vector<Real> Xj, Xnj, Xa, Xna;
   junc.GetNodeCoord(&Xj, &Xnj, nullptr);
   arms.GetNodeCoord(&Xa, &Xna, nullptr);
@@ -46,8 +87,12 @@ void combined_nodes(const QuadElemList<Real>& junc, const ArmList& arms,
   X.ReInit(0); Xn.ReInit(0);
   for (auto v : Xj)  X.PushBack(v);
   for (auto v : Xa)  X.PushBack(v);
+  Vector<Real> Xo, Xno; Long No = 0;
+  if (obst) { obst->GetNodeCoord(&Xo, &Xno, nullptr); No = Xo.Dim()/3; for (auto v : Xo) X.PushBack(v); }
   for (auto v : Xnj) Xn.PushBack(v);
   for (auto v : Xna) Xn.PushBack(v);
+  if (obst) for (auto v : Xno) Xn.PushBack(v);
+  if (No_out) *No_out = No;
 }
 
 // ---- Watertightness / orientation check: int n dA = 0 for any closed, consistently-oriented surface.
@@ -295,7 +340,9 @@ Vector<Real> solve_dirichlet_bvp(const QuadElemList<Real>& junc, const ArmList& 
                                  const Real tol, const Vector<Real>& bc, const bool interior,
                                  Real SL_scal, Real DL_scal, const Vector<Real>& Xtrg, Vector<Real>* U_trg,
                                  const std::string& name, const Long gmres_max_iter = 400,
-                                 const JunctionPrecondSpec<Real>* precond = nullptr) {
+                                 const JunctionPrecondSpec<Real>* precond = nullptr,
+                                 const Vector<Real>& arm_sl_eta = Vector<Real>(),
+                                 const ArmList* obstacles = nullptr, Long* n_iter = nullptr) {
   // Solved through StokesBIO (Stokes3D kernels only); KerSL/KerDL remain in the signature because every
   // caller names them explicitly (ybifurc-flow / -vessels-flow / -channel all pass the Stokes pair).
   static_assert(std::is_same<KerSL, Stokes3D_FxU>::value && std::is_same<KerDL, Stokes3D_DxU>::value,
@@ -313,20 +360,68 @@ Vector<Real> solve_dirichlet_bvp(const QuadElemList<Real>& junc, const ArmList& 
   // BoundaryIntegralOp setup would register the DL kernel for M2M/M2L/L2L and corrupt the heap under
   // PVFMM -- see include/quad_junctions/fmm_kernels.hpp).
   // Combined [base ; shaft] nodes (name-sorted "0_base"<"1_shaft"); the DL jump/mean act on these DOFs.
-  Vector<Real> X0, Xn0; Long Nb = 0, Ns = 0;
-  combined_nodes(junc, arms, X0, Xn0, Nb, Ns);
+  Vector<Real> X0, Xn0; Long Nb = 0, Ns = 0, No = 0;
+  combined_nodes(junc, arms, X0, Xn0, Nb, Ns, obstacles, &No);
 
   StokesBIO<Real> Op(SL_scal, DL_scal, comm);
   Op.SetAccuracy(tol);
   Op.AddElemList(junc, "0_junc"); Op.AddElemList(arms, "1_arms");
+  if (obstacles) Op.AddElemList(*obstacles, "2_obst");
   Op.SetTargetCoord(X0);
 
-  const auto ApplyK = [&](Vector<Real>* U, const Vector<Real>& sigma) {
-    Vector<Real> Uc;
-    Op.ComputePotential(Uc, sigma);   // = SL_scal*S[sigma] + DL_scal*D[sigma]
-    if (U->Dim() != sigma.Dim()) U->ReInit(sigma.Dim());
-    (*U) = Uc + jump*sigma;
+  // Obstacle spheres carry the CSBQ normal pointing INTO the fluid (opposite the vessel walls), so
+  // their DL self-jump has the OPPOSITE sign. jump_of_node = +jump on junc+arms, -jump on the "2_obst"
+  // block (see include/quad_junctions/sphere_obstacles.hpp). No obstacles => scalar path, bit-identical.
+  const bool has_obst = (obstacles != nullptr) && (No > 0);
+
+  // ---- Optional CSBQ well-conditioned per-node single-layer scaling on the arm DOFs (Malhotra-Barnett
+  // ---- 2024, Eq. 33; built once per geometry by the caller via arm_slender_sl_eta as a POSITIVE
+  // ---- magnitude). Build a per-node scalar SL coefficient sl_w: junction nodes keep the constant SL_scal
+  // ---- (bulky -- not slender), arm nodes take copysign(eta, SL_scal) where eta>0, else fall back to
+  // ---- SL_scal (nodes outside the slender regime eps<=eps_max). Empty arm_sl_eta => scaling OFF and the
+  // ---- code path below is bit-identical to the old ComputePotential apply. ----
+  const bool use_sl_scaling = (arm_sl_eta.Dim() > 0);
+  Vector<Real> sl_w;
+  if (use_sl_scaling) {
+    SCTL_ASSERT_MSG(arm_sl_eta.Dim() == Ns, "solve_dirichlet_bvp: arm_sl_eta length != local arm node count");
+    sl_w.ReInit(Nb + Ns + No);
+    for (Long i = 0; i < Nb; i++) sl_w[i] = SL_scal;
+    for (Long i = 0; i < Ns; i++) { const Real e = arm_sl_eta[i]; sl_w[Nb+i] = (e > 0 ? (SL_scal < 0 ? -e : e) : SL_scal); }
+    for (Long i = 0; i < No; i++) sl_w[Nb+Ns+i] = SL_scal;   // obstacle spheres are not slender -> constant SL
+  }
+  const Long KDIM = KerSL::SrcDim();
+
+  // Add the (possibly per-block-signed) DL self-jump term jump*sigma into an on-surface field U.
+  const auto add_jump = [&](Vector<Real>& U, const Vector<Real>& sigma) {
+    if (!has_obst) { for (Long i = 0; i < U.Dim(); i++) U[i] += jump*sigma[i]; return; }
+    const Long nbs = Nb + Ns;   // junc+arms keep +jump; the "2_obst" block gets -jump (flipped normal)
+    for (Long n = 0;   n < nbs;    n++) for (Long k = 0; k < KDIM; k++) U[n*KDIM+k] +=  jump*sigma[n*KDIM+k];
+    for (Long n = nbs; n < nbs+No; n++) for (Long k = 0; k < KDIM; k++) U[n*KDIM+k] += -jump*sigma[n*KDIM+k];
   };
+
+  // Apply the represented field SL_scal*S + DL_scal*D at the currently-set targets, optionally + jump*sigma
+  // (on-surface). With per-node SL scaling ON, the single layer acts on the arm-scaled density sl_w (x) sigma
+  // via the raw ComputeSL (which carries no scalar), so the arm SL coefficient is copysign(eta,SL_scal) while
+  // the junction coefficient stays SL_scal; the double layer and jump are untouched.
+  const auto apply_field = [&](Vector<Real>* U, const Vector<Real>& sigma, const bool with_jump) {
+    // (operator= resizes *U; on-surface out-dim == sigma.Dim(), off-surface it == Ntrg*TrgDim)
+    if (!use_sl_scaling) {
+      Vector<Real> Uc;
+      Op.ComputePotential(Uc, sigma);           // = SL_scal*S[sigma] + DL_scal*D[sigma]
+      (*U) = Uc;
+      if (with_jump) add_jump(*U, sigma);
+      return;
+    }
+    Vector<Real> sig_sl(sigma.Dim());
+    const Long Nn = sl_w.Dim();
+    for (Long n = 0; n < Nn; n++) for (Long k = 0; k < KDIM; k++) sig_sl[n*KDIM+k] = sl_w[n] * sigma[n*KDIM+k];
+    Vector<Real> Us, Ud;
+    Op.ComputeSL(Us, sig_sl);                   // raw S[ sl_w (x) sigma ]
+    Op.ComputeDL(Ud, sigma);                    // raw D[sigma]
+    (*U) = Us + Ud*DL_scal;
+    if (with_jump) add_jump(*U, sigma);
+  };
+  const auto ApplyK = [&](Vector<Real>* U, const Vector<Real>& sigma) { apply_field(U, sigma, true); };
 
   // ---- Optional block-diagonal LEFT preconditioner on the junction rows (see
   // ---- quad_junctions/junction_precond.hpp). Left-preconditioning means we solve
@@ -356,18 +451,18 @@ Vector<Real> solve_dirichlet_bvp(const QuadElemList<Real>& junc, const ArmList& 
   // that can run hundreds of matvecs at minutes each, the residual history is the only way to tell slow
   // convergence from stagnation, and it costs one line of log per iteration.
   GMRES<Real> solver(comm, true);
-  KrylovPrecond<Real> krylov;
   Vector<Real> sigma;
   Long iter = 0;
   const Real gmres_tol = tol * (Real)10;
   Profile::Enable(true); Profile::reset();
   Profile::Tic("gmres solve", &comm);
-  if (P.active()) solver(&sigma, ApplyK_precond, bc_use, gmres_tol, gmres_max_iter, false, &iter, &krylov);
-  else            solver(&sigma, ApplyK,         bc_use, gmres_tol, gmres_max_iter, false, &iter, &krylov);
+  if (P.active()) solver(&sigma, ApplyK_precond, bc_use, gmres_tol, gmres_max_iter, false, &iter);
+  else            solver(&sigma, ApplyK,         bc_use, gmres_tol, gmres_max_iter, false, &iter);
   Profile::Toc();
   Profile::print(&comm, {"t_avg", "f/s_avg"});
   Profile::reset();
   if (!comm.Rank()) std::cout << "  " << name << ": GMRES iters=" << iter << "\n";
+  if (n_iter) *n_iter = iter;
 
   // TRUE (unpreconditioned) relative residual ||b - A sigma|| / ||b||. Mandatory once left
   // preconditioning is in play: the per-iteration "KSP Residual norm" history is then the
@@ -393,7 +488,7 @@ Vector<Real> solve_dirichlet_bvp(const QuadElemList<Real>& junc, const ArmList& 
   // empty (targets are typically supplied on rank 0 only), so the guard is on U_trg, NOT on Xtrg.Dim().
   if (U_trg) {
     Op.SetTargetCoord(Xtrg);
-    Op.ComputePotential(*U_trg, sigma);
+    apply_field(U_trg, sigma, /*with_jump=*/false);   // same represented field (incl. any arm SL scaling)
   }
   return sigma;
 }
