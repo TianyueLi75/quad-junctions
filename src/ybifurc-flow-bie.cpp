@@ -31,6 +31,7 @@
 
 #include <csbq.hpp>                                  // CSBQ SlenderElemList + CubeVolumeVis
 #include <quad_junctions/ybifurc_assembly.hpp>       // composable component API
+#include <quad_junctions/quad_scheme.hpp>            // QJDefaultScheme (Duffy default, SCTL_SELF_SCHEME=hybrid opt-out)
 #include <quad_junctions/hybrid_bie_tests.hpp>       // combined_nodes + solve_dirichlet_bvp
 #include <cmath>
 #include <cstdio>
@@ -175,7 +176,7 @@ int main(int argc, char** argv) {
 
     QuadElemList<Real> junc = A.quad(comm);
     SlenderElemList<Real> arms = A.slender(comm);
-    junc.SetQuadScheme(QuadElemList<Real>::QuadScheme::Hybrid, cov_q, Nbeta, maxdep);
+    junc.SetQuadScheme(quad_junctions::QJDefaultScheme<Real>(), cov_q, Nbeta, maxdep);
     const std::string tag = "vis/ybifurc-flow-ord" + std::to_string((long)ord) + "-nref" + std::to_string((long)nref);
 
     // ----------------------------------------------------------------------------------------------

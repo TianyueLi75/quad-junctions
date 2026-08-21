@@ -28,6 +28,7 @@
 
 #include <csbq.hpp>                                  // CSBQ SlenderElemList
 #include <quad_junctions/ybifurc_assembly.hpp>       // composable component API
+#include <quad_junctions/quad_scheme.hpp>            // QJDefaultScheme (Duffy default, SCTL_SELF_SCHEME=hybrid opt-out)
 #include <quad_junctions/hybrid_bie_tests.hpp>       // shared BIE identity / watertightness tests
 #include <array>
 #include <cmath>
@@ -300,7 +301,7 @@ int main(int argc, char** argv) {
       std::cout << "    [region max] quad(junctions+transitions+caps)=" << mj << " slender(arms)=" << ma << "\n";
     };
 
-    junc.SetQuadScheme(QuadElemList<Real>::QuadScheme::Hybrid, cov_q, Nbeta, maxdep);
+    junc.SetQuadScheme(quad_junctions::QJDefaultScheme<Real>(), cov_q, Nbeta, maxdep);
     if (!comm.Rank())
       std::cout << "\n---- BIE verification [tol=" << tol << " Nbeta=" << Nbeta << " max_depth=" << maxdep
                 << " cov_q=" << cov_q << "] ----\n";

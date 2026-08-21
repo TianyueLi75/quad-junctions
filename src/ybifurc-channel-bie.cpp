@@ -70,7 +70,9 @@
 
 #include <csbq.hpp>                                  // CSBQ SlenderElemList
 #include <quad_junctions/ybifurc_assembly.hpp>       // composable component API (add_bent_arm)
-#include <quad_junctions/interior_viz.hpp>           // build_arm_panel_targets / build_box_targets (interior viz)
+#include <quad_junctions/quad_scheme.hpp>            // QJDefaultScheme (Duffy default, SCTL_SELF_SCHEME=hybrid opt-out)
+#include <quad_junctions/interior_viz.hpp>           // dense arm-volume + junction-box hex interior viz
+#include <quad_junctions/sphere_obstacles.hpp>       // spherical obstacles near the centerlines (QJ_OBSTACLE)
 #include <quad_junctions/hybrid_bie_tests.hpp>       // shared BIE identity / watertightness tests
 #include <array>
 #include <cctype>
@@ -136,7 +138,7 @@ void run_verify(QuadElemList<Real>& junc, SlenderElemList<Real>& arms, const Com
               << " | slender panels=" << nap << " nodes=" << nan << " ----\n"
               << "  [near-eval] Hybrid(cov_q=" << cov_q << ", Nbeta=" << Nbeta << ", max_depth=" << md
               << ")  tol=" << std::setprecision(1) << tol << "\n" << std::setprecision(6);
-  junc.SetQuadScheme(QuadElemList<Real>::QuadScheme::Hybrid, cov_q, Nbeta, md);
+  junc.SetQuadScheme(quad_junctions::QJDefaultScheme<Real>(), cov_q, Nbeta, md);
   divergence_check<Real>(junc, arms, tol, comm);
   if (!comm.Rank()) std::cout << "    [Laplace] "; test_DLIdentity<Real, Laplace3D_DxU>(junc, arms, comm, tol, tag+"-dl-laplace", region_report);
   if (!comm.Rank()) std::cout << "    [Stokes]  "; test_DLIdentity<Real, Stokes3D_DxU>(junc, arms, comm, tol, tag+"-dl-stokes", region_report);
@@ -266,7 +268,7 @@ void run_manufactured(QuadElemList<Real>& junc, SlenderElemList<Real>& arms, con
 
   // Solve the EXTERIOR combined-field CFIE (interior=false -> jump=+1/2*DL_scal; no SL-sign flip) and
   // evaluate the represented velocity at Xall. Verbose GMRES prints the residual per iteration.
-  junc.SetQuadScheme(QuadElemList<Real>::QuadScheme::Hybrid, cov_q, Nbeta, md);
+  junc.SetQuadScheme(quad_junctions::QJDefaultScheme<Real>(), cov_q, Nbeta, md);
   Vector<Real> Uall;
   const Vector<Real> sigma = solve_dirichlet_bvp<Real, Stokes3D_FxU, Stokes3D_DxU>(
       junc, arms, comm, tol, bc, /*interior=*/false, SL_scal, DL_scal, Xall, &Uall,
@@ -362,7 +364,10 @@ void run_flow(QuadElemList<Real>& junc, SlenderElemList<Real>& arms, const Comm&
               const HybridJunction<Real>& JA, const HybridJunction<Real>& JB, const Real s_cap,
               const std::string& tag, const Real tol, const Integer Nbeta, const Integer md,
               const Integer cov_q, const Real p_in, const Real p_out, const Long gmres_max_iter,
-              const Long Ngrid, const Real SL_scal, const Real DL_scal, const Long Nvis) {
+              const Long Ngrid, const Real SL_scal, const Real DL_scal, const Long Nvis,
+              const JunctionPrecondSpec<Real>* precond = nullptr,
+              const SlenderElemList<Real>* obstacles = nullptr,
+              const std::vector<SphereObstacle<Real>>* obst_specs = nullptr) {
   // The only two open (capped) seams are the stems: A.arm0 (-x, inlet) and B.arm0 (+x, outlet).
   std::vector<FlowCap<Real>> caps;
   {
@@ -406,8 +411,10 @@ void run_flow(QuadElemList<Real>& junc, SlenderElemList<Real>& arms, const Comm&
   }
 
   // Boundary velocity RHS over the combined nodes, then VERIFY flux per cap (+-p) and total (~0).
-  Vector<Real> X, Xn; Long Nj, Na; combined_nodes(junc, arms, X, Xn, Nj, Na);
-  const Long Nnode = Nj + Na;
+  // Obstacle sphere nodes (if any) append after the arms; flow_bc_vel returns 0 there (no-slip).
+  Vector<Real> X, Xn; Long Nj, Na, No = 0; combined_nodes(junc, arms, X, Xn, Nj, Na, obstacles, &No);
+  const Long Nsurf = Nj + Na;             // junc+arms only (the interior indicator uses just these)
+  const Long Nnode = Nj + Na + No;        // full combined node count (bc / sigma ordering)
   Vector<Real> bc(Nnode*3);
   for (Long i = 0; i < Nnode; i++) {
     const Vec3<Real> v = flow_bc_vel<Real>(Vec3<Real>{X[3*i], X[3*i+1], X[3*i+2]}, caps);
@@ -448,10 +455,14 @@ void run_flow(QuadElemList<Real>& junc, SlenderElemList<Real>& arms, const Comm&
     const Real mx = (Real)0.15*(xhi-xlo), my = (Real)0.15*(yhi-ylo); xlo -= mx; xhi += mx; ylo -= my; yhi += my;
   }
   const Long Nx = Ngrid, Ny = std::max<Long>(2, (Long)std::lround((double)Ngrid*(yhi-ylo)/(xhi-xlo)));
-  // Interior point cloud (in addition to the z=0 slice): arm cross-section stars at each CSBQ panel's first
-  // Chebyshev node + junction-body boxes (interior_viz.hpp). build_arm_panel_targets uses per-rank GetGeom,
-  // so it is COLLECTIVE and must run on every rank; junction boxes are pure rank-0 geometry.
-  Vector<Real> Xarm; build_arm_panel_targets<Real>(arms, comm, /*cheb=*/10, Xarm);
+  // UNIFORM interior fill (in addition to the z=0 slice): a dense arm VOLUME (per-panel s x theta x r
+  // lattice swept from the centerline out to the wall, hexahedra) + junction-body boxes (interior_viz.hpp).
+  // Both are written as solid VTK hex volumes; U is zeroed (points kept) inside obstacles / outside the
+  // fluid so the flow reads uniformly and the obstacles appear as U=0 holes. build_arm_volume_targets uses
+  // per-rank GetGeom -> COLLECTIVE (runs on every rank); junction boxes are pure rank-0 geometry.
+  const Long vs = 6, vt = 16, vr = 5;   // arm-volume lattice: s_order x t_order x r_order per panel
+  Vector<Real> Xarm; Long Npanel_arm = 0;
+  build_arm_volume_targets<Real>(arms, comm, Xarm, Npanel_arm, vs, vt, vr);
   Vector<Real> Xgrid; Long Ngrid_pts = 0, Nslice = 0, Narm = 0, Njunc = 0, Nax = 0;
   if (!comm.Rank()) {
     for (Long ix = 0; ix < Nx; ix++) { const Real xx = xlo + (xhi-xlo)*ix/(Nx-1);
@@ -478,9 +489,9 @@ void run_flow(QuadElemList<Real>& junc, SlenderElemList<Real>& arms, const Comm&
     Njunc = Xgrid.Dim()/3 - Nslice - Narm;
     Ngrid_pts = Xgrid.Dim()/3;
     std::cout << "  [grid] z=0 slice " << Nx << " x " << Ny << " = " << Nslice << " + " << Narm
-              << " arm stars (" << (Narm/16) << " panels x16) + " << Njunc << " junction-box (2 x " << Nax
-              << "^3) over x[" << std::setprecision(4) << xlo << "," << xhi << "] y[" << ylo << "," << yhi
-              << "]\n" << std::setprecision(6);
+              << " arm-volume (" << Npanel_arm << " panels x " << vs << "x" << vt << "x" << vr << ") + " << Njunc
+              << " junction-box (2 x " << Nax << "^3) over x[" << std::setprecision(4) << xlo << "," << xhi
+              << "] y[" << ylo << "," << yhi << "]\n" << std::setprecision(6);
   }
 
   // Solve the INTERIOR Stokes Dirichlet BVP (jump=-1/2*DL_scal). SL_scal is the SINGLE-LAYER weight (the
@@ -488,40 +499,40 @@ void run_flow(QuadElemList<Real>& junc, SlenderElemList<Real>& arms, const Comm&
   // the SL up (~30 for a closed loop) to condition it -- try SL_scal=30 vs the default 1. (interior +
   // same-sign SL/DL -> solve_dirichlet_bvp flips SL to negative internally, so |SL_scal| is what matters.)
   // gmres_max_iter is the CLI knob: run a SMALL value first to watch the residual, then the full value.
-  junc.SetQuadScheme(QuadElemList<Real>::QuadScheme::Hybrid, cov_q, Nbeta, md);
+  junc.SetQuadScheme(quad_junctions::QJDefaultScheme<Real>(), cov_q, Nbeta, md);
   Vector<Real> Ugrid;
   const Vector<Real> sigma = solve_dirichlet_bvp<Real, Stokes3D_FxU, Stokes3D_DxU>(
       junc, arms, comm, tol, bc, /*interior=*/true, SL_scal, DL_scal,
-      Xgrid, &Ugrid, "stokes pressure-drop (interior)", gmres_max_iter);
+      Xgrid, &Ugrid, "stokes pressure-drop (interior)", gmres_max_iter, precond,
+      /*arm_sl_eta=*/Vector<Real>(), obstacles);
 
-  // Interior mask/filter: Laplace-DL const-density indicator (~ -1 interior, ~0 exterior). On the z=0
-  // slice, KEEP the fluid interior and zero the exterior. For the 3D cloud, arm stars are interior by
-  // construction (always kept) and junction-box points are kept only where |ind|>0.5 (the "check inside").
-  Vector<Real> Xvis, Uvis;
+  // Interior mask: Laplace-DL const-density indicator (~ -1 interior, ~0 exterior). U is ZEROED in place
+  // (points KEPT so the structured hex volumes stay intact) wherever a target is outside the fluid
+  // (|ind|<=0.5) OR inside an obstacle sphere -> the arm/junction volumes render as a solid uniform flow
+  // with the obstacles (and the walls) reading as U=0. The z=0 slice uses the same rule.
   {
     BoundaryIntegralOp<Real, Laplace3D_DxU> IndOp((Laplace3D_DxU()), false, comm);
     SetPVFMMKer(IndOp);
     IndOp.SetAccuracy(tol);
     IndOp.AddElemList(junc, "0_junc"); IndOp.AddElemList(arms, "1_arms");
-    Vector<Real> ones(Nnode); ones = 1;
+    Vector<Real> ones(Nsurf); ones = 1;   // indicator has only junc+arms; obstacles handled geometrically
     IndOp.SetTargetCoord(Xgrid);
     Vector<Real> ind; IndOp.ComputePotential(ind, ones);
+    auto in_fluid = [&](Long i) -> bool {
+      if (std::fabs((double)ind[i]) <= 0.5) return false;
+      return !obst_specs || outside_all_spheres<Real>(Xgrid[3*i], Xgrid[3*i+1], Xgrid[3*i+2], *obst_specs);
+    };
     if (!comm.Rank()) {
-      Long n_in = 0;
-      for (Long i = 0; i < Nslice; i++) {
-        if (std::fabs((double)ind[i]) > 0.5) n_in++;
-        else { Ugrid[3*i] = 0; Ugrid[3*i+1] = 0; Ugrid[3*i+2] = 0; }
-      }
-      Long n_junc_in = 0;
-      for (Long i = Nslice; i < Nslice + Narm; i++)                 // arm stars: interior by construction
-        for (Integer k = 0; k < 3; k++) { Xvis.PushBack(Xgrid[3*i+k]); Uvis.PushBack(Ugrid[3*i+k]); }
-      for (Long i = Nslice + Narm; i < Ngrid_pts; i++)              // junction box: keep interior only
-        if (std::fabs((double)ind[i]) > 0.5) {
-          for (Integer k = 0; k < 3; k++) { Xvis.PushBack(Xgrid[3*i+k]); Uvis.PushBack(Ugrid[3*i+k]); }
-          n_junc_in++;
-        }
-      std::cout << "  [grid] slice interior " << n_in << " / " << Nslice << "; cloud = " << Narm
-                << " arm + " << n_junc_in << " / " << Njunc << " junction = " << (Xvis.Dim()/3) << " pts\n";
+      Long n_slice = 0, n_arm = 0, n_junc = 0;
+      for (Long i = 0; i < Nslice; i++)
+        { if (in_fluid(i)) n_slice++; else { Ugrid[3*i]=0; Ugrid[3*i+1]=0; Ugrid[3*i+2]=0; } }
+      for (Long i = Nslice; i < Nslice + Narm; i++)
+        { if (in_fluid(i)) n_arm++; else { Ugrid[3*i]=0; Ugrid[3*i+1]=0; Ugrid[3*i+2]=0; } }
+      for (Long i = Nslice + Narm; i < Ngrid_pts; i++)
+        { if (in_fluid(i)) n_junc++; else { Ugrid[3*i]=0; Ugrid[3*i+1]=0; Ugrid[3*i+2]=0; } }
+      std::cout << "  [grid] in-fluid targets: slice " << n_slice << "/" << Nslice << ", arm-volume "
+                << n_arm << "/" << Narm << ", junction-box " << n_junc << "/" << Njunc
+                << " (rest zeroed: walls + obstacles)\n";
     }
   }
 
@@ -533,10 +544,21 @@ void run_flow(QuadElemList<Real>& junc, SlenderElemList<Real>& arms, const Comm&
     junc.WriteVTK(tag + "-sigma-junc", sj,  comm);
     arms.WriteVTK(tag + "-sigma-arms", sa_, comm);
     junc.WriteVTK(tag + "-bc-junc",    bcj, comm);
+    if (obstacles && No > 0) {   // obstacle density lives in the trailing "2_obst" block of sigma
+      Vector<Real> so(No*3);
+      for (Long i = 0; i < No*3; i++) so[i] = sigma[Nsurf*3 + i];
+      obstacles->WriteVTK(tag + "-sigma-obst", so, comm);   // collective; surface colored by density
+    }
   }
   if (!comm.Rank()) {
     write_plane_vtu<Real>(tag + "-flow-slice", Xgrid, Ugrid, Nx, Ny);
-    write_points_vtu<Real>(tag + "-flow-box", Xvis, Uvis, Xvis.Dim()/3);
+    // Split the (already masked) Ugrid into its arm-volume and junction-box blocks and write each as a
+    // solid hexahedral VTK volume (uniform interior flow; walls + obstacles read as U=0).
+    Vector<Real> Xa(Narm*3), Ua(Narm*3), Xb(Njunc*3), Ub(Njunc*3);
+    for (Long i = 0; i < Narm*3;  i++) { Xa[i] = Xgrid[Nslice*3 + i];         Ua[i] = Ugrid[Nslice*3 + i]; }
+    for (Long i = 0; i < Njunc*3; i++) { Xb[i] = Xgrid[(Nslice+Narm)*3 + i];  Ub[i] = Ugrid[(Nslice+Narm)*3 + i]; }
+    write_arm_volume_vtu<Real>(tag + "-flow-arms", Xa, Ua, Npanel_arm, vs, vt, vr);
+    write_box_hex_vtu<Real>(tag + "-flow-junc", Xb, Ub, /*Njunc=*/2, Nax);
     std::ofstream csv(tag + "-flow-slice.csv");
     csv << "x,y,ux,uy,uz,umag\n";
     for (Long i = 0; i < Nslice; i++) {
@@ -544,7 +566,8 @@ void run_flow(QuadElemList<Real>& junc, SlenderElemList<Real>& arms, const Comm&
       csv << Xgrid[3*i] << "," << Xgrid[3*i+1] << "," << ux << "," << uy << "," << uz << ","
           << std::sqrt(ux*ux+uy*uy+uz*uz) << "\n";
     }
-    std::cout << "  [viz] wrote " << tag << "-sigma-{junc,arms}.pvtu, -bc-junc.pvtu, -flow-slice.vtu, -flow-box.vtu, -flow-slice.csv\n";
+    std::cout << "  [viz] wrote " << tag << "-sigma-{junc,arms}.pvtu, -bc-junc.pvtu, -flow-slice.vtu, "
+              << "-flow-arms.vtu (hex arm volume), -flow-junc.vtu (hex junction box), -flow-slice.csv\n";
   }
 }
 
@@ -743,7 +766,61 @@ int main(int argc, char** argv) {
       run_manufactured<Real>(junc, arms, comm, level, PA, PB, sep, JA, polys, freeseg, tag, tol,
                              Nbeta, md, cov_q, SL_scal, DL_scal, Ngrid);
     } else if (flow) {
-      run_flow<Real>(junc, arms, comm, JA, JB, s_cap, tag, tol, Nbeta, md, cov_q, p_in, p_out, gmresMax, Ngrid, SL_scal, DL_scal, Nvis);
+      // Optional junction preconditioner (env QJ_PRECOND_BLOCK, default junction). The two junctions
+      // JA, JB are the leading whole junctions of `junc` (add_junction appends them before any caps),
+      // so njunc=2. Same YSwept mesh params the solve uses -> the block preconditions the operator
+      // actually assembled.
+      JunctionPrecondSpec<Real> spec;
+      spec.kind         = std::getenv("QJ_PRECOND_BLOCK") ? precond_block_kind() : PrecondBlockKind::Off;
+      spec.order        = ord;
+      spec.level        = level;
+      spec.nref         = nref;
+      spec.eta_join     = etajoin;
+      spec.Ns_trans     = NsTrans;
+      spec.njunc        = 2;
+
+      // ---- Spherical obstacles (QJ_OBSTACLE=1): one per axial element on each TRACK (bent wall) + one per
+      // ---- junction; the two inflow/outflow STEMS (seam 0) are skipped. Deterministic placement (fixed
+      // ---- seed), so the obstacle set is identical across the convergence sweep and across MPI ranks. ----
+      SlenderElemList<Real> obst;
+      std::vector<SphereObstacle<Real>> obst_specs;
+      const char* obenv = std::getenv("QJ_OBSTACLE");
+      const bool obstacle = obenv && atoi(obenv) != 0;
+      if (obstacle) {
+        const unsigned seed = std::getenv("QJ_OBSTACLE_SEED")    ? (unsigned)atoi(std::getenv("QJ_OBSTACLE_SEED")) : 2u;
+        const Real  radfrac = std::getenv("QJ_OBSTACLE_RADFRAC") ? (Real)atof(std::getenv("QJ_OBSTACLE_RADFRAC")) : (Real)0.2;
+        const Long  sph_ord = cheb;   // MUST equal the arm order 10: only special_quad_q10 is precomputed (see CLAUDE.md, "CSBQ ElemOrder").
+        const Long  sph_fou = std::getenv("QJ_OBSTACLE_FOURIER") ? (Long)atoi(std::getenv("QJ_OBSTACLE_FOURIER")) : fourier;
+        const Long  sph_pan = std::getenv("QJ_OBSTACLE_PANEL")   ? (Long)atoi(std::getenv("QJ_OBSTACLE_PANEL"))   : 2;
+        // Skip cylinders = the two capped stems (inflow at -x, outflow at +x).
+        std::vector<ExclCyl<Real>> skip;
+        for (const ArmSeam<Real>* s : {&JA.seam(0), &JB.seam(0)})
+          skip.push_back(ExclCyl<Real>{s->C, s->u, s_cap - s->a0, s->R0});
+        place_arm_panel_obstacles<Real>(arms, comm, cheb, skip, seed, radfrac, obst_specs);
+        // One obstacle per junction: center = mean of its 3 seam centers, R0 = stem radius, half = farthest seam.
+        std::vector<Vec3<Real>> jcen; std::vector<Real> jR0, jhalf;
+        for (const HybridJunction<Real>* J : {&JA, &JB}) {
+          Vec3<Real> c{0,0,0};
+          for (int k = 0; k < 3; k++) { const ArmSeam<Real>& s = J->seam(k); c[0]+=s.C[0]; c[1]+=s.C[1]; c[2]+=s.C[2]; }
+          c[0]/=3; c[1]/=3; c[2]/=3;
+          Real h = 0;
+          for (int k = 0; k < 3; k++) { const ArmSeam<Real>& s = J->seam(k);
+            const Real dx=s.C[0]-c[0], dy=s.C[1]-c[1], dz=s.C[2]-c[2]; h = std::max<Real>(h, std::sqrt(dx*dx+dy*dy+dz*dz)); }
+          jcen.push_back(c); jR0.push_back(J->seam(0).R0); jhalf.push_back(h);
+        }
+        place_junction_obstacles<Real>(jcen, jR0, jhalf, seed, radfrac, obst_specs);
+        obst = build_obstacle_elem_list<Real>(obst_specs, sph_ord, sph_fou, sph_pan, comm);
+        if (!comm.Rank()) {
+          Real rmin = 1e300, rmax = 0; for (const auto& s : obst_specs) { rmin = std::min<Real>(rmin, s.r); rmax = std::max<Real>(rmax, s.r); }
+          std::cout << "  [obstacle] ON  " << obst_specs.size() << " spheres (per-track-element + per-junction; stems skipped)"
+                    << "  r in [" << std::setprecision(4) << (obst_specs.empty()?0:rmin) << "," << rmax << "]"
+                    << "  mesh: " << sph_pan << " panels x ord " << sph_ord << " x fourier " << sph_fou << std::setprecision(6) << "\n";
+        }
+      } else if (!comm.Rank()) {
+        std::cout << "  [obstacle] OFF (set QJ_OBSTACLE=1 to add spherical obstacles near the centerlines)\n";
+      }
+      run_flow<Real>(junc, arms, comm, JA, JB, s_cap, tag, tol, Nbeta, md, cov_q, p_in, p_out, gmresMax, Ngrid, SL_scal, DL_scal, Nvis, &spec,
+                     obstacle ? &obst : nullptr, obstacle ? &obst_specs : nullptr);
     } else {
       const std::string label = lens ? "diverging-converging channel (2 junctions, 2 bent walls)"
                                       : ("two junctions + one bent arm (turn " + std::to_string((long)tiltDeg) + " deg)");

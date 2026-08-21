@@ -111,7 +111,7 @@ template <class Real> Vec3<Real> transition_point(const YField<Real>& fld, int k
 // ============================================================================
 // Butterfly-dome cap for arm k: a hemisphere of radius R0 centered on the axis at station s_cap. The
 // equator (q=1) is exactly the R0 circle at s_cap => node-conforms to the slender tube's terminal
-// circle. Same non-degenerate O-grid as the M1 cap / stud_sphere add_cap_butterfly (central gnomonic
+// circle. Same non-degenerate O-grid as the M1 cap / collar_mount add_cap_butterfly (central gnomonic
 // square core [-h,h]^2 + 4 Coons arc blocks to the unit circle), elevated onto the hemisphere.
 // Ncap panels per direction. push_oriented gives outward normals (aligned with -grad f).
 // ============================================================================

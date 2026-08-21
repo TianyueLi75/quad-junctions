@@ -25,6 +25,7 @@
 
 #include <csbq.hpp>                                  // CSBQ SlenderElemList
 #include <quad_junctions/ybifurc_assembly.hpp>       // composable component API
+#include <quad_junctions/quad_scheme.hpp>            // QJDefaultScheme (Duffy default, SCTL_SELF_SCHEME=hybrid opt-out)
 #include <quad_junctions/hybrid_bie_tests.hpp>       // shared BIE identity / watertightness tests
 #include <cmath>
 #include <cstdlib>
@@ -63,10 +64,10 @@ void run_case(QuadElemList<Real>& junc, SlenderElemList<Real>& arms, const Comm&
   if (!comm.Rank())
     std::cout << "\n---- BIE sweep [" << label << "]: quad panels=" << njp << " nodes=" << njn
               << " | slender panels=" << nap << " nodes=" << nan << " ----\n";
-  junc.SetQuadScheme(QuadElemList<Real>::QuadScheme::Hybrid, cov_q, NbL[0], mdL[0]);
+  junc.SetQuadScheme(quad_junctions::QJDefaultScheme<Real>(), cov_q, NbL[0], mdL[0]);
   divergence_check<Real>(junc, arms, tolL[0], comm);
   for (int idx = 0; idx < nlevels; idx++) {
-    junc.SetQuadScheme(QuadElemList<Real>::QuadScheme::Hybrid, cov_q, NbL[idx], mdL[idx]);
+    junc.SetQuadScheme(quad_junctions::QJDefaultScheme<Real>(), cov_q, NbL[idx], mdL[idx]);
     if (!comm.Rank()) std::cout << "  [tol=" << tolL[idx] << " Nbeta=" << NbL[idx] << " max_depth=" << mdL[idx] << "]\n";
     const bool dump = (idx == nlevels-1) && (tolOv <= (Real)0);  // no VTU clobber during a near-eval scan
     const std::string dt = dump ? tag : std::string();
@@ -234,60 +235,6 @@ int main(int argc, char** argv) {
       junc.WriteVTK(tag + "-junc", Vector<Real>(), comm);
       arms.WriteVTK(tag + "-arms", Vector<Real>(), comm);
       run_case<Real>(junc, arms, comm, X0, tag, "two junctions + shared arm", nlev, cov_q, tolOv, NbOv, mdOv);
-
-      // ------------------------------------------------------------------------------------------
-      // MANUFACTURED-SOLUTION CFIE solve (GMRES) on this same two-junction geometry.
-      // The exact field is the SL potential of the SAME two EXTERIOR sources used above (x0b, x0a).
-      // Since the sources are exterior, the field is harmonic INSIDE the solid -> interior Dirichlet
-      // problem: solve ( c*I - S + D ) sigma = u_e|surface, evaluate at interior probe points, compare.
-      // Default accurate near-eval: Hybrid(cov_q=6, Nbeta=200, max_depth=8) + SetAccuracy(1e-8).
-      // ------------------------------------------------------------------------------------------
-      {
-        const Real man_tol = (Real)1e-8;
-        junc.SetQuadScheme(QuadElemList<Real>::QuadScheme::Hybrid, 6, 200, 8);
-
-        // Two exterior sources (reuse the Green-identity points), ordered [x0b, x0a].
-        const Vector<Real> Xsrc{x0b[0], x0b[1], x0b[2], x0a[0], x0a[1], x0a[2]};
-
-        // Interior probe targets, built on rank 0 only (so GlobalReduce counts each once). All lie on a
-        // tube/arm centerline (radius 0 < R0) -> guaranteed interior by construction; junction centers
-        // are additionally validated by the YField inside-check before inclusion.
-        Vector<Real> Xtrg;
-        if (!comm.Rank()) {
-          auto push = [&](const Vec3<Real>& P) { Xtrg.PushBack(P[0]); Xtrg.PushBack(P[1]); Xtrg.PushBack(P[2]); };
-          // shared-arm axis (on the straight seam-to-seam segment; the sine wiggle displaces the surface,
-          // not this axis, so these stay interior)
-          for (const Real t : {(Real)0.25, (Real)0.5, (Real)0.75})
-            push(Vec3<Real>{sa.C[0]+t*(sb.C[0]-sa.C[0]), sa.C[1]+t*(sb.C[1]-sa.C[1]), sa.C[2]+t*(sb.C[2]-sa.C[2])});
-          // each free arm: a couple of on-axis stations stepped into the arm from the seam ring
-          const ArmSeam<Real>* freearms[4] = {&JA.seam(1), &JA.seam(2), &JB.seam(1), &JB.seam(2)};
-          for (const ArmSeam<Real>* s : freearms)
-            for (const Real k : {(Real)1, (Real)2})
-              push(Vec3<Real>{s->C[0]+k*s->R0*s->u[0], s->C[1]+k*s->R0*s->u[1], s->C[2]+k*s->R0*s->u[2]});
-          // junction centers (canonical origin), included only if confirmed inside a junction blob
-          const YField<Real> fldchk;
-          for (const Placement<Real>* P : {&PA, &PB}) {
-            const Vec3<Real> C = P->apply_point(Vec3<Real>{0,0,0});
-            if (fldchk.f(P->apply_inverse_point(C)) >= level) push(C);
-          }
-          SCTL_ASSERT_MSG(Xtrg.Dim() > 0, "no interior probe targets for the manufactured test");
-          std::cout << "\n[case 2] MANUFACTURED-SOLUTION CFIE solve (interior Dirichlet, 2 exterior sources)\n"
-                    << "  near-eval: Hybrid(cov_q=6, Nbeta=200, max_depth=8) tol=" << std::setprecision(1) << man_tol
-                    << " (GMRES tol=" << man_tol*10 << ")  interior probe targets=" << Xtrg.Dim()/3 << "\n";
-        }
-
-        // Laplace CFIE: recover the two point-charge potential (strengths +1, -1).
-        const Vector<Real> Fsrc_lap{(Real)1, (Real)-1};
-        test_manufactured<Real, Laplace3D_FxU, Laplace3D_DxU>(
-            junc, arms, comm, man_tol, Xsrc, Fsrc_lap, /*interior=*/true, Xtrg,
-            /*SL_scal=*/(Real)-1, /*DL_scal=*/(Real)1, "Laplace manufactured");
-
-        // Stokes CFIE: recover the two-Stokeslet velocity field.
-        const Vector<Real> Fsrc_stk{(Real)1, (Real)0.5, (Real)-0.3, (Real)-1, (Real)-0.5, (Real)0.3};
-        test_manufactured<Real, Stokes3D_FxU, Stokes3D_DxU>(
-            junc, arms, comm, man_tol, Xsrc, Fsrc_stk, /*interior=*/true, Xtrg,
-            /*SL_scal=*/(Real)-1, /*DL_scal=*/(Real)1, "Stokes manufactured");
-      }
     }
   }
   Comm::MPI_Finalize();

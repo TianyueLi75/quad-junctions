@@ -8,7 +8,8 @@
  *   make bin/areatest && ./bin/areatest [order PatchPerFace tol]
  */
 #include <sctl.hpp>
-#include <quad_junctions/stud_sphere_geom.hpp>
+#include <quad_junctions/collar_mount_geom.hpp>
+#include <quad_junctions/quad_scheme.hpp>     // QJDefaultScheme (Duffy default, SCTL_SELF_SCHEME=hybrid opt-out)
 #include <csbq/slender_element.hpp>
 #include <csbq/slender_element.cpp>
 #include <iomanip>
@@ -61,7 +62,7 @@ int main(int argc, char** argv) {
               const Vec3<Real> w = mnt(X, Y, (Real)0); Xall.PushBack(w[0]); Xall.PushBack(w[1]); Xall.PushBack(w[2]); } }
         }
     QuadElemList<Real> sph(order, Xall);
-    sph.SetQuadScheme(QuadElemList<Real>::QuadScheme::Hybrid, 10, 200, 12);
+    sph.SetQuadScheme(quad_junctions::QJDefaultScheme<Real>(), 10, 200, 12);
 
     // ---- SlenderElemList: sphere radius R2 as a body of revolution about z (radius sqrt(R2^2 - z^2)) ----
     const Long Nelem = 32, cheb = 10, fourier = 16;

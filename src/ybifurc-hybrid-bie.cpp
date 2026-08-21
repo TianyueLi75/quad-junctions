@@ -28,8 +28,10 @@
 #include <csbq.hpp>                                 // CSBQ SlenderElemList
 #include <quad_junctions/ybifurc_hybrid_geom.hpp>   // hybrid builders (junction+transition+cap, slender arms)
 #include <quad_junctions/hybrid_bie_tests.hpp>      // shared BIE identity/watertightness tests
+#include <quad_junctions/quad_scheme.hpp>           // QJDefaultScheme (Duffy default, SCTL_SELF_SCHEME=hybrid opt-out)
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -69,7 +71,7 @@ struct QuadRegions {
 // operator tol), but a QuadElemList arm tube needs the same Hybrid scheme the junction gets.
 template <class Real> void set_arm_scheme(SlenderElemList<Real>&, Integer, Integer, Integer) {}
 template <class Real> void set_arm_scheme(QuadElemList<Real>& a, Integer cov_q, Integer Nb, Integer md) {
-  a.SetQuadScheme(QuadElemList<Real>::QuadScheme::Hybrid, cov_q, Nb, md);
+  a.SetQuadScheme(quad_junctions::QJDefaultScheme<Real>(), cov_q, Nb, md);
 }
 
 // Panel squareness: physical edge lengths in the two param directions, aspect = max/min.
@@ -120,6 +122,10 @@ void run_comparison(QuadElemList<Real>& junc, ArmList& arms, const Comm& comm, c
     for (Long i=0;i<Nnode;i++){ if(i>=Nj){ma=std::max(ma,err[i]);continue;}
       const Long w=i%reg.per_arm; if(w<reg.nJ)mj=std::max(mj,err[i]); else if(w<reg.nJ+reg.nT)mt=std::max(mt,err[i]); else mc=std::max(mc,err[i]); }
     std::cout << "    [region max] junction=" << mj << " transition=" << mt << " cap=" << mc << " arm=" << ma << "\n"; };
+  // Junction singular/near scheme: default Duffy, SCTL_SELF_SCHEME=hybrid opts out (see quad_scheme.hpp).
+  using QuadScheme = typename QuadElemList<Real>::QuadScheme;
+  const QuadScheme jsch = quad_junctions::QJDefaultScheme<Real>();
+  if (!comm.Rank()) std::cout << "  [scheme] junction = " << (jsch==QuadScheme::Duffy ? "Duffy" : "Hybrid") << "\n";
   const Long njp = GlobalReduce((Long)junc.Size(), comm, CommOp::SUM), nap = GlobalReduce((Long)arms.Size(), comm, CommOp::SUM);
   Vector<Real> Xj, Xa; junc.GetNodeCoord(&Xj, nullptr, nullptr); arms.GetNodeCoord(&Xa, nullptr, nullptr);
   const Long njn = GlobalReduce((Long)(Xj.Dim()/3), comm, CommOp::SUM), nan = GlobalReduce((Long)(Xa.Dim()/3), comm, CommOp::SUM);
@@ -127,11 +133,11 @@ void run_comparison(QuadElemList<Real>& junc, ArmList& arms, const Comm& comm, c
     std::cout << "\n---- BIE sweep [arm=" << arm_tag << "]: junction panels=" << njp << " nodes=" << njn
               << " | arm panels=" << nap << " nodes=" << nan << " ----\n";
   // watertightness / orientation diagnostic (cheap; needs the quad scheme set on both quad lists)
-  junc.SetQuadScheme(QuadElemList<Real>::QuadScheme::Hybrid, cov_q, NbL[0], mdL[0]);
+  junc.SetQuadScheme(jsch, cov_q, NbL[0], mdL[0]);
   set_arm_scheme<Real>(arms, cov_q, NbL[0], mdL[0]);
   divergence_check<Real>(junc, arms, tolL[0], comm);
   for (int idx = 0; idx < nlev; idx++) {
-    junc.SetQuadScheme(QuadElemList<Real>::QuadScheme::Hybrid, cov_q, NbL[idx], mdL[idx]);
+    junc.SetQuadScheme(jsch, cov_q, NbL[idx], mdL[idx]);
     set_arm_scheme<Real>(arms, cov_q, NbL[idx], mdL[idx]);
     if (!comm.Rank()) std::cout << "  [tol=" << tolL[idx] << " Nbeta=" << NbL[idx] << " max_depth=" << mdL[idx] << "]\n";
     const bool dump = (idx == nlev-1);
