@@ -6,6 +6,10 @@ Current main geometries: (in include/quad_junctions/)
 
 These building blocks are connected to form more complex examples: src/cilia_carpet-bie.cpp for 2-periodic flow past top and bottom plates with cilia, and src/bifurc-vessels-flow-bie.cpp for large bifurcating channel (vessel).
 
+## Generating a generalized N-arm bifurcation
+
+To build and verify a bifurcation mesh with **arbitrary branch angles, an arbitrary (including even) number of branches, and non-coplanar 3D arms** (`gaps:`/`dirs:` specs and presets like `y120`, `cross4`, `tetra4`), **read the playbook [bifurcation_meshing.md](bifurcation_meshing.md)**. It is the step-by-step command guide (for a human or an agent) covering the three drivers — `bin/bifurc-general-{geom,bie,load-bie}` — the runtime spec/resolution knobs, the watertightness + DL/Green identity acceptance tests, the Hybrid-vs-Duffy junction scheme (`SCTL_SELF_SCHEME`), and exporting the validated geometry as a reusable bundle. Start there before touching `src/bifurc-general-*.cpp` or `include/quad_junctions/gen_junction_geom.hpp`.
+
 The Dirichlet BIE solve happens in include/quad_junctions/hybrid_bie_tests.hpp, the periodic BIO are directly in cilia_carpet-bie.cpp.
 
 Makefile defaults to no MPI or PVFMM, so make MPI=1 for MPI, and PVFMM=1 for pvfmm (and MPI).
