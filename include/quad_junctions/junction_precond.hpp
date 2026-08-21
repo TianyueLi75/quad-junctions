@@ -94,21 +94,23 @@ template <class Real> struct JunctionPrecondSpec {
 
 // Factored pseudo-inverse of one block, plus the block->row bookkeeping.
 template <class Real> struct BlockPrecond {
-  Matrix<Real> P0, P1;      // A11^+ = P0 * P1   (P0 = V, P1 = S^+ U^T)
-  Long blk = 0;             // DOF per block
+  Matrix<Real> P0, P1;      // A11^+ = P0 * P1   (P0 = V, P1 = S^+ U^T); size blk
+  Long blk = 0;             // DOF per block -- the DOF the Apply slices/writes
   Long nblk_local = 0;      // number of whole blocks this rank applies it to
   Long dof_offset = 0;      // local DOF index where those blocks start
   PrecondBlockKind kind = PrecondBlockKind::Off;
 
   bool active() const {
-    return kind != PrecondBlockKind::Off && blk > 0 && nblk_local > 0
-           && P0.Dim(0) == blk && P0.Dim(1) == blk && P1.Dim(0) == blk && P1.Dim(1) == blk;
+    if (kind == PrecondBlockKind::Off || blk <= 0 || nblk_local <= 0) return false;
+    if (!(P0.Dim(0) == blk && P0.Dim(1) == blk && P1.Dim(0) == blk && P1.Dim(1) == blk)) return false;
+    return true;
   }
 
   // out = A11^+ applied to each whole block in [dof_offset, dof_offset + nblk_local*blk);
   // IDENTITY everywhere else (caps, arms, rank-split junctions). A block-diagonal
   // preconditioner with identity blocks is still a valid preconditioner -- it just does
-  // no work on those rows -- so this is safe rather than merely convenient.
+  // no work on those rows -- so this is safe rather than merely convenient. The block
+  // apply is the factored w = P0*(P1*v).
   void Apply(Vector<Real>& out, const Vector<Real>& in) const {
     if (out.Dim() != in.Dim()) out.ReInit(in.Dim());
     out = in;                                   // identity default
@@ -176,8 +178,8 @@ BlockPrecond<Real> build_block_precond(const PrecondBlockKind kind, const Intege
   if (kind == PrecondBlockKind::Off) return P;
 
   const Long npj = (Long)3 * (YSwept::Na0*nref) * (YSwept::Nr0*nref + Ns_trans);
-  const Long npe = (Long)order * order * 3;                       // DOF per panel
-  const Long blk = (kind == PrecondBlockKind::Junction) ? npj*npe : npe;
+  const Long npe = (Long)order * order * 3;                                 // DOF per panel
+  const Long blk = (kind == PrecondBlockKind::Junction) ? npj*npe : npe;    // block DOF (SVD + Apply)
   P.blk = blk;
 
   const double gb = (double)blk * (double)blk * (double)sizeof(Real) / (1024.0*1024.0*1024.0);
@@ -193,14 +195,15 @@ BlockPrecond<Real> build_block_precond(const PrecondBlockKind kind, const Intege
     std::snprintf(msg, sizeof msg,
         "junction_precond: block of %ld DOF needs %.2f GB dense (x2 cached, plus SVD workspace), "
         "over the %.2f GB limit. The SVD alone is ~20*n^3 = %.1e flop. Either set "
-        "QJ_PRECOND_BLOCK=panel, lower `order`, or raise QJ_PRECOND_MAXGB if you really mean it.",
+        "QJ_PRECOND_BLOCK=panel, lower `order`, or raise "
+        "QJ_PRECOND_MAXGB if you really mean it.",
         (long)blk, gb, maxgb, 20.0*(double)blk*(double)blk*(double)blk);
     SCTL_ASSERT_MSG(gb <= maxgb, msg);
   }
 
   // Cache key: everything the block depends on -- mesh params (via the canonical junction
-  // key), the operator scalings, the jump, the quadrature tol, and the block kind. A stale
-  // hit here would silently precondition the wrong operator.
+  // key), the operator scalings, the jump, the quadrature tol, and the block kind. A stale hit
+  // here would silently precondition the wrong operator.
   using precond_detail::tag;
   const std::string dir = precond_detail::cache_dir();
   const std::string key = std::string(precond_kind_name(kind))
@@ -227,9 +230,10 @@ BlockPrecond<Real> build_block_precond(const PrecondBlockKind kind, const Intege
                                 << ") -- rebuilding\n";
   }
 
-  // ---- Build the dense block. Serial on every rank (comm.Self()): the matrix is
+  // ---- Build the dense block at `order`. Serial on every rank (comm.Self()): the matrix is
   // ---- replicated, so no communication and no rank-dependent branching.
-  if (!comm.Rank()) std::cout << "  [precond] building " << blk << " columns ...\n" << std::flush;
+  if (!comm.Rank()) std::cout << "  [precond] building " << blk << " columns (order " << order
+                              << ") ...\n" << std::flush;
 
   const CanonMesh<Real>& canon = canonical_junction<Real>(order, level, nref, eta_join, Ns_trans, Comm::Self());
   Vector<Real> Xblk;

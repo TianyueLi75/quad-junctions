@@ -20,7 +20,12 @@
  *   make bin/ybifurc-vessels-bie
  *   OMP_NUM_THREADS=8 ./bin/ybifurc-vessels-bie \
  *       [level] [order(mult4)] [nref] [eta_join] [Ns_trans] [fourier] [lead] [corner] \
- *       [tol] [Nbeta] [max_depth] [cov_q] [svg_scale] [geomOnly] [gscale]
+ *       [tol] [Nbeta] [max_depth] [cov_q] [svg_scale] [geomOnly] [gscale] [sphere_deg] [sphere_tilt] \
+ *       [arterial_only]
+ *
+ *   arterial_only (default 0): build ONLY the arterial tree and CAP each branch where it would have
+ *   merged into the venous tree (free-arm stub + hemisphere), instead of drawing the leaf connectors.
+ *   The venous half is omitted entirely. sphere_deg still applies (arterial tree drapes onto the sphere).
  *
  *   gscale (default 1) uniformly rescales the WHOLE network (positions AND junction sizes), i.e. a
  *   similarity transform. The DL identity is scale-invariant and SCTL renormalizes into PVFMM's
@@ -32,6 +37,7 @@
 
 #include <csbq.hpp>                                  // CSBQ SlenderElemList
 #include <quad_junctions/ybifurc_assembly.hpp>       // composable component API (add_bent_arm single_corner)
+#include <quad_junctions/quad_scheme.hpp>            // QJDefaultScheme (Duffy default, SCTL_SELF_SCHEME=hybrid opt-out)
 #include <quad_junctions/hybrid_bie_tests.hpp>       // shared BIE identity / watertightness tests
 #include <quad_junctions/vessels_build.hpp>          // shared network build (dot3/ArmSeg + build_vessels_network)
 #include <quad_junctions/vessels_tree_data.hpp>      // arterial/venous junction + connector tables
@@ -101,6 +107,7 @@ int main(int argc, char** argv) {
     const Real    gscale  = (argc > 15) ? (Real)atof(argv[15]) : (Real)1;   // global similarity scale
     const Real    sphereDeg = (argc > 16) ? (Real)atof(argv[16]) : (Real)0; // 0=planar; >0 drapes onto a sphere (arc deg)
     const Real    sphereTilt= (argc > 17) ? (Real)atof(argv[17]) : (Real)0; // tilt the 2 middle connectors +/- this many deg
+    const bool    arterialOnly = (argc > 18) ? (atoi(argv[18]) != 0) : false; // 1=only the arterial tree, capped where it would meet the venous tree
     const Integer Ncap    = (Integer)(YSwept::Ncap0 * std::max<Integer>(1, nref));
     const Long    cheb    = 10;
     const Integer nAxFree = 3;
@@ -111,13 +118,17 @@ int main(int argc, char** argv) {
 
     namespace vd = vessels_data;
     const int NJ = vd::n_junc, NC = vd::n_conn;
+    // arterial_only builds just the first-half (arterial) junctions; every loop that touches per-junction
+    // placements/sources must stop at NJ_active (the venous placements P[NJ/2..] are never populated).
+    const int NJ_active = arterialOnly ? NJ/2 : NJ;
+    const int NC_active = arterialOnly ? 0 : NC;
 
     if (!comm.Rank()) {
-      std::cout << "\n=== ybifurc-vessels: 20-junction arterial/venous network ===\n";
+      std::cout << "\n=== ybifurc-vessels: " << (arterialOnly ? "arterial-only (capped) network" : "20-junction arterial/venous network") << " ===\n";
       std::cout << "  order=" << ord << " level=" << level << " nref=" << nref << " eta_join=" << etajoin
                 << " Ns_trans=" << NsTrans << " fourier=" << fourier << " lead=" << leadP << " corner=" << cornerP
                 << " svg_scale=" << svgs << " gscale=" << gscale << " sphere_deg=" << sphereDeg << " sphere_tilt=" << sphereTilt
-                << (geomOnly ? "  [GEOM-ONLY]\n" : "\n");
+                << (arterialOnly ? "  [ARTERIAL-ONLY]" : "") << (geomOnly ? "  [GEOM-ONLY]\n" : "\n");
     }
 
     std::vector<Real> scale(NJ);   // per-junction 0.8^gen (also used in the collision report below)
@@ -127,7 +138,8 @@ int main(int argc, char** argv) {
     // shared builder; the identity tests below run on the SAME geometry the flow driver uses.
     HybridAssembly<Real> A(ord);
     const VesselsBuild<Real> vb = build_vessels_network<Real>(A, level, nref, etajoin, NsTrans, fourier,
-        leadP, cornerP, svgs, Ncap, cheb, nAxFree, tipLen, comm, gscale, sphereDeg, sphereTilt);
+        leadP, cornerP, svgs, Ncap, cheb, nAxFree, tipLen, comm, gscale, sphereDeg, sphereTilt,
+        /*open_roots*/false, /*world_off*/Vec3<Real>{0,0,0}, /*arterial_only*/arterialOnly);
     const std::vector<Placement<Real>>& P = vb.P;
     const std::vector<ArmSeg<Real>>& segs = vb.segs;
     const int n_caps = vb.n_caps;
@@ -140,8 +152,8 @@ int main(int argc, char** argv) {
     // ---- geometry report + collision guard (min clearance between non-adjacent tubes / junction bodies) ----
     if (!comm.Rank()) {
       Vector<Real> Xj, Xa; junc.GetNodeCoord(&Xj, nullptr, nullptr); arms.GetNodeCoord(&Xa, nullptr, nullptr);
-      std::cout << "\n[geometry] junctions=" << NJ << " intra-tree arms=" << (NJ-2) << " connectors=" << NC
-                << " capped roots=" << n_caps << "\n  quad panels=" << junc.Size() << " nodes=" << Xj.Dim()/3
+      std::cout << "\n[geometry] junctions=" << NJ_active << " intra-tree arms=" << (vb.n_single+vb.n_race)
+                << " connectors=" << NC_active << " caps=" << n_caps << "\n  quad panels=" << junc.Size() << " nodes=" << Xj.Dim()/3
                 << " | slender panels=" << arms.Size() << " nodes=" << Xa.Dim()/3 << "\n";
       const Real Jrad_can = (Real)1.3;   // canonical junction blob outer-radius proxy
       Real minclear = std::numeric_limits<Real>::max(); int mi=-1, mj=-1;
@@ -155,7 +167,7 @@ int main(int argc, char** argv) {
           if (clear < minclear) { minclear = clear; mi=(int)a; mj=(int)b; }
         }
       Real minJclear = std::numeric_limits<Real>::max();
-      for (int i = 0; i < NJ; i++) {
+      for (int i = 0; i < NJ_active; i++) {
         const Vec3<Real> C = P[i].apply_point(Vec3<Real>{0,0,0}); const Real Rb = scale[i]*Jrad_can;
         for (const auto& s : segs) {
           if (s.j0==i || s.j1==i) continue;
@@ -211,7 +223,7 @@ int main(int argc, char** argv) {
       // clearance explicitly (they are non-adjacent so the guard above skips them, but they are the pair the
       // sphere_tilt nudges apart).
       const int s4 = (NJ-2)+4, s5 = (NJ-2)+5;
-      if (s5 < (int)segs.size())
+      if (!arterialOnly && s5 < (int)segs.size())
         std::cout << "  [collision] middle connectors (segs " << s4 << "," << s5 << ") centerline clearance (dist - 1.1*shaft_R) = "
                   << std::setprecision(4) << cl_clear(segs[s4], segs[s5], -1) << std::setprecision(6) << "\n";
     }
@@ -232,15 +244,15 @@ int main(int argc, char** argv) {
     {
       const YField<Real> fld;
       auto exterior = [&](const Vec3<Real>& Xs) -> bool {
-        for (int i = 0; i < NJ; i++) if (fld.f(P[i].apply_inverse_point(Xs)) >= level) return false;
+        for (int i = 0; i < NJ_active; i++) if (fld.f(P[i].apply_inverse_point(Xs)) >= level) return false;
         for (const auto& s : segs) if (seg_seg_dist<Real>(Xs, Xs, s.A, s.B) <= s.rtube) return false;
         return true;
       };
-      for (int i = 0; i < NJ; i++) {
+      for (int i = 0; i < NJ_active; i++) {
         const Vec3<Real> Xs = P[i].apply_point(Vec3<Real>{1.6, 1.4, 0.9});
         if (exterior(Xs)) { X0.PushBack(Xs[0]); X0.PushBack(Xs[1]); X0.PushBack(Xs[2]); }
       }
-      if (!comm.Rank()) std::cout << "  [green] kept " << X0.Dim()/3 << " / " << NJ << " exterior sources\n";
+      if (!comm.Rank()) std::cout << "  [green] kept " << X0.Dim()/3 << " / " << NJ_active << " exterior sources\n";
       SCTL_ASSERT_MSG(X0.Dim() > 0, "no exterior Green source survived validation.");
     }
 
@@ -252,7 +264,7 @@ int main(int argc, char** argv) {
       std::cout << "    [region max] quad(junctions+transitions+caps)=" << mj << " slender(arms)=" << ma << "\n";
     };
 
-    junc.SetQuadScheme(QuadElemList<Real>::QuadScheme::Hybrid, cov_q, Nbeta, maxdep);
+    junc.SetQuadScheme(quad_junctions::QJDefaultScheme<Real>(), cov_q, Nbeta, maxdep);
     if (!comm.Rank())
       std::cout << "\n---- BIE verification [tol=" << tol << " Nbeta=" << Nbeta << " max_depth=" << maxdep
                 << " cov_q=" << cov_q << "] ----\n";

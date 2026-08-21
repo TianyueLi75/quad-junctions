@@ -96,6 +96,102 @@ void build_arm_panel_targets(const SlenderElemList<Real>& arms, const Comm& comm
   comm.Allgatherv(Xloc.begin(), Xloc.Dim(), Xout.begin(), rcounts.begin(), rdispls.begin());
 }
 
+// ---- DENSE UNIFORM interior fill of the slender arms (mirrors ../stokes-periodize-numtest VolumeVis).
+// ---- Per panel: s_order axial stations x t_order azimuth x r_order radial layers, interpolated from the
+// ---- cross-section CENTROID (k=0) out to ~the surface (k=r_order-1, at (1-1e-3) of the radius). The
+// ---- point order per panel is [s][theta][r] (r fastest, theta wraps), so a hex writer reconstructs the
+// ---- (s,theta,r) cell lattice purely from the global panel count. Coords are Allgatherv'd so the full
+// ---- set is replicated on every rank (used on rank 0 downstream). Npanel_out = global panel count. ----
+template <class Real>
+void build_arm_volume_targets(const SlenderElemList<Real>& arms, const Comm& comm, Vector<Real>& Xout,
+                              Long& Npanel_out, const Long s_order = 6, const Long t_order = 16,
+                              const Long r_order = 5) {
+  const Real pi = const_pi<Real>();
+  Vector<Real> s_param(s_order), sin_th(t_order), cos_th(t_order);
+  for (Long i = 0; i < s_order; i++) s_param[i] = (s_order > 1) ? (Real)i/(Real)(s_order-1) : (Real)0.5;
+  for (Long j = 0; j < t_order; j++) { const Real t = (Real)j/(Real)t_order;
+    sin_th[j] = (Real)std::sin((double)(2*pi*t)); cos_th[j] = (Real)std::cos((double)(2*pi*t)); }
+  const Real r_inv = (Real)(1 - 1e-3)/(Real)(r_order-1);
+
+  Vector<Real> loc;
+  const Long np = arms.Size();   // LOCAL panels under MPI
+  for (Long e = 0; e < np; e++) {
+    Vector<Real> X_;             // s_order*t_order surface points, AoS, order [s][theta]
+    arms.GetGeom(&X_, nullptr, nullptr, nullptr, nullptr, s_param, sin_th, cos_th, e);
+    for (Long i = 0; i < s_order; i++) {
+      Real Xc[3] = {0,0,0};      // cross-section centroid = azimuthal mean at this s-station
+      for (Long j = 0; j < t_order; j++) for (Integer l = 0; l < 3; l++) Xc[l] += X_[(i*t_order+j)*3+l]/(Real)t_order;
+      for (Long j = 0; j < t_order; j++)
+        for (Long k = 0; k < r_order; k++)
+          for (Integer l = 0; l < 3; l++)
+            loc.PushBack((X_[(i*t_order+j)*3+l] - Xc[l]) * (Real)k * r_inv + Xc[l]);
+    }
+  }
+
+  const Integer nranks = comm.Size();
+  Vector<Long> scv(1); scv[0] = loc.Dim();
+  Vector<Long> rc((Long)nranks); comm.Allgather(scv.begin(), 1, rc.begin(), 1);
+  Vector<Long> rd((Long)nranks); Long tot = 0;
+  for (Integer i = 0; i < nranks; i++) { rd[i] = tot; tot += rc[i]; }
+  Xout.ReInit(tot);
+  if (tot) comm.Allgatherv(loc.begin(), loc.Dim(), Xout.begin(), rc.begin(), rd.begin());
+  const Long blk = s_order*t_order*r_order;
+  Npanel_out = blk ? (Xout.Dim()/3)/blk : 0;
+}
+
+// Write the arm-volume lattice (from build_arm_volume_targets) as VTK_HEXAHEDRON cells over each panel's
+// (s,theta,r) grid, colored by the 3-vector field Ug. Rank-0-only data (Comm::Self()). Points are KEPT
+// (never deleted) -- the caller zeroes Ug inside obstacles / outside the fluid so the solid volume stays
+// intact and the obstacles read as U=0 holes in the flow.
+template <class Real>
+void write_arm_volume_vtu(const std::string& fname, const Vector<Real>& Xg, const Vector<Real>& Ug,
+                          const Long Npanel, const Long s_order, const Long t_order, const Long r_order) {
+  VTUData vtu;
+  const Long Npts = Xg.Dim()/3;
+  for (Long i = 0; i < Npts; i++) for (Integer k = 0; k < 3; k++) vtu.coord.PushBack((VTUData::VTKReal)Xg[3*i+k]);
+  for (Long i = 0; i < Npts; i++) for (Integer k = 0; k < 3; k++) vtu.value.PushBack((VTUData::VTKReal)Ug[3*i+k]);
+  for (Long l = 0; l < Npanel; l++) {
+    const Long off = l * s_order*t_order*r_order;
+    auto idx = [&](Long i, Long j, Long k) { return (int32_t)(off + (i*t_order + (j % t_order))*r_order + k); };
+    for (Long i = 0; i < s_order-1; i++)
+      for (Long j = 0; j < t_order; j++)         // theta wraps (j+1)%t_order -> closed tube
+        for (Long k = 0; k < r_order-1; k++) {
+          vtu.connect.PushBack(idx(i+0,j+0,k+0)); vtu.connect.PushBack(idx(i+0,j+0,k+1));
+          vtu.connect.PushBack(idx(i+0,j+1,k+1)); vtu.connect.PushBack(idx(i+0,j+1,k+0));
+          vtu.connect.PushBack(idx(i+1,j+0,k+0)); vtu.connect.PushBack(idx(i+1,j+0,k+1));
+          vtu.connect.PushBack(idx(i+1,j+1,k+1)); vtu.connect.PushBack(idx(i+1,j+1,k+0));
+          vtu.offset.PushBack((int32_t)vtu.connect.Dim()); vtu.types.PushBack((uint8_t)12);  // 12 = VTK_HEXAHEDRON
+        }
+  }
+  vtu.WriteVTK(fname, Comm::Self());
+}
+
+// Write the junction-box lattice (from build_box_targets: Njunc blocks of an Nax^3 grid, point order
+// [ix][iy][iz], iz fastest) as VTK_HEXAHEDRON cells colored by Ug. Rank-0-only. Same keep-and-zero
+// convention as write_arm_volume_vtu.
+template <class Real>
+void write_box_hex_vtu(const std::string& fname, const Vector<Real>& Xg, const Vector<Real>& Ug,
+                       const Long Njunc, const Long Nax) {
+  VTUData vtu;
+  const Long Npts = Xg.Dim()/3;
+  for (Long i = 0; i < Npts; i++) for (Integer k = 0; k < 3; k++) vtu.coord.PushBack((VTUData::VTKReal)Xg[3*i+k]);
+  for (Long i = 0; i < Npts; i++) for (Integer k = 0; k < 3; k++) vtu.value.PushBack((VTUData::VTKReal)Ug[3*i+k]);
+  for (Long b = 0; b < Njunc; b++) {
+    const Long off = b * Nax*Nax*Nax;
+    auto idx = [&](Long i, Long j, Long k) { return (int32_t)(off + (i*Nax + j)*Nax + k); };
+    for (Long i = 0; i < Nax-1; i++)
+      for (Long j = 0; j < Nax-1; j++)
+        for (Long k = 0; k < Nax-1; k++) {
+          vtu.connect.PushBack(idx(i+0,j+0,k+0)); vtu.connect.PushBack(idx(i+0,j+0,k+1));
+          vtu.connect.PushBack(idx(i+0,j+1,k+1)); vtu.connect.PushBack(idx(i+0,j+1,k+0));
+          vtu.connect.PushBack(idx(i+1,j+0,k+0)); vtu.connect.PushBack(idx(i+1,j+0,k+1));
+          vtu.connect.PushBack(idx(i+1,j+1,k+1)); vtu.connect.PushBack(idx(i+1,j+1,k+0));
+          vtu.offset.PushBack((int32_t)vtu.connect.Dim()); vtu.types.PushBack((uint8_t)12);
+        }
+  }
+  vtu.WriteVTK(fname, Comm::Self());
+}
+
 // Uniform Nax^3 samples in each cube (center +- half). `centers` is AoS (3 per junction), `halves` one
 // per junction. Appends to Xout (AoS, 3/pt). Caller filters to the interior afterwards. Rank-0 geometry.
 template <class Real>

@@ -28,7 +28,15 @@
  *   OMP_NUM_THREADS=8 ./bin/ybifurc-vessels-flow-bie \
  *       [level] [order(mult4)] [nref] [eta_join] [Ns_trans] [fourier] [lead] [corner] \
  *       [tol] [Nbeta] [max_depth] [cov_q] [svg_scale] [p_in] [p_out] [Ngrid] [gmres_max_iter] [Nvis] \
- *       [gscale] [sphere_deg] [sphere_tilt]
+ *       [gscale] [sphere_deg] [sphere_tilt] [arterial_only]
+ *
+ * arterial_only (argv 22, default 0): solve on the ARTERIAL-ONLY geometry (ybifurc-vessels-bie's
+ * arterial_only=1) -- the arterial root cap is the single INFLOW (flux p_in) and every leaf cap (where
+ * the tree used to meet the venous side) is an OUTFLOW. p_out is ignored. The outflow SPLIT is set by env
+ *   QJ_OUTFLOW_FLUX="w1,w2,..."   (relative weights, one per outflow cap in the printed order; missing
+ * entries default to weight 1; unset => equal split). Weights are normalized so the total outflow flux
+ * equals p_in (net flux = 0, the interior-Stokes compatibility condition). It is a flux (velocity) BC, not
+ * a pressure BC. The connector resistance-network + Poiseuille checks are skipped (no connectors exist).
  *
  * The last three (argv 19-21, default 1/0/0 = planar) match ybifurc-vessels-bie.cpp: gscale is a global
  * similarity scale, sphere_deg>0 drapes the whole network rigidly onto a sphere spanning that many arc
@@ -53,8 +61,10 @@
 
 #include <csbq.hpp>                                  // CSBQ SlenderElemList + CubeVolumeVis
 #include <quad_junctions/vessels_build.hpp>          // shared build_vessels_network (+ dot3 etc.)
+#include <quad_junctions/quad_scheme.hpp>            // QJDefaultScheme (Duffy default, SCTL_SELF_SCHEME=hybrid opt-out)
 #include <quad_junctions/vessels_network_solve.hpp>  // reduced Hagen-Poiseuille resistance-network solve
 #include <quad_junctions/interior_viz.hpp>           // build_arm_panel_targets / build_box_targets (interior viz)
+#include <quad_junctions/sphere_obstacles.hpp>       // spherical obstacles near the centerlines (QJ_OBSTACLE)
 #include <quad_junctions/hybrid_bie_tests.hpp>       // combined_nodes + solve_dirichlet_bvp
 #include <quad_junctions/vessels_tree_data.hpp>      // arterial/venous topology tables
 #include <cmath>
@@ -194,6 +204,7 @@ int main(int argc, char** argv) {
     const Real    gscale    = (argc > 19) ? (Real)atof(argv[19]) : (Real)1;   // global similarity scale
     const Real    sphereDeg = (argc > 20) ? (Real)atof(argv[20]) : (Real)0;   // 0=planar; >0 drapes onto a sphere (arc deg)
     const Real    sphereTilt= (argc > 21) ? (Real)atof(argv[21]) : (Real)0;   // tilt the 2 middle connectors +/- deg
+    const bool    arterialOnly = (argc > 22) ? (atoi(argv[22]) != 0) : false; // 1=arterial tree only, capped leaves = outflow ports
     const Integer Ncap    = (Integer)(YSwept::Ncap0 * std::max<Integer>(1, nref));
     const Long    cheb     = 10;
     const Integer nAxFree  = 3;
@@ -203,7 +214,8 @@ int main(int argc, char** argv) {
     SCTL_ASSERT_MSG(ord >= 4 && ord <= 48 && ord % 4 == 0, "order must be a multiple of 4 in {4,...,48}.");
 
     if (!comm.Rank()) {
-      std::cout << "\n=== Stokes inflow/outflow BVP on the 20-junction vessels network ===\n";
+      std::cout << "\n=== Stokes inflow/outflow BVP on the "
+                << (arterialOnly ? "arterial-only (capped) vessels network" : "20-junction vessels network") << " ===\n";
       std::cout << "  order=" << ord << " level=" << level << " nref=" << nref << " eta_join=" << etajoin
                 << " Ns_trans=" << NsTrans << " fourier=" << fourier << " lead=" << leadP << " corner=" << cornerP
                 << " svg_scale=" << svgs << " gscale=" << gscale
@@ -211,8 +223,12 @@ int main(int argc, char** argv) {
                                     + std::to_string((long)sphereTilt) + "]" : "  [planar]") << "\n";
       std::cout << "  near-eval: Hybrid(cov_q=" << cov_q << ", Nbeta=" << Nbeta << ", max_depth=" << maxdep
                 << ") tol=" << std::setprecision(1) << tol << "  gmres_max_iter=" << gmaxit << "\n";
-      std::cout << "  prescribed flux: arterial-root inflow p_in=" << std::setprecision(4) << p_in
-                << "  venous-root outflow p_out=" << p_out << "  net=" << (-p_in + p_out) << "\n";
+      if (arterialOnly)
+        std::cout << "  prescribed flux: arterial-root inflow p_in=" << std::setprecision(4) << p_in
+                  << "  outflow split over leaf caps (QJ_OUTFLOW_FLUX weights, normalized to p_in)  net=0\n";
+      else
+        std::cout << "  prescribed flux: arterial-root inflow p_in=" << std::setprecision(4) << p_in
+                  << "  venous-root outflow p_out=" << p_out << "  net=" << (-p_in + p_out) << "\n";
     }
 
     // ----------------------------------------------------------------------------------------------
@@ -220,13 +236,17 @@ int main(int argc, char** argv) {
     // ----------------------------------------------------------------------------------------------
     HybridAssembly<Real> A(ord);
     const VesselsBuild<Real> vb = build_vessels_network<Real>(A, level, nref, etajoin, NsTrans, fourier,
-        leadP, cornerP, svgs, Ncap, cheb, nAxFree, tipLen, comm, gscale, sphereDeg, sphereTilt);
+        leadP, cornerP, svgs, Ncap, cheb, nAxFree, tipLen, comm, gscale, sphereDeg, sphereTilt,
+        /*open_roots*/false, /*world_off*/Vec3<Real>{0,0,0}, /*arterial_only*/arterialOnly);
 
     QuadElemList<Real> junc = A.quad(comm);
     SlenderElemList<Real> arms = A.slender(comm);
-    junc.SetQuadScheme(QuadElemList<Real>::QuadScheme::Hybrid, cov_q, Nbeta, maxdep);
+    junc.SetQuadScheme(quad_junctions::QJDefaultScheme<Real>(), cov_q, Nbeta, maxdep);
+    const char* obenv = std::getenv("QJ_OBSTACLE");
+    const bool obstacle = obenv && atoi(obenv) != 0;   // add spherical obstacles near the centerlines
     const std::string tag = "vis/ybifurc-vessels-flow-ord" + std::to_string((long)ord) + "-nref" + std::to_string((long)nref)
-        + (sphereDeg > 0 ? "-sph" + std::to_string((long)sphereDeg) : "");   // distinct tag so sph90 doesn't clobber planar
+        + (sphereDeg > 0 ? "-sph" + std::to_string((long)sphereDeg) : "")   // distinct tag so sph90 doesn't clobber planar
+        + (obstacle ? "-obst" : "");
 
     {
       // GLOBAL panel/node counts: GetNodeCoord/Size() return this rank's LOCAL slice, so sum across the comm
@@ -238,36 +258,74 @@ int main(int argc, char** argv) {
       const Long njn = GlobalReduce((Long)(Xj.Dim()/3),  comm, CommOp::SUM);
       const Long nan = GlobalReduce((Long)(Xa.Dim()/3),  comm, CommOp::SUM);
       if (!comm.Rank())
-        std::cout << "\n[geometry] junctions=" << vessels_data::n_junc << " connectors=" << vessels_data::n_conn
-                  << " capped roots=" << vb.n_caps << " (global counts, summed over " << comm.Size() << " ranks)"
+        std::cout << "\n[geometry] junctions=" << (arterialOnly ? vessels_data::n_junc/2 : vessels_data::n_junc)
+                  << " connectors=" << (arterialOnly ? 0 : vessels_data::n_conn)
+                  << " caps=" << vb.n_caps << " (global counts, summed over " << comm.Size() << " ranks)"
                   << "\n  quad panels=" << njp << " nodes=" << njn
                   << " | slender panels=" << nap << " nodes=" << nan
                   << " | TOTAL panels=" << (njp+nap) << " nodes=" << (njn+nan) << "\n";
     }
 
     // ----------------------------------------------------------------------------------------------
-    // (2) The two capped root stems are the inflow/outflow ports. Arterial root (owner id < 10) = INFLOW,
-    //     venous root (owner id >= 10) = OUTFLOW. Cap dome-equator center = seam.C + L*seam.u.
+    // (2) Assign the inflow/outflow ports (cap dome-equator center = seam.C + L*seam.u).
+    //     - Full network (default): exactly two root stems -- arterial root (owner id < 10) = INFLOW p_in,
+    //       venous root (owner id >= 10) = OUTFLOW p_out.
+    //     - Arterial-only: the single arterial-root stem (owner junction with no parent) = INFLOW p_in;
+    //       every other cap (the leaf stubs where the tree used to meet the venous side) = OUTFLOW. The
+    //       outflow SPLIT is set by env QJ_OUTFLOW_FLUX = comma-separated RELATIVE WEIGHTS, one per outflow
+    //       cap in the printed order (missing entries -> weight 1; unset -> all equal). The weights are
+    //       normalized so the total outflow flux == p_in, i.e. net flux int u.n dA = 0 (the interior Stokes
+    //       Dirichlet compatibility condition) holds for ANY weights. Not a pressure BC: each cap prescribes
+    //       a flux-normalized parabolic VELOCITY, same as the two-port case.
     // ----------------------------------------------------------------------------------------------
-    SCTL_ASSERT_MSG(vb.cap_seams.size() == 2, "vessels network must have exactly two root caps (inlet/outlet).");
-    std::vector<FlowCap<Real>> caps;
+    std::vector<FlowCap<Real>> caps(vb.cap_seams.size());
     for (size_t i = 0; i < vb.cap_seams.size(); i++) {
       const ArmSeam<Real>& s = vb.cap_seams[i];
       const Real L = vb.cap_len[i];
-      FlowCap<Real> c;
-      c.C  = Vec3<Real>{s.C[0] + L*s.u[0], s.C[1] + L*s.u[1], s.C[2] + L*s.u[2]};
-      c.u  = s.u; c.R0 = s.R0;
-      if (vb.cap_owner[i] < 10) { c.sgn = -1; c.p = p_in;  }   // arterial-tree root = inflow
-      else                      { c.sgn = +1; c.p = p_out; }   // venous-tree   root = outflow
-      caps.push_back(c);
+      caps[i].C  = Vec3<Real>{s.C[0] + L*s.u[0], s.C[1] + L*s.u[1], s.C[2] + L*s.u[2]};
+      caps[i].u  = s.u; caps[i].R0 = s.R0;
+    }
+    if (!arterialOnly) {
+      SCTL_ASSERT_MSG(caps.size() == 2, "full vessels network must have exactly two root caps (inlet/outlet).");
+      for (size_t i = 0; i < caps.size(); i++)
+        if (vb.cap_owner[i] < 10) { caps[i].sgn = -1; caps[i].p = p_in;  }   // arterial-tree root = inflow
+        else                      { caps[i].sgn = +1; caps[i].p = p_out; }   // venous-tree   root = outflow
+    } else {
+      SCTL_ASSERT_MSG(caps.size() >= 2, "arterial-only network must have >= 2 caps (1 inflow + outflows).");
+      int inflow = -1;   // the arterial-root cap (its owning junction has no parent)
+      for (size_t i = 0; i < caps.size(); i++)
+        if (vessels_data::juncs[vb.cap_owner[i]].parent < 0) {
+          SCTL_ASSERT_MSG(inflow < 0, "arterial-only: more than one root (parentless) cap found.");
+          inflow = (int)i;
+        }
+      SCTL_ASSERT_MSG(inflow >= 0, "arterial-only: no arterial-root inflow cap found.");
+      caps[inflow].sgn = -1; caps[inflow].p = p_in;
+      std::vector<int> outidx;   // remaining caps, in cap-emission order, are the outflows
+      for (int i = 0; i < (int)caps.size(); i++) if (i != inflow) outidx.push_back(i);
+      const Long Nout = (Long)outidx.size();
+      std::vector<Real> w((size_t)Nout, (Real)1);
+      if (const char* env = std::getenv("QJ_OUTFLOW_FLUX")) {
+        std::string str(env); size_t pos = 0; Long k = 0;
+        while (k < Nout && pos <= str.size()) {
+          const size_t comma = str.find(',', pos);
+          const std::string tok = str.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+          if (!tok.empty()) w[(size_t)k] = (Real)atof(tok.c_str());
+          k++;
+          if (comma == std::string::npos) break;
+          pos = comma + 1;
+        }
+      }
+      Real wsum = 0; for (Long k = 0; k < Nout; k++) wsum += w[(size_t)k];
+      SCTL_ASSERT_MSG((double)wsum > 0, "QJ_OUTFLOW_FLUX weights must sum to > 0.");
+      for (Long k = 0; k < Nout; k++) { caps[outidx[(size_t)k]].sgn = +1; caps[outidx[(size_t)k]].p = p_in * w[(size_t)k]/wsum; }
     }
     if (!comm.Rank()) {
-      std::cout << "\n  [caps] " << caps.size() << " root-stem ports (R0=" << std::setprecision(6) << caps[0].R0 << ")\n";
+      std::cout << "\n  [caps] " << caps.size() << " ports (1 inflow"
+                << (arterialOnly ? " + " + std::to_string((long)caps.size()-1) + " outflow" : " + 1 outflow") << ")\n";
       for (size_t i = 0; i < caps.size(); i++)
-        std::cout << "    cap " << i << " (junc " << vb.cap_owner[i] << "): center=(" << std::setprecision(4)
-                  << caps[i].C[0] << "," << caps[i].C[1] << "," << caps[i].C[2] << ")  axis=(" << caps[i].u[0]
-                  << "," << caps[i].u[1] << "," << caps[i].u[2] << ")  "
-                  << (caps[i].sgn < 0 ? "INFLOW" : "OUTFLOW") << " p=" << caps[i].p << "\n";
+        std::cout << "    cap " << i << " (junc " << vb.cap_owner[i] << ", R0=" << std::setprecision(4) << caps[i].R0
+                  << "): center=(" << caps[i].C[0] << "," << caps[i].C[1] << "," << caps[i].C[2] << ")  "
+                  << (caps[i].sgn < 0 ? "INFLOW " : "OUTFLOW") << " p=" << std::setprecision(6) << caps[i].p << "\n";
     }
 
     // ----------------------------------------------------------------------------------------------
@@ -295,11 +353,58 @@ int main(int argc, char** argv) {
     }
 
     // ----------------------------------------------------------------------------------------------
-    // (4) Assemble the boundary velocity RHS over the combined "0_junc"+"1_arms" node ordering, and
-    //     VERIFY the flux: int v.n dA per cap (should be -+p) and the total (should be ~0).
+    // (3b) Spherical obstacles (QJ_OBSTACLE=1): one per axial arm element + one per junction, near the
+    //      centerlines. The inflow/outflow root-cap STEMS are skipped so obstacles never sit on the
+    //      pressure-BC caps. Deterministic (fixed seed) -> identical across the convergence sweep / ranks.
     // ----------------------------------------------------------------------------------------------
-    Vector<Real> X, Xn; Long Nj, Na; combined_nodes(junc, arms, X, Xn, Nj, Na);
-    const Long Nnode = Nj + Na;
+    SlenderElemList<Real> obst;
+    std::vector<SphereObstacle<Real>> obst_specs;
+    if (obstacle) {
+      const unsigned seed = std::getenv("QJ_OBSTACLE_SEED")    ? (unsigned)atoi(std::getenv("QJ_OBSTACLE_SEED")) : 2u;
+      const Real  radfrac = std::getenv("QJ_OBSTACLE_RADFRAC") ? (Real)atof(std::getenv("QJ_OBSTACLE_RADFRAC")) : (Real)0.2;
+      const Long  sph_ord = cheb;   // MUST equal the arm order 10: only special_quad_q10 is precomputed (see CLAUDE.md, "CSBQ ElemOrder").
+      const Long  sph_fou = std::getenv("QJ_OBSTACLE_FOURIER") ? (Long)atoi(std::getenv("QJ_OBSTACLE_FOURIER")) : fourier;
+      const Long  sph_pan = std::getenv("QJ_OBSTACLE_PANEL")   ? (Long)atoi(std::getenv("QJ_OBSTACLE_PANEL"))   : 2;
+      // Skip cylinders = the root-cap stems (inflow/outflow), where the parabolic BC is prescribed.
+      std::vector<ExclCyl<Real>> skip;
+      for (size_t i = 0; i < vb.cap_seams.size(); i++) {
+        const ArmSeam<Real>& s = vb.cap_seams[i];
+        skip.push_back(ExclCyl<Real>{s.C, s.u, vb.cap_len[i] - s.a0, s.R0});
+      }
+      place_arm_panel_obstacles<Real>(arms, comm, cheb, skip, seed, radfrac, obst_specs);
+      // One obstacle per junction: center = placement origin; R0 = a representative attached-arm radius;
+      // half-width = farthest attached seam ring (same estimate the viz box uses below).
+      const int NJ = arterialOnly ? vessels_data::n_junc/2 : vessels_data::n_junc;
+      std::vector<Vec3<Real>> jcen((size_t)NJ); std::vector<Real> jR0((size_t)NJ, (Real)0), jhalf((size_t)NJ, (Real)0);
+      for (int i = 0; i < NJ; i++) jcen[(size_t)i] = vb.P[(size_t)i].apply_point(Vec3<Real>{0,0,0});
+      for (const ArmSeg<Real>& seg : vb.segs) {
+        if (seg.cl.empty()) continue;
+        if (seg.j0 >= 0 && seg.j0 < NJ) { jR0[(size_t)seg.j0] = std::max(jR0[(size_t)seg.j0], seg.rtube);
+          jhalf[(size_t)seg.j0] = std::max(jhalf[(size_t)seg.j0], nrm3(sub3(seg.cl.front(), jcen[(size_t)seg.j0]))); }
+        if (seg.j1 >= 0 && seg.j1 < NJ && seg.j1 != seg.j0) { jR0[(size_t)seg.j1] = std::max(jR0[(size_t)seg.j1], seg.rtube);
+          jhalf[(size_t)seg.j1] = std::max(jhalf[(size_t)seg.j1], nrm3(sub3(seg.cl.back(), jcen[(size_t)seg.j1]))); }
+      }
+      for (int i = 0; i < NJ; i++) { if (!(jR0[(size_t)i] > 0)) jR0[(size_t)i] = caps[0].R0; if (!(jhalf[(size_t)i] > 0)) jhalf[(size_t)i] = (Real)3*caps[0].R0; }
+      place_junction_obstacles<Real>(jcen, jR0, jhalf, seed, radfrac, obst_specs);
+      obst = build_obstacle_elem_list<Real>(obst_specs, sph_ord, sph_fou, sph_pan, comm);
+      if (!comm.Rank()) {
+        Real rmin = 1e300, rmax = 0; for (const auto& s : obst_specs) { rmin = std::min<Real>(rmin, s.r); rmax = std::max<Real>(rmax, s.r); }
+        std::cout << "\n  [obstacle] ON  " << obst_specs.size() << " spheres (per arm-element + per junction; root stems skipped)"
+                  << "  r in [" << std::setprecision(4) << (obst_specs.empty()?0:rmin) << "," << rmax << "]"
+                  << "  mesh: " << sph_pan << " panels x ord " << sph_ord << " x fourier " << sph_fou << std::setprecision(6) << "\n";
+      }
+    } else if (!comm.Rank()) {
+      std::cout << "\n  [obstacle] OFF (set QJ_OBSTACLE=1 to add spherical obstacles near the centerlines)\n";
+    }
+    const SlenderElemList<Real>* obst_ptr = obstacle ? &obst : nullptr;
+
+    // ----------------------------------------------------------------------------------------------
+    // (4) Assemble the boundary velocity RHS over the combined "0_junc"+"1_arms"(+"2_obst") node
+    //     ordering, and VERIFY the flux: int v.n dA per cap (should be -+p) and the total (should be ~0).
+    // ----------------------------------------------------------------------------------------------
+    Vector<Real> X, Xn; Long Nj, Na, No = 0; combined_nodes(junc, arms, X, Xn, Nj, Na, obst_ptr, &No);
+    const Long Nsurf = Nj + Na;            // junc+arms only (interior indicator uses just these)
+    const Long Nnode = Nj + Na + No;       // full combined node count (bc / sigma ordering)
     Vector<Real> bc(Nnode*3);
     for (Long i = 0; i < Nnode; i++) {
       const Vec3<Real> v = flow_bc_vel<Real>(Vec3<Real>{X[3*i], X[3*i+1], X[3*i+2]}, caps);
@@ -352,7 +457,8 @@ int main(int argc, char** argv) {
       for (Long i = 0; i < Xarm.Dim(); i++) Xgrid.PushBack(Xarm[i]);
       Narm = Xgrid.Dim()/3;
       // Per-junction cube: center = placement origin; half-width = farthest attached arm-seam ring + 15%.
-      const int NJ = vessels_data::n_junc;
+      // arterial-only builds only the first-half junctions (venous placements are never populated).
+      const int NJ = arterialOnly ? vessels_data::n_junc/2 : vessels_data::n_junc;
       Vector<Real> jc(3*NJ), jh(NJ); jh = 0;
       for (int i = 0; i < NJ; i++) {
         const Vec3<Real> c = vb.P[(size_t)i].apply_point(Vec3<Real>{0,0,0});
@@ -387,12 +493,6 @@ int main(int argc, char** argv) {
     //      Then, on rank 0, APPEND mid-arm probe targets (a cross-section disk to integrate the BIE flux,
     //      + a radial line for the profile) to Xgrid so they ride the SAME operator eval as the box.
     // ----------------------------------------------------------------------------------------------
-    int root_in = -1, root_out = -1;
-    for (size_t i = 0; i < vb.cap_owner.size(); i++)
-      (vb.cap_owner[i] < 10 ? root_in : root_out) = vb.cap_owner[i];
-    const NetworkSolution<Real> net =
-        solve_vessels_pressure_network<Real>(vb.segs, vessels_data::n_junc, root_in, root_out, p_in);
-
     // Per-connector probe metadata (rank 0 only; carried to the post-solve check in step 9).
     struct Probe {
       int cidx; Real r, Qpred; Vec3<Real> mid, t;
@@ -402,7 +502,17 @@ int main(int argc, char** argv) {
     std::vector<Probe> probes;
     const Long Nring = 8, Nang = 16, Nrad = 21;
 
-    if (!comm.Rank()) {
+    // The resistance-network reference + mid-arm Poiseuille probes describe the arterial<->venous CONNECTOR
+    // flow; arterial-only has no connectors, so this whole verification (and step 9) is skipped -- `probes`
+    // stays empty. The BIE flow solve itself (step 6) is geometry-agnostic and runs unchanged.
+    if (!arterialOnly) {
+      int root_in = -1, root_out = -1;
+      for (size_t i = 0; i < vb.cap_owner.size(); i++)
+        (vb.cap_owner[i] < 10 ? root_in : root_out) = vb.cap_owner[i];
+      const NetworkSolution<Real> net =
+          solve_vessels_pressure_network<Real>(vb.segs, vessels_data::n_junc, root_in, root_out, p_in);
+
+     if (!comm.Rank()) {
       Real Qsum = 0; int nconn = 0;
       std::cout << "\n  [network] reduced Hagen-Poiseuille resistance solve (mu=1; pressures ~ p_in=" << p_in << "):\n";
       std::cout << "    junction pressures P[0.." << (vessels_data::n_junc-1) << "] (mean-zero):\n     ";
@@ -453,31 +563,60 @@ int main(int argc, char** argv) {
                 << "  (target p_in=" << p_in << ", global conservation)\n";
       std::cout << "    mid-arm probes: " << nconn << " connectors x (" << Nring << "x" << Nang
                 << " disk + " << Nrad << " line) = " << (Long)(Xgrid.Dim()/3 - Ngrid_pts) << " points appended\n";
+     }
     }
 
     // ----------------------------------------------------------------------------------------------
     // (6) Solve the interior Stokes Dirichlet BVP (SL_scal=-1, DL_scal=+1 -> jump=-1/2) and evaluate the
     //     represented velocity field at the grid + mid-arm probe points.
     // ----------------------------------------------------------------------------------------------
-    // DISABLED 2026-07-29: block-diagonal left preconditioner on the junction rows. The machinery is
-    // still there and inert (quad_junctions/junction_precond.hpp; solve_dirichlet_bvp's `precond`
-    // argument defaults to nullptr), so re-enabling is just uncommenting this block and passing
-    // &pspec again. Left off because the whole-junction block is 3*npj*order^2 DOF = 82,944 at
-    // order 12 / nref 1 / Ns_trans 2 -> 55 GB dense and a ~3 h SVD; QJ_PRECOND_BLOCK selects
-    // junction / panel / off when it is back in play.
-    // JunctionPrecondSpec<Real> pspec;
-    // pspec.kind     = precond_block_kind();
-    // pspec.order    = ord;
-    // pspec.level    = level;
-    // pspec.nref     = nref;
-    // pspec.eta_join = etajoin;
-    // pspec.Ns_trans = NsTrans;
-    // pspec.njunc    = (Long)vb.P.size();
-
+    // UNPRECONDITIONED (reverted 2026-08-11). The junction preconditioner (quad_junctions/
+    // junction_precond.hpp) was tried on this network and made convergence WORSE, not better:
+    //   * unpreconditioned : converged in 1860 GMRES iters.
+    //   * coarse (order-4) two-grid junction block, covering 19/20 junctions (job 6824396,
+    //     order 8 / nref 1 / Ns_trans 2 / tol 1e-7): reached iter 2212 WITHOUT converging
+    //     (preconditioned rel residual still 4.6e-4) before the 3 h wall limit.
+    // This matches the racetrack diagnostic: even the EXACT junction-block inverse increases
+    // iterations there (55 -> 177), because the dominant slow modes are the multiply-connected
+    // (genus-10) lumen circulation modes, which a junction-only block preconditioner cannot
+    // touch -- it only perturbs the already well-conditioned junction rows. The coarse two-grid
+    // machinery + its Off-by-default `precond` argument remain available in the header and the
+    // racetrack driver (ybifurc-channel-bie) for future use; it is simply not helpful here.
+    // CSBQ well-conditioned per-node single-layer scaling on the slender arms (Malhotra-Barnett 2024,
+    // Eq. 33): replace the constant arm SL coefficient with eta(s)=1/(2*eps*log(1/eps)) so the combined
+    // field stays O(1)-conditioned as the tube radius eps->0. Env-gated (default OFF -> results identical):
+    //   QJ_SLENDER_SCALING=1   enable
+    //   QJ_SLENDER_EPS_MAX=<r> slender-regime cutoff (default 0.1); nodes with eps>cutoff keep SL_scal.
+    // Computed ONCE here from each arm node's radius; solve_dirichlet_bvp multiplies it into the arm slice
+    // of the density once per GMRES iteration.
+    Vector<Real> arm_sl_eta;                                          // empty => scaling OFF
+    {
+      const char* sbenv = std::getenv("QJ_SLENDER_SCALING");
+      if (sbenv && atoi(sbenv) != 0) {
+        const char* emenv = std::getenv("QJ_SLENDER_EPS_MAX");
+        const Real eps_max = emenv ? (Real)atof(emenv) : (Real)0.1;
+        quad_junctions::arm_slender_sl_eta<Real>(arms, cheb, arm_sl_eta, eps_max);
+        // Diagnostics: how many arm nodes fall in the slender regime, and the eta range applied.
+        Long n_scaled = 0; Real emin = 1e300, emax = 0;
+        for (Long i = 0; i < arm_sl_eta.Dim(); i++) if (arm_sl_eta[i] > 0) { n_scaled++; emin = std::min(emin, (Real)arm_sl_eta[i]); emax = std::max(emax, (Real)arm_sl_eta[i]); }
+        const Long n_arm = arm_sl_eta.Dim();
+        const long g_scaled = (long)GlobalReduce((double)n_scaled, comm, CommOp::SUM);
+        const long g_arm    = (long)GlobalReduce((double)n_arm,    comm, CommOp::SUM);
+        const double g_emin = (n_scaled ? GlobalReduce((double)emin, comm, CommOp::MIN) : GlobalReduce(1e300, comm, CommOp::MIN));
+        const double g_emax = GlobalReduce((double)emax, comm, CommOp::MAX);
+        if (!comm.Rank())
+          std::cout << "  [slender-scaling] ON  eps_max=" << (double)eps_max << "  scaled "
+                    << g_scaled << " / " << g_arm << " arm nodes  eta in ["
+                    << (g_scaled ? g_emin : 0.0) << ", " << g_emax << "]\n";
+      } else if (!comm.Rank()) {
+        std::cout << "  [slender-scaling] OFF (set QJ_SLENDER_SCALING=1 to enable CSBQ Eq.33 arm SL scaling)\n";
+      }
+    }
     Vector<Real> Ugrid;
     const Vector<Real> sigma = solve_dirichlet_bvp<Real, Stokes3D_FxU, Stokes3D_DxU>(
         junc, arms, comm, tol, bc, /*interior=*/true, /*SL_scal=*/(Real)-1., /*DL_scal=*/(Real)1.,
-        Xgrid, &Ugrid, "stokes inflow/outflow", /*gmres_max_iter=*/gmaxit);
+        Xgrid, &Ugrid, "stokes inflow/outflow", /*gmres_max_iter=*/gmaxit,
+        /*precond=*/nullptr, /*arm_sl_eta=*/arm_sl_eta, /*obstacles=*/obst_ptr);
 
     // ----------------------------------------------------------------------------------------------
     // (7) Interior filter: Laplace DL constant-density indicator (~ -1 interior, ~0 exterior) at the viz
@@ -490,16 +629,21 @@ int main(int argc, char** argv) {
       SetPVFMMKer(IndOp);
       IndOp.SetAccuracy(tol);
       IndOp.AddElemList(junc, "0_junc"); IndOp.AddElemList(arms, "1_arms");
-      Vector<Real> ones(Nnode); ones = 1;
+      Vector<Real> ones(Nsurf); ones = 1;   // indicator has only junc+arms; obstacles handled geometrically
       IndOp.SetTargetCoord(Xgrid);
       Vector<Real> ind;
       IndOp.ComputePotential(ind, ones);
+      // A viz target is "in the fluid" if the indicator says interior AND it is outside every obstacle sphere.
+      auto out_sph = [&](Long i) -> bool {
+        return !obstacle || outside_all_spheres<Real>(Xgrid[3*i], Xgrid[3*i+1], Xgrid[3*i+2], obst_specs);
+      };
       if (!comm.Rank()) {
         Long n_junc_in = 0;
-        for (Long i = 0; i < Narm; i++)                          // arms: interior by construction
-          for (Integer k = 0; k < 3; k++) { Xvis.PushBack(Xgrid[3*i+k]); Uvis.PushBack(Ugrid[3*i+k]); }
-        for (Long i = Narm; i < Ngrid_pts; i++)                  // junction box: keep interior only
-          if (std::fabs((double)ind[i]) > 0.5) {
+        for (Long i = 0; i < Narm; i++)                          // arms: interior, but drop any inside a sphere
+          if (out_sph(i))
+            for (Integer k = 0; k < 3; k++) { Xvis.PushBack(Xgrid[3*i+k]); Uvis.PushBack(Ugrid[3*i+k]); }
+        for (Long i = Narm; i < Ngrid_pts; i++)                  // junction box: keep interior AND outside spheres
+          if (std::fabs((double)ind[i]) > 0.5 && out_sph(i)) {
             for (Integer k = 0; k < 3; k++) { Xvis.PushBack(Xgrid[3*i+k]); Uvis.PushBack(Ugrid[3*i+k]); }
             n_junc_in++;
           }
@@ -518,6 +662,11 @@ int main(int argc, char** argv) {
       junc.WriteVTK(tag + "-sigma-junc", sj,  comm);   // collective
       arms.WriteVTK(tag + "-sigma-arms", sa_, comm);
       junc.WriteVTK(tag + "-bc-junc",    bcj, comm);   // prescribed inflow/outflow velocity
+      if (obstacle && No > 0) {   // obstacle density lives in the trailing "2_obst" block of sigma
+        Vector<Real> so(No*3);
+        for (Long i = 0; i < No*3; i++) so[i] = sigma[Nsurf*3 + i];
+        obst.WriteVTK(tag + "-sigma-obst", so, comm);   // collective; obstacle surfaces colored by density
+      }
       if (!comm.Rank()) {
         // Interior-only cloud built in step 7: arm cross-section stars + junction-box points inside the
         // surface. The mid-arm Poiseuille probes (appended after Ngrid_pts) are never added to Xvis.

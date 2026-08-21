@@ -58,10 +58,25 @@ VesselsBuild<Real> build_vessels_network(HybridAssembly<Real>& A, const Real lev
     const Integer cornerP, const Real svgs, const Integer Ncap, const Long cheb, const Integer nAxFree,
     const Real tipLen, const Comm& comm, const Real gscale = (Real)1, const Real sphere_deg = (Real)0,
     const Real sphere_tilt_deg = (Real)0,
-    const bool open_roots = false, const Vec3<Real> world_off = Vec3<Real>{(Real)0,(Real)0,(Real)0}) {
+    const bool open_roots = false, const Vec3<Real> world_off = Vec3<Real>{(Real)0,(Real)0,(Real)0},
+    const bool arterial_only = false) {
   namespace vd = vessels_data;
   const int NJ = vd::n_junc, NC = vd::n_conn;
   VesselsBuild<Real> out;
+
+  // `arterial_only`: build ONLY the arterial half of the network (junctions 0..NJ/2-1). The venous tree
+  // (junctions NJ/2..NJ-1) is omitted entirely, and the leaf connectors A_i<->V_i are NOT drawn --
+  // instead every arterial branch seam that would have fed a connector is left unconsumed, so Pass 4
+  // caps it (a slender stub + hemisphere) exactly like a root stem. The arterial tree therefore ends in
+  // capped free arms where it used to merge into the venous tree. The topology (auto-generated) places
+  // arterial junctions in the first half of `juncs` and every connector's a_jct in that half / v_jct in
+  // the second; assert that so the i<NJ/2 split stays valid if the SVG is ever re-emitted.
+  const int NJ_art = NJ / 2;
+  auto active = [&](int i) { return !arterial_only || i < NJ_art; };
+  if (arterial_only)
+    for (int ci = 0; ci < NC; ci++)
+      SCTL_ASSERT_MSG(vd::conns[ci].a_jct < NJ_art && vd::conns[ci].v_jct >= NJ_art,
+                      "arterial_only assumes arterial junctions occupy the first half of the topology table.");
 
   // `gscale` is a GLOBAL SIMILARITY factor: it multiplies BOTH the SVG->world position scale and every
   // junction's own size, so the network is geometrically similar -- only its absolute extent changes
@@ -124,10 +139,11 @@ VesselsBuild<Real> build_vessels_network(HybridAssembly<Real>& A, const Real lev
   auto mat_vec = [](const Real R[9], const Vec3<Real>& v) {
     return Vec3<Real>{ R[0]*v[0]+R[1]*v[1]+R[2]*v[2], R[3]*v[0]+R[4]*v[1]+R[5]*v[2], R[6]*v[0]+R[7]*v[1]+R[8]*v[2] }; };
   if (onsphere) {
-    for (int i=0;i<NJ;i++) { Gc[0]+=center[i][0]; Gc[1]+=center[i][1]; Gc[2]+=center[i][2]; }
-    Gc[0]/=NJ; Gc[1]/=NJ; Gc[2]/=NJ;
+    int nact = 0;
+    for (int i=0;i<NJ;i++) if (active(i)) { Gc[0]+=center[i][0]; Gc[1]+=center[i][1]; Gc[2]+=center[i][2]; nact++; }
+    Gc[0]/=nact; Gc[1]/=nact; Gc[2]/=nact;
     Real Lspan = 0;
-    for (int i=0;i<NJ;i++) for (int j=i+1;j<NJ;j++) { const Real d=nrm3(sub3(center[i],center[j])); if (d>Lspan) Lspan=d; }
+    for (int i=0;i<NJ;i++) if (active(i)) for (int j=i+1;j<NJ;j++) if (active(j)) { const Real d=nrm3(sub3(center[i],center[j])); if (d>Lspan) Lspan=d; }
     Rsph = Lspan / (sphere_deg * (const_pi<Real>()/(Real)180));
     if (!comm.Rank())
       std::cout << "  [sphere] span L=" << Lspan << " -> R=" << Rsph << " (" << sphere_deg
@@ -181,6 +197,7 @@ VesselsBuild<Real> build_vessels_network(HybridAssembly<Real>& A, const Real lev
   //     (all target positions are known up front), so no BFS dependency. Then place it and assign its
   //     two branch seams to the two targets by best axis-direction match. ---
   for (int i = 0; i < NJ; i++) {
+    if (!active(i)) continue;   // arterial_only: skip the venous half (indices >= NJ/2)
     int seamk[2];
     if (onsphere) {
       // Rigid tangent placement: compose the local (planar) alignment with the sphere tangent frame Q.
@@ -243,6 +260,7 @@ VesselsBuild<Real> build_vessels_network(HybridAssembly<Real>& A, const Real lev
   int n_single = 0, n_race = 0;
   for (int c = 0; c < NJ; c++) {
     if (vd::juncs[c].parent < 0) continue;
+    if (!active(c)) continue;   // arterial_only: no venous intra-tree arms
     const int pj = clink[c][0], pk = clink[c][1];
     const ArmSeam<Real> a = J[pj].seam(pk), b = J[c].seam(0);
     const Vec3<Real> chv = sub3(b.C, a.C);
@@ -265,7 +283,9 @@ VesselsBuild<Real> build_vessels_network(HybridAssembly<Real>& A, const Real lev
   if (!comm.Rank()) std::cout << "  [intra-tree] single-corner=" << n_single << " racetrack-fallback=" << n_race << "\n";
 
   // --- Pass 3: leaf connectors A_i <-> V_i (two-corner racetrack; lenses close by construction). ---
-  for (int ci = 0; ci < NC; ci++) {
+  //     Skipped entirely in arterial_only mode: the arterial branch seams that would have fed a connector
+  //     stay unconsumed and get capped in Pass 4, so the arterial tree terminates in free arms + caps.
+  for (int ci = 0; !arterial_only && ci < NC; ci++) {
     const ArmSeam<Real> a = J[llnkJ[ci][0]].seam(llnkK[ci][0]), b = J[llnkJ[ci][1]].seam(llnkK[ci][1]);
     const Real chord = nrm3(sub3(b.C, a.C));
     const Real pspac = (Real)1.5*std::max(a.R0, b.R0);
@@ -294,7 +314,8 @@ VesselsBuild<Real> build_vessels_network(HybridAssembly<Real>& A, const Real lev
 
   // --- Pass 4: cap every remaining (unconsumed) seam -- the two tree-root stems (inlet/outlet). ---
   int n_caps = 0;
-  for (int i = 0; i < NJ; i++)
+  for (int i = 0; i < NJ; i++) {
+    if (!active(i)) continue;   // arterial_only: only cap arterial seams (venous half was never built)
     for (int k = 0; k < 3; k++)
       if (!consumed[i][k]) {
         const ArmSeam<Real> s = J[i].seam(k);
@@ -307,6 +328,7 @@ VesselsBuild<Real> build_vessels_network(HybridAssembly<Real>& A, const Real lev
         out.cap_seams.push_back(s); out.cap_len.push_back(L); out.cap_owner.push_back(i);
         n_caps++;
       }
+  }
 
   out.n_single = n_single; out.n_race = n_race; out.n_caps = n_caps;
   return out;
