@@ -3,7 +3,7 @@
  * HYBRID flat-plane cilia carpet: the QuadElemList BASE (two flat walls, each tiled with an
  * Npatch x Npatch grid of collar + fillet + butterfly-cap FEET, NO shaft) joined to a CSBQ
  * SlenderElemList that supplies one bent-tube SHAFT per cilium, all fed into ONE BoundaryIntegralOp.
- * The flat-carpet counterpart of stud_sphere_hybrid_geom.hpp's `flagella`/`allfinger` hybrid.
+ * The flat-carpet hybrid: QuadElemList collar/cap feet + CSBQ slender shafts (the `flagella`/`allfinger` pattern).
  *
  * Each cilium's slender shaft follows a CiliumCurveFlat centerline: a straight base, a smootherstep-POU
  * tilt into `tilt_rad` (in the +dir_x*x / z plane), then straight-tilted to a tip at height H_reach, with
@@ -216,7 +216,8 @@ template <class Real> Real tip_world_x(Real cx, Real cy, Real R_shaft, Real H_re
 template <class Real> std::vector<CiliumCurveFlat<Real>> generate_cilia_carpet(
     Integer Npatch, Real z_bottom, Real z_top, Real L, Real R_shaft, Real bot_tip, Real top_tip,
     Real r_fil, Integer Naz, Real tilt_rad, Integer n_straight, Integer n_trans,
-    uint64_t seed, const Comm& comm, Real box_buffer = (Real)0.01, Real coll_buffer = (Real)0.005) {
+    uint64_t seed, const Comm& comm, Real box_buffer = (Real)0.01, Real coll_buffer = (Real)0.005,
+    bool wiggle = true) {
   const Real S = L / (Real)(2 * Npatch);
   const Real pi = const_pi<Real>();
   // Wiggle amplitude (transverse, windowed to 0 at foot+tip). Bounded by FOUR things:
@@ -234,7 +235,10 @@ template <class Real> std::vector<CiliumCurveFlat<Real>> generate_cilia_carpet(
   const Real Sarc_lo = std::min(bot_tip - z_bottom, z_top - top_tip);   // conservative arc-length proxy
   const Real k_curv = std::getenv("QJ_WIG_KCURV") ? (Real)std::atof(std::getenv("QJ_WIG_KCURV")) : (Real)2;
   const Real curv_amp = (R_shaft > 0) ? Sarc_lo*Sarc_lo / (4*pi*pi*k_curv*R_shaft) : (Real)1e30;
-  const Real max_amp = std::min(std::min(wig_frac * (2 * S), lane), curv_amp);
+  // wiggle knob (default on): OFF forces amp==0 for every cilium, so each curve reduces to the nominal
+  // tilted add_cilium_stud_flat centerline (bit-identical wiggle-off). Tilt-reduction / box-containment /
+  // cap-overlap safeguards below still run -- only the random transverse sine is removed.
+  const Real max_amp = wiggle ? std::min(std::min(wig_frac * (2 * S), lane), curv_amp) : (Real)0;
   const Real edge_amp = (Real)0.2 * (L / (Real)Npatch);  // Phase-C box amp-cut STEP size (0.1*edge_amp per step)
 
   // 1. nominal curves (tilt, no wiggle)
@@ -372,7 +376,8 @@ template <class Real> std::vector<CiliumCurveFlat<Real>> generate_cilia_carpet(
   for (Long i = 0; i < N; i++) { Real zmn, zmx; cilium_z_bounds<Real>(C[i], R_shaft, zmn, zmx);
     z_over = std::max(z_over, std::max((Real)0 - zmn, zmx - L)); zlo_g = std::min(zlo_g, zmn); zhi_g = std::max(zhi_g, zmx); }
   if (!comm.Rank())
-    std::cout << "  generate_cilia_carpet: " << N << " cilia  seed=" << seed << "  amp in [" << amp_min
+    std::cout << "  generate_cilia_carpet: " << N << " cilia  seed=" << seed
+              << "  wiggle=" << (wiggle ? "ON" : "OFF") << "  amp in [" << amp_min
               << ", " << max_amp << "] (bounds: patch " << wig_frac*(2*S) << ", lane " << lane
               << ", curvature " << curv_amp << " [R_curv>=" << k_curv << "*R_shaft])\n"
               << "    tilt-reduced (box-fit): " << n_tilt_cut << "   wiggle regenerations: " << n_regen

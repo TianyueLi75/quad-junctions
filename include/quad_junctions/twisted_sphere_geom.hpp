@@ -10,7 +10,7 @@
  * recovers the plain cubed sphere.
  *
  * Ported verbatim from the SCTL fork's SCTL_quad_element/src/test-quad-elem.cpp (BuildTwistedSphere);
- * FacePoint (gnomonic cube-face -> sphere map) is reused from stud_sphere_geom.hpp so there is one
+ * FacePoint (gnomonic cube-face -> sphere map) is reused from collar_mount_geom.hpp so there is one
  * source of truth for the cubed-sphere map.
  *
  * Every rank builds the full node array X, then the QuadElemList ctor keeps only this rank's
@@ -19,7 +19,7 @@
  */
 
 #include <sctl.hpp>
-#include <quad_junctions/stud_sphere_geom.hpp>   // FacePoint (cubed-sphere gnomonic map)
+#include <quad_junctions/collar_mount_geom.hpp>   // FacePoint (cubed-sphere gnomonic map)
 
 namespace quad_junctions {
 using namespace sctl;

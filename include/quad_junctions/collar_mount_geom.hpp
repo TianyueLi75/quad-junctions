@@ -1,20 +1,18 @@
 #pragma once
 /**
- * Cilia / collar / mount surface-mesh generator (pure QuadElemList) for cubed-sphere geometries.
- * Ported verbatim from SCTL_quad_element/src/test-gmsh-geom.cpp (the cilia-mount code migrated here).
+ * Collar / cap / cilium-stud surface-mesh primitives (pure QuadElemList) — the shared mounting library
+ * used by the flat cilia carpet (plane_cilia_geom.hpp) and the twisted cubed sphere
+ * (twisted_sphere_geom.hpp, which pulls FacePoint from here). Ported from
+ * SCTL_quad_element/src/test-gmsh-geom.cpp.
  *
- * Three layers of order x order GL patches (AoS, u-slow), concatenated into a QuadElemList:
- *   1. Mount  : (X,Y,depth) -> world functor placing a tangent-plane patch on a host surface
- *               (SphereMount = gnomonic north pole; PatchMount = gnomonic on any cube face).
- *   2. Collar : collar_point circle(R_foot)->square(S) annulus (add_collar_sector) + add_disk_fill
- *               butterfly O-grid closing the foot hole. ONE shared collar mesh.
- *   3. Cilia  : add_cilium_stud stacks shaft + fillet + collar + butterfly cap (add_cap_butterfly).
- *
- * Builders: BuildCiliumStuddedSphere (single stud), BuildSphereWithCollarFill (one collar patch, no
- * finger), BuildAllCollarFillSphere (every patch = collar+disk, optional one finger). report_area is a
- * geometry/watertightness summary helper. Observed-best defaults: disk core_frac=0.40; collar Naz=4
- * (single, conforming outer seam), Naz=8 (finger shaft + all-collar rim). See the drivers
- * src/stud_sphere-bie.cpp (DL + Green's identity) and src/stud_sphere-geom.cpp (geometry checks).
+ * The building blocks (all templated on a Mount<Real> (X,Y,depth)->world functor, so any host surface
+ * can supply its own frame):
+ *   - Mount  : PatchMount = gnomonic on any cube face (FacePoint); callers may supply flat frames etc.
+ *   - Collar : collar_point circle(R_foot)->square(S) annulus (add_collar_sector) + add_disk_fill
+ *              butterfly O-grid closing the foot hole. ONE shared collar mesh.
+ *   - Cilia  : add_cilium_stud stacks shaft + fillet + collar + butterfly cap (add_cap_butterfly).
+ * report_area is a geometry/watertightness summary helper. Observed-best defaults: disk core_frac=0.40;
+ * collar Naz=4 (single, conforming outer seam), Naz=8 (finger shaft + all-collar rim).
  */
 
 #include <sctl.hpp>
@@ -86,7 +84,7 @@ template <class Real> void add_cubedsphere(Vector<Real>& X, Integer order, Long 
   for (Integer face = 0; face < 6; face++)
     for (Long iu = 0; iu < PatchPerFace; iu++)
       for (Long iv = 0; iv < PatchPerFace; iv++) {
-        if (face == skipFace && iu == skipIu && iv == skipIv) continue;
+        if ((skipFace < 0 || face == skipFace) && iu == skipIu && iv == skipIv) continue;  // skipFace<0 => skip this (iu,iv) on EVERY face
         for (Integer i = 0; i < order; i++) {
           const Real a = 2 * (iu + nds[i]) / (Real)PatchPerFace - 1;
           for (Integer j = 0; j < order; j++) {
@@ -104,16 +102,9 @@ template <class Real> using Vec3 = std::array<Real, 3>;
 template <class Real> using Curve = std::function<Vec2<Real>(Real)>;
 template <class Real> using Mount = std::function<Vec3<Real>(Real, Real, Real)>;
 
-// Collar gnomonically projected onto a radius-R sphere at the north pole; shaft along -z.
-template <class Real> Mount<Real> SphereMount(Real R) {
-  return [R](Real X, Real Y, Real depth) {
-    const Real s = R / sqrt<Real>(X * X + Y * Y + R * R);
-    return Vec3<Real>{X * s, Y * s, R * s - depth};
-  };
-}
 // Forward decl (FacePoint is defined further down); PatchMount places a collar/disk tangent (X,Y) in
 // [-S,S]^2 onto the cubed-sphere patch centred at gnomonic (a_c,b_c) of `face` -- so ANY cube patch can
-// host the collarfill pattern (used by BuildAllCollarFillSphere). depth pushes inward along the radial.
+// host the collarfill pattern. depth pushes inward along the radial.
 template <class Real> void FacePoint(Real& x, Real& y, Real& z, Integer face, Real a, Real b, Real R);
 template <class Real> Mount<Real> PatchMount(Integer face, Real a_c, Real b_c, Real R) {
   return [=](Real X, Real Y, Real depth) {
@@ -214,12 +205,24 @@ template <class Real> Integer collar_Nc(Real R_foot, Real S, Integer Naz) {
   const double pi = (double)const_pi<Real>();
   return std::max<Integer>(1, (Integer)std::ceil(std::log((double)(std::sqrt((Real)2) * S / R_foot)) / std::log(1.0 + 2 * pi / Naz)));
 }
+
+// PATCH-RELATIVE cilium sizing (single source of truth). A cilium is made self-similar to its patch by
+// tying the shaft radius to the patch half-width S: R_shaft = frac*S (frac 0.25 => the thin cilium, a
+// slender collar with ~2 rings at Naz=8, INDEPENDENT of patch count). r_fil and the (sphere) shaft depth
+// H_shaft scale with R_shaft so the finger keeps constant aspect at any density. Carpet H_reach is
+// box-driven and NOT set here. Drivers pass a positive absolute R_shaft to override.
+template <class Real> struct CiliumScale { Real R_shaft, r_fil, H_shaft; };
+template <class Real> CiliumScale<Real> cilium_scale_from_patch(Real S, Real frac = (Real)0.25,
+                                                                Real rfil_k = (Real)0.1, Real hshaft_k = (Real)3) {
+  const Real Rs = frac * S;
+  return CiliumScale<Real>{Rs, rfil_k * Rs, hshaft_k * Rs};
+}
 // ---- NEW on-sphere exact-circle collar (2026-07-24) ----------------------------------------------
 // The legacy collar (collar_point above) builds the annulus in TANGENT-plane 2D coords and applies the
 // gnomonic `mnt(X,Y,0)` once, so an inner circle of radius R_foot becomes a world ELLIPSE off-axis (the
 // ~3e-6 foot-seam floor). The new scheme defines the inner foot ring DIRECTLY in world space as an exact
 // small circle about the patch axis u, keeps the outer square edge unchanged (node-conforming), and keeps
-// the whole collar on the sphere. See stud_sphere_geom_legacy.hpp for the frozen original.
+// the whole collar on the sphere. (The legacy pre-overhaul collar variants have been removed.)
 template <class Real> using Curve3 = std::function<Vec3<Real>(Real)>;
 // World-space transfinite (Coons) blend of four boundary curves (component-wise).
 template <class Real> Vec3<Real> coons3(const Curve3<Real>& Eb, const Curve3<Real>& Et, const Curve3<Real>& El, const Curve3<Real>& Er, Real xi, Real eta) {
@@ -245,7 +248,7 @@ template <class Real> void add_collar_block3(Vector<Real>& X, Integer order, Rea
 }
 // Invert mnt(X,Y,0) = W for the tangent coords (X,Y). Gauss-Newton from (0,0); the target is the tiny foot
 // circle near the patch centre so the mount is near-linear there and this converges in a few steps. Works
-// for any smooth mount (SphereMount pole or off-axis PatchMount) -- no face/(a_c,b_c) plumbing needed.
+// for any smooth mount (PatchMount cube-face or a caller-supplied flat frame) -- no face/(a_c,b_c) plumbing needed.
 template <class Real> Vec2<Real> mnt_inverse(const Mount<Real>& mnt, const Vec3<Real>& W) {
   const Real h = (Real)1e-5;
   Real x = 0, y = 0;
@@ -281,8 +284,133 @@ template <class Real> Vec2<Real> collar_point_2d(const Mount<Real>& mnt, Real R0
   const Real la = (rho_out > rho_in) ? (r - rho_in) / (rho_out - rho_in) : t;
   return Vec2<Real>{(1 - la) * I[0] + la * O[0], (1 - la) * I[1] + la * O[1]};
 }
+
+// ================= Regular partition-of-unity collar map (2026-07-26) =============================
+// Overhauls the off-axis MOUNTING of the collar annulus. Instead of the pure gnomonic 2D-blend-then-mount
+// (whose off-axis interior skews near the foot), the collar map is a REGULAR (radial-only) partition-of-
+// unity blend, on the sphere, of two constructions (see collar_world):
+//   * ISOTROPIC interior -- an EXACT concentric circle about the patch axis u (uniform angle, graded
+//     radius). Keeps the near-foot region circular with no gnomonic skew ("interior isotropic").
+//   * ANISOTROPIC exterior -- the gnomonic conforming map whose outer ring is the node-conforming square
+//     edge ("exterior anisotropic, conforming").
+// Blend weight = a plain radial smootherstep (NOT corner-aware -- a corner-aware variant and an iterative
+// Winslow/metric-Laplacian smoother were prototyped and dropped: on this thin graded annulus the iterative
+// smoother near-folded the inner rings and blew up the near-singular BIE quadrature; the analytic blend is
+// C-infinity, watertight, and fold-free by construction). (The frozen pre-overhaul 2D-preimage collar,
+// the QJ_COLLAR_ENABLE=0 A/B baseline, has been removed.)
+//
+// Watertightness: emission is via add_collar_block3/coons3 whose four edge curves are slices of the ONE
+// deterministic map collar_world(t,s) (plus EXACT analytic inner/outer boundary rings). Adjacent elements
+// evaluate that same map at identical shared-boundary (t,s), so shared 3D edges are bit-identical ->
+// watertight exactly (the GL nodes are OPEN, so watertightness is a shared-EDGE-CURVE property, not a
+// shared-node one).
+
+// Config (settable via env; mirrors the fillet_pou_kind() static-accessor pattern). Only `enable` remains:
+// 1 (default) = regular PoU collar; 0 = the legacy 2D-preimage collar (the A/B baseline).
+struct CollarPouCfg { int enable = 1; };
+inline CollarPouCfg& collar_pou_cfg() {
+  static CollarPouCfg c = [] { CollarPouCfg d;
+    if (const char* e = std::getenv("QJ_COLLAR_ENABLE")) d.enable = atoi(e);
+    return d; }();
+  return c;
+}
+// degree-5 smootherstep (C2 at both ends, order-exact for order>=6); S5(0)=0, S5(1)=1.
+template <class Real> Real collar_s5(Real x) {
+  if (x <= (Real)0) return (Real)0;
+  if (x >= (Real)1) return (Real)1;
+  return x*x*x*((Real)6*x*x - (Real)15*x + (Real)10);
+}
+
+// Collar field = just the (u,e1,e2) frame + sphere radius + collar params. The collar map is now an
+// ANALYTIC regular partition-of-unity blend (no grid, no iterative solve) -- see collar_world.
+template <class Real> struct CollarField {
+  Real u[3], e1[3], e2[3], Rsph, R0, a0, grade, S;
+  Mount<Real> mnt;                                            // gnomonic mount (for the anisotropic conforming part)
+  Integer Naz, Nc, order;
+};
+// REGULAR (non-corner-aware) partition-of-unity collar map, analytic and on the sphere. t in [0,1] radial
+// (0 inner foot circle, 1 outer square seam), s in [0,1) global azimuth. Blends, with a plain radial
+// smootherstep weight phi(t):
+//   * P_iso  -- ISOTROPIC interior: an EXACT concentric circle about the patch axis u at uniform angle and
+//     graded perpendicular radius. This keeps the near-foot region circular with NO gnomonic skew (the
+//     source of the off-axis foot error) -- "interior isotropic, circle stays circular".
+//   * P_ani  -- ANISOTROPIC exterior: the gnomonic conforming map (collar_point_2d then mnt), whose outer
+//     ring is the node-conforming square edge -- "exterior anisotropic, conforming".
+// phi(0)=0 => pure isotropic circle at the foot; phi(1)=1 => pure conforming square at the seam; C-infinity
+// and watertight/fold-free by construction (a convex blend of two smooth on-sphere maps, then projected).
+// enable=0 returns P_ani alone = the legacy 2D-preimage collar (the A/B baseline).
+template <class Real> Vec3<Real> collar_world(const CollarField<Real>& F, Real t, Real s) {
+  const Real pi = const_pi<Real>();
+  s = s - std::floor((double)s);
+  Integer m = (Integer)std::floor((double)(s*F.Naz)); if (m >= F.Naz) m = F.Naz-1;
+  Real phi_s = s*F.Naz - m; if (phi_s < 0) phi_s = 0; if (phi_s > 1) phi_s = 1;
+  const Real tha = pi/4 + m*2*pi/F.Naz, thb = tha + 2*pi/F.Naz;
+  // anisotropic conforming part (world)
+  const Vec2<Real> P2 = collar_point_2d<Real>(F.mnt, F.R0, F.a0, F.S, F.u, F.e1, F.e2, tha, thb, t, phi_s);
+  const Vec3<Real> P_ani = F.mnt(P2[0], P2[1], (Real)0);
+  auto proj = [&](Vec3<Real> W) { const Real nn = sqrt<Real>(W[0]*W[0]+W[1]*W[1]+W[2]*W[2]); return Vec3<Real>{F.Rsph*W[0]/nn, F.Rsph*W[1]/nn, F.Rsph*W[2]/nn}; };
+  if (!collar_pou_cfg().enable) return proj(P_ani);           // baseline
+  // isotropic interior part: exact concentric circle, uniform angle, geometric radius R0 -> S
+  const Real th = pi/4 + 2*pi*s;
+  const Real Rref = std::max<Real>(F.S, F.R0*(Real)1.0001);
+  Real rho = F.R0 * pow<Real>(Rref/F.R0, t); rho = std::min<Real>(rho, (Real)0.999*F.Rsph);
+  const Real aiso = sqrt<Real>(std::max<Real>(F.Rsph*F.Rsph - rho*rho, (Real)0));
+  const Vec3<Real> P_iso{aiso*F.u[0] + rho*(cos<Real>(th)*F.e1[0] + sin<Real>(th)*F.e2[0]),
+                         aiso*F.u[1] + rho*(cos<Real>(th)*F.e1[1] + sin<Real>(th)*F.e2[1]),
+                         aiso*F.u[2] + rho*(cos<Real>(th)*F.e1[2] + sin<Real>(th)*F.e2[2])};
+  const Real w = collar_s5<Real>(t);                          // regular radial PoU weight
+  return proj(Vec3<Real>{(1-w)*P_iso[0]+w*P_ani[0], (1-w)*P_iso[1]+w*P_ani[1], (1-w)*P_iso[2]+w*P_ani[2]});
+}
+// Build the collar field (frame + params). No iterative solve -- the map is analytic (collar_world).
+template <class Real> CollarField<Real> build_collar_field(const Mount<Real>& mnt, Real R_foot, Real S,
+    Integer Naz, Integer Nc, Integer order, Real grade) {
+  CollarField<Real> F;
+  Real P0[3]; mount_local_frame<Real>(mnt, P0, F.u, F.e1, F.e2);
+  F.Rsph = sqrt<Real>(P0[0]*P0[0]+P0[1]*P0[1]+P0[2]*P0[2]); F.R0 = R_foot; F.a0 = sqrt<Real>(F.Rsph*F.Rsph - F.R0*F.R0);
+  F.Naz = Naz; F.Nc = Nc; F.order = order; F.grade = grade; F.S = S; F.mnt = mnt;
+  return F;
+}
+// Emit sector m's Nc collar rings from the smoothed field, via add_collar_block3 (world Coons + project).
+// Same edge layout / winding as the legacy add_collar_sector (u-slow=azimuth, v-fast=radial), so the
+// existing collar+disk group-orientation flip in the builders applies unchanged.
+//
+// The two FIXED boundary rings are emitted from EXACT analytic curves (NOT the Catmull-Rom interpolant),
+// so the cross-patch outer seam and the collar<->disk inner seam stay watertight to machine precision:
+//   * inner (ir=0, t=0): the exact small circle a0*u + R0*(cos e1 + sin e2)  -> matches the disk fill.
+//   * outer (ir=Nc-1, t=1): mnt(linear-along-square-edge) -> node-conforming with the neighbour patch,
+//     byte-identical to the legacy construction.
+// All interior ring boundaries + the sector-boundary radial edges come from collar_world (their shared
+// copies are bit-identical between neighbours because it is one deterministic map; the interpolation error
+// there is internal to the collar and cancels).
+template <class Real> void emit_collar_sector(Vector<Real>& X, Integer order, const CollarField<Real>& F, Integer m) {
+  const Real pi = const_pi<Real>();
+  const Integer Nc = F.Nc; const Real grade = F.grade, s0 = (Real)m/F.Naz, s1 = (Real)(m+1)/F.Naz;
+  auto W = [&](Real t, Real s) { return collar_world<Real>(F, t, s); };
+  auto inner_exact = [&](Real s) {                            // exact small circle on the sphere
+    const Real th = pi/4 + 2*pi*s;
+    return Vec3<Real>{F.a0*F.u[0] + F.R0*(cos<Real>(th)*F.e1[0] + sin<Real>(th)*F.e2[0]),
+                      F.a0*F.u[1] + F.R0*(cos<Real>(th)*F.e1[1] + sin<Real>(th)*F.e2[1]),
+                      F.a0*F.u[2] + F.R0*(cos<Real>(th)*F.e1[2] + sin<Real>(th)*F.e2[2])}; };
+  auto outer_exact = [&](Real s) {                            // exact linear-along-square-edge, node-conforming
+    Integer mm = (Integer)std::floor((double)(s*F.Naz)); if (mm >= F.Naz) mm = F.Naz-1;
+    Real phi = s*F.Naz - mm; if (phi < 0) phi = 0; if (phi > 1) phi = 1;
+    const Real tha = pi/4 + mm*2*pi/F.Naz, thb = tha + 2*pi/F.Naz;
+    auto sq = [&](Real th) { const Real c = cos<Real>(th), s2 = sin<Real>(th), mx = std::max(std::fabs(c), std::fabs(s2)); return Vec2<Real>{F.S*c/mx, F.S*s2/mx}; };
+    const Vec2<Real> A = sq(tha), B = sq(thb); const Vec2<Real> O{(1-phi)*A[0]+phi*B[0], (1-phi)*A[1]+phi*B[1]};
+    return F.mnt(O[0], O[1], (Real)0); };
+  for (Integer ir = 0; ir < Nc; ir++) {
+    const Real t0 = pow<Real>((Real)ir/Nc, grade), t1 = pow<Real>((Real)(ir+1)/Nc, grade);  // geometric radial grading
+    const bool inner = (ir == 0), outer = (ir == Nc-1);
+    auto Eb = [=](Real eta) { const Real s = s0 + eta*(s1-s0); return inner ? inner_exact(s) : W(t0, s); };
+    auto Et = [=](Real eta) { const Real s = s0 + eta*(s1-s0); return outer ? outer_exact(s) : W(t1, s); };
+    auto El = [=](Real xi)  { return W(t0 + xi*(t1-t0), s0); };
+    auto Er = [=](Real xi)  { return W(t0 + xi*(t1-t0), s1); };
+    add_collar_block3<Real>(X, order, F.Rsph, Eb, Et, El, Er);
+  }
+}
+
 // Emit the Nc collar rings for azimuthal sector m via the new on-sphere map. The (u,e1,e2) frame + sphere
-// radius are derived from `mnt` (works for SphereMount pole AND any off-axis PatchMount). ksub subdivides
+// radius are derived from `mnt` (works for any PatchMount cube-face or caller-supplied frame). ksub subdivides
 // each ring AND the sector for the collar-resolution diagnostics.
 template <class Real> void add_collar_sector(Vector<Real>& X, Integer order, const Mount<Real>& mnt, Real R_foot, Real S, Integer Naz, Integer Nc, Integer m, Real grade_exp = 1, Integer ksub = 1) {
   const Real pi = const_pi<Real>();
@@ -365,6 +493,22 @@ template <class Real> void add_cap_butterfly(Vector<Real>& X, Integer order, con
       }
   }
 }
+// Butterfly-dome cap at an ARBITRARY tip: a hemisphere of radius rho_tip whose EQUATOR is the circle of
+// radius rho_tip perpendicular to the travel tangent Ttip, centered at the tip point Ctip, in the frame
+// (w1,w2); the pole bulges to Ctip + rho_tip*Ttip. Generalizes the axis-aligned mnt_cap in add_cilium_stud
+// (recovered by Ctip=aCap*u, Ttip=-u, (w1,w2)=(e1,e2)). The H_ref offset cancels because the butterfly's
+// depth enters only as (depth - H_ref) = rho*cos(psi). Used to cap the end of a curved (flagella) slender
+// shaft; the equator conforms to the slender's tip ring (separate lists -> geometric coincidence suffices).
+template <class Real> void add_tip_cap_butterfly(Vector<Real>& X, Integer order,
+    const Real Ctip[3], const Real Ttip[3], const Real w1[3], const Real w2[3],
+    Real rho_tip, Integer Naz, Real core_frac = (Real)0.40) {
+  const Real Cx=Ctip[0],Cy=Ctip[1],Cz=Ctip[2], t0=Ttip[0],t1=Ttip[1],t2=Ttip[2];
+  const Real a0=w1[0],a1=w1[1],a2=w1[2], b0=w2[0],b1=w2[1],b2=w2[2], HR=rho_tip;  // H_ref cancels
+  Mount<Real> mnt_cap = [=](Real Xc, Real Yc, Real dep) {
+    const Real g = dep - HR;   // bulge along Ttip: equator (dep=HR) -> 0, pole (dep=HR+rho_tip) -> rho_tip
+    return Vec3<Real>{ Cx + Xc*a0 + Yc*b0 + g*t0, Cy + Xc*a1 + Yc*b1 + g*t1, Cz + Xc*a2 + Yc*b2 + g*t2 }; };
+  add_cap_butterfly<Real>(X, order, mnt_cap, rho_tip, /*H_shaft=*/HR, Naz, core_frac);
+}
 // Flat disk of radius R_disk placed ON the sphere by `mnt` (depth 0), as a 5-block BUTTERFLY / O-grid
 // (central square core [-h,h]^2 + 4 arc-transition caps) => near-square cells, no squircle center
 // distortion. Its outer edge is the exact R_disk circle so it is watertight with the collar's inner
@@ -389,7 +533,7 @@ template <class Real> void add_disk_fill(Vector<Real>& X, Integer order, const M
     for (Integer jc = 0; jc < nc; jc++) {
       const Real x0 = -h + 2*h*ic/nc, x1 = -h + 2*h*(ic+1)/nc, y0 = -h + 2*h*jc/nc, y1 = -h + 2*h*(jc+1)/nc;
       // u=y (slow), v=x => core normal dX/dy x dX/dx = -z, MATCHING the collar's default (-z inward)
-      // and the caps below, so the single group-flip in BuildSphereWithCollarFill makes all outward.
+      // and the caps below, so a single group-flip by the caller makes all outward.
       for (Integer i = 0; i < order; i++) { const Real yy = y0 + nds[i]*(y1-y0);
         for (Integer j = 0; j < order; j++) { const Real xx = x0 + nds[j]*(x1-x0);
           const Vec3<Real> w = place(xx, yy); X.PushBack(w[0]); X.PushBack(w[1]); X.PushBack(w[2]); } }
@@ -440,7 +584,7 @@ template <class Real> Real fillet_pou_weight(Real tau) {
 
 template <class Real> void add_cilium_stud(Vector<Real>& Xout, Integer order, const Mount<Real>& mnt, Real R_shaft, Real H_shaft, Real r_fil, Real S, Integer Naz, bool flip,
                                            Integer Ns_in = -1, Integer Nf_in = -1, Integer Nc_in = -1, Integer Ncap_in = -1, Real grade_exp = 1, bool with_shaft = true, bool circularize = false, Real core_frac = (Real)0.40, Integer cap_Naz = -1,
-                                           Real trans_depth = 0, Integer Ns_trans = 3, Real cap_rho = -1, Real cap_a = 0) {
+                                           Real trans_depth = 0, Integer Ns_trans = 3, Real cap_rho = -1, Real cap_a = 0, bool with_cap = true) {
   const Real pi = const_pi<Real>(), R_foot = R_shaft + r_fil;
   SCTL_ASSERT(R_foot < S && H_shaft > r_fil && Naz >= 4 && Naz % 4 == 0);
   const Real az = 2 * pi * R_shaft / Naz;
@@ -493,19 +637,22 @@ template <class Real> void add_cilium_stud(Vector<Real>& Xout, Integer order, co
   auto rFil  = [=](Real t) { return Cr + rho_arc * cos<Real>(angF(t)); };  // R0(t=1) -> R_shaft(t=0)
   auto sFil  = [=](Real t) { return Cs + rho_arc * sin<Real>(angF(t)); };  // a0(t=1) -> Cs(t=0)
   const Real a_shaft_top = Cs;                                             // fillet-bottom / shaft-top station
+  // Whole-collar corner-aware PoU + Winslow smoother, built ONCE (periodic azimuthally). Its fixed inner
+  // ring == the fillet top (a0*u + R_foot*circle), so the fillet<->collar seam is unchanged/watertight.
+  const CollarField<Real> CF = build_collar_field<Real>(mnt, R_foot, S, Naz, Nc, order, grade_exp);
   for (Integer m = 0; m < Naz; m++) {
     const Real tha = pi / 4 + m * 2 * pi / Naz, thb = tha + 2 * pi / Naz;
-    if (with_shaft) {  // the hybrid base (BuildCiliumStuddedSphereBase) omits the shaft -> a CSBQ SlenderElemList replaces it
+    if (with_shaft) {  // a hybrid base omits the shaft -> a CSBQ SlenderElemList replaces it
       auto rShaft = [=](Real) { return R_shaft; };
       auto sShaft = [=](Real t) { return aCap + t * (a_shaft_top - aCap); };  // cap station(t=0) -> fillet-bottom(t=1)
       for (Integer l = 0; l < Ns; l++) rev_frame(rShaft, sShaft, (Real)l / Ns, (Real)(l + 1) / Ns, tha, thb);
     }
     for (Integer l = 0; l < Nf; l++) rev_frame(rFil, sFil, (Real)l / Nf, (Real)(l + 1) / Nf, tha, thb);   // tangent fillet revolution
-    add_collar_sector<Real>(X, order, mnt, R_foot, S, Naz, Nc, m, grade_exp); // on-sphere exact-circle collar (inner ring == fillet top)
+    emit_collar_sector<Real>(X, order, CF, m);                             // corner-aware PoU+Winslow collar (inner ring == fillet top)
   }
-  add_cap_butterfly<Real>(X, order, mnt_cap, rhoCap, H_shaft, (cap_Naz > 0 ? cap_Naz : Naz), core_frac); // dome anchored to the exact cap ring
+  if (with_cap) add_cap_butterfly<Real>(X, order, mnt_cap, rhoCap, H_shaft, (cap_Naz > 0 ? cap_Naz : Naz), core_frac); // dome anchored to the exact cap ring
   const Integer cNaz = (cap_Naz > 0 ? cap_Naz : Naz);
-  const Integer cap_pan = 5 * (cNaz/4) * (cNaz/4);                  // butterfly: core (cNaz/4)^2 + 4 caps (cNaz/4)^2
+  const Integer cap_pan = with_cap ? 5 * (cNaz/4) * (cNaz/4) : 0;   // butterfly: core (cNaz/4)^2 + 4 caps (cNaz/4)^2 (0 if the cap is placed externally at a curved tip)
   const Integer Ns_rep = with_shaft ? Ns : 0;                       // shaft omitted for the hybrid base
   std::cout << "  stud panels: Naz=" << Naz << " cap_Naz=" << cNaz << " Ns=" << Ns_rep << " Nf=" << Nf << " Nc=" << Nc << " cap(butterfly)=" << cap_pan
             << " -> " << (Naz * (Ns_rep + Nf + Nc) + cap_pan) << "\n";
@@ -517,123 +664,6 @@ template <class Real> void add_cilium_stud(Vector<Real>& Xout, Integer order, co
           for (int c = 0; c < 3; c++) std::swap(X[(e * nn + i * order + j) * 3 + c], X[(e * nn + j * order + i) * 3 + c]);
   }
   for (Long i = 0; i < X.Dim(); i++) Xout.PushBack(X[i]);
-}
-
-// Does the stud (unflipped) have inward collar normals w.r.t. the sphere? If so we must
-// flip to match the cubed sphere's outward normals.
-template <class Real> bool stud_needs_flip(Integer order, Real R, Real S, Integer Naz, Real r_fil, Real R_shaft = 0.015) {
-  Vector<Real> Xs;
-  add_cilium_stud<Real>(Xs, order, SphereMount<Real>(R), R_shaft, (Real)0.05, r_fil, S, Naz, /*flip=*/false);
-  QuadElemList<Real> stud(order, Xs);
-  Vector<Real> X, Xn; stud.GetNodeCoord(&X, &Xn, nullptr);
-  Real acc = 0; Long n = 0;
-  for (Long i = 0; i < X.Dim() / 3; i++) {
-    const Real x = X[i*3], y = X[i*3+1], z = X[i*3+2], rr = std::sqrt(x*x + y*y + z*z);
-    if (rr > R - (Real)1e-6) { acc += (Xn[i*3]*x + Xn[i*3+1]*y + Xn[i*3+2]*z) / rr; n++; } // collar (on sphere)
-  }
-  return (n > 0 && acc < 0);
-}
-
-// Cubed sphere with the center patch of face 4 (north-pole face) replaced by a stud.
-template <class Real> QuadElemList<Real> BuildCiliumStuddedSphere(Integer order, Long PatchPerFace, Real R, Integer Naz, Real r_fil,
-                                                                 Integer Ns = -1, Integer Nf = -1, Integer Nc = -1, Integer Ncap = -1, Real grade_exp = 1, Real R_shaft = 0.015,
-                                                                 const Comm& comm = Comm::Self(), bool with_shaft = true, bool invert_normals = false, Real H_shaft = 0.05) {
-  SCTL_ASSERT_MSG(PatchPerFace % 2 == 1, "PatchPerFace must be odd so the replaced patch is centered on the pole");
-  const Real S = R / (Real)PatchPerFace; // stud collar half-width = center-patch half-extent
-  const bool flip = stud_needs_flip<Real>(order, R, S, Naz, r_fil, R_shaft);
-  if (!comm.Rank()) std::cout << "  stud normals " << (flip ? "FLIPPED" : "kept") << " to match sphere outward"
-                              << (invert_normals ? " (then whole surface INVERTED -> inward)" : "") << "\n";
-  Vector<Real> X;   // built identically on every rank; the ctor slices per `comm`
-  add_cubedsphere<Real>(X, order, PatchPerFace, R, /*skipFace=*/4, PatchPerFace / 2, PatchPerFace / 2);
-  add_cilium_stud<Real>(X, order, SphereMount<Real>(R), R_shaft, H_shaft, r_fil, S, Naz, flip, Ns, Nf, Nc, Ncap, grade_exp, with_shaft);
-  if (invert_normals) {  // transpose EVERY element (sphere + stud) -> flip all normals to point into the sphere,
-    const Long nn = (Long)order * order, ne = X.Dim() / (nn * 3);  // aligning with CSBQ's native radial-OUTWARD slender normal
-    for (Long e = 0; e < ne; e++)
-      for (Integer i = 0; i < order; i++)
-        for (Integer j = i + 1; j < order; j++)
-          for (int c = 0; c < 3; c++) std::swap(X[(e * nn + i * order + j) * 3 + c], X[(e * nn + j * order + i) * 3 + c]);
-  }
-  return QuadElemList<Real>(order, X, comm);
-}
-
-// Watertight sphere with ONE pole patch replaced by [collar annulus: circle R_foot -> square S] +
-// [inner disk fill: square -> circle R_foot], ALL on the sphere (NO finger, NO fillet, NO cap dome).
-// Uses the same shared collar map (add_collar_sector) and disk (add_disk_fill) as the studded finger,
-// so the whole surface is the exact radius-R sphere and the collar/disk mesh is exercised in isolation.
-template <class Real> QuadElemList<Real> BuildSphereWithCollarFill(Integer order, Long PatchPerFace, Real R, Integer Naz, Real r_fil, Real grade_exp, Real R_shaft, Integer Nc_in = -1, Integer Ndisk_in = -1, Real core_frac = (Real)0.40, const Comm& comm = Comm::Self()) {
-  SCTL_ASSERT_MSG(PatchPerFace % 2 == 1, "PatchPerFace must be odd so the replaced patch is centered on the pole");
-  const Real pi = const_pi<Real>(), R_foot = R_shaft + r_fil, S = R / (Real)PatchPerFace, az = 2*pi*R_shaft/Naz;
-  const Mount<Real> mnt = SphereMount<Real>(R);
-  const Integer Nc    = (Nc_in    >= 1) ? Nc_in    : collar_Nc<Real>(R_foot, S, Naz);
-  const Integer Ndisk = (Ndisk_in >= 1) ? Ndisk_in : std::max<Integer>(1, (Integer)std::llround((double)(R_foot/az)));
-
-  // Collar + disk built into their own buffer so we can orient them outward as a group.
-  Vector<Real> Xcd;
-  for (Integer m = 0; m < Naz; m++) add_collar_sector<Real>(Xcd, order, mnt, R_foot, S, Naz, Nc, m, grade_exp);
-  add_disk_fill<Real>(Xcd, order, mnt, R_foot, Ndisk, core_frac);
-
-  // Orient the collar+disk group OUTWARD (n.rhat > 0) to match the cubed sphere; transpose if inward.
-  // The orientation test runs on the FULL replicated buffer, so this temporary stays Comm::Self()
-  // (slicing it per rank would make ranks disagree on the flip).
-  { QuadElemList<Real> cd(order, Xcd); Vector<Real> Xc, Xnc; cd.GetNodeCoord(&Xc, &Xnc, nullptr);
-    Real acc = 0; for (Long i = 0; i < Xc.Dim()/3; i++) { const Real x=Xc[i*3],y=Xc[i*3+1],z=Xc[i*3+2],r=std::sqrt(x*x+y*y+z*z); acc += (Xnc[i*3]*x+Xnc[i*3+1]*y+Xnc[i*3+2]*z)/r; }
-    if (acc < 0) { const Long nn=(Long)order*order, ne=Xcd.Dim()/(nn*3);
-      for (Long e=0;e<ne;e++) for (Integer i=0;i<order;i++) for (Integer j=i+1;j<order;j++) for (int c=0;c<3;c++) std::swap(Xcd[(e*nn+i*order+j)*3+c], Xcd[(e*nn+j*order+i)*3+c]);
-      if (!comm.Rank()) std::cout << "  collar+disk normals FLIPPED to match sphere outward\n";
-    } else if (!comm.Rank()) std::cout << "  collar+disk normals kept\n";
-  }
-  if (!comm.Rank()) std::cout << "  collar+disk panels: Naz=" << Naz << " Nc=" << Nc << " (collar) + butterfly 5*" << Ndisk << "^2 (disk) -> " << (Naz*Nc + 5*Ndisk*Ndisk) << "\n";
-
-  Vector<Real> X;   // full mesh built on every rank; ctor keeps this rank's slice
-  add_cubedsphere<Real>(X, order, PatchPerFace, R, /*skipFace=*/4, PatchPerFace / 2, PatchPerFace / 2);
-  for (Long i = 0; i < Xcd.Dim(); i++) X.PushBack(Xcd[i]);
-  return QuadElemList<Real>(order, X, comm);
-}
-
-// Sphere tiled with the collarfill pattern in EVERY cubed-sphere patch (collar circle→square + butterfly
-// disk), instead of just one. All patch outer boundaries are the same square-edge map at the same Naz, so
-// every patch↔patch seam has matched node density (within a face exactly; across cube faces same-density,
-// like the plain cubed sphere). Tests whether the single-patch collarfill accuracy holds when the whole
-// surface is collar-tiled — and, at higher Naz, whether a uniformly finer outer rim (no longer a mismatch
-// against plain neighbours) recovers the floor.
-template <class Real> QuadElemList<Real> BuildAllCollarFillSphere(Integer order, Long PatchPerFace, Real R, Integer Naz, Real r_fil, Real grade_exp, Real R_shaft, Integer Nc_in = -1, Integer Ndisk_in = -1, Real core_frac = (Real)0.40, bool with_finger = false, bool circularize = false, const Comm& comm = Comm::Self()) {
-  const Real pi = const_pi<Real>(), R_foot = R_shaft + r_fil, S = R / (Real)PatchPerFace, az = 2*pi*R_shaft/Naz;
-  const Integer Nc    = (Nc_in    >= 1) ? Nc_in    : collar_Nc<Real>(R_foot, S, Naz);
-  const Integer Ndisk = (Ndisk_in >= 1) ? Ndisk_in : std::max<Integer>(1, (Integer)std::llround((double)(R_foot/az)));
-  const Long nn = (Long)order*order;
-  Vector<Real> Xall;
-  Long nflip = 0;
-  for (Integer face = 0; face < 6; face++)
-    for (Long iu = 0; iu < PatchPerFace; iu++)
-      for (Long iv = 0; iv < PatchPerFace; iv++) {
-        const Real a_c = 2*(iu + (Real)0.5)/PatchPerFace - 1, b_c = 2*(iv + (Real)0.5)/PatchPerFace - 1;
-        const Mount<Real> mnt = PatchMount<Real>(face, a_c, b_c, R);
-        // Optionally replace ONE patch (face-4 centre, like the studded sphere) with a full cilium finger.
-        // Its collar shares Naz with the surrounding all-collar patches, so the finger's outer seam is
-        // node-conforming against them (no 2:1 plain-neighbour mismatch).
-        // const bool is_finger = with_finger && face == 4 && iu == PatchPerFace/2 && iv == PatchPerFace/2;
-        const bool is_finger = with_finger;
-        Vector<Real> Xp;
-        if (is_finger) {
-          add_cilium_stud<Real>(Xp, order, mnt, R_shaft, (Real)0.05, r_fil, S, Naz, /*flip=*/false,
-                                /*Ns*/-1, /*Nf*/-1, /*Nc*/Nc, /*Ncap*/-1, grade_exp, /*with_shaft*/true, circularize, core_frac);
-        } else {
-          for (Integer m = 0; m < Naz; m++) add_collar_sector<Real>(Xp, order, mnt, R_foot, S, Naz, Nc, m, grade_exp);
-          add_disk_fill<Real>(Xp, order, mnt, R_foot, Ndisk, core_frac);
-        }
-        // Orient this patch's collar+disk group OUTWARD (n·rhat > 0); transpose (swap u<->v) if inward.
-        { QuadElemList<Real> pc(order, Xp); Vector<Real> Xc, Xnc; pc.GetNodeCoord(&Xc, &Xnc, nullptr);
-          Real acc = 0; for (Long i = 0; i < Xc.Dim()/3; i++) { const Real x=Xc[i*3],y=Xc[i*3+1],z=Xc[i*3+2],r=std::sqrt(x*x+y*y+z*z); acc += (Xnc[i*3]*x+Xnc[i*3+1]*y+Xnc[i*3+2]*z)/r; }
-          if (acc < 0) { const Long ne = Xp.Dim()/(nn*3); nflip++;
-            for (Long e=0;e<ne;e++) for (Integer i=0;i<order;i++) for (Integer j=i+1;j<order;j++) for (int c=0;c<3;c++) std::swap(Xp[(e*nn+i*order+j)*3+c], Xp[(e*nn+j*order+i)*3+c]); }
-        }
-        for (Long i = 0; i < Xp.Dim(); i++) Xall.PushBack(Xp[i]);
-      }
-  const Long npatch = 6*PatchPerFace*PatchPerFace, per = Naz*Nc + 5*Ndisk*Ndisk;
-  if (!comm.Rank()) std::cout << "  all-collarfill: " << npatch << " patches x (collar Naz=" << Naz << "*Nc=" << Nc << " + disk 5*" << Ndisk << "^2 = "
-            << per << ") -> " << (npatch*per) << " panels; " << nflip << " patch-groups flipped outward\n";
-  // Xall is built identically on every rank; the ctor keeps only this rank's element slice.
-  return QuadElemList<Real>(order, Xall, comm);
 }
 
 } // namespace quad_junctions

@@ -3,7 +3,7 @@
  * Flat-plane cilia carpet geometry (pure QuadElemList), for the doubly-periodic (XY) Stokes flow
  * driver src/cilia_carpet-bie.cpp.
  *
- * The cilium-stud machinery in stud_sphere_geom.hpp mounts collar+fingers on a cubed SPHERE: its
+ * The cilium-stud machinery in collar_mount_geom.hpp mounts collar+fingers on a cubed SPHERE: its
  * collar/disk/finger builders derive the local frame as u = P0/|P0| (sphere radial), project every
  * node onto Rsph = |P0|, and place the foot ring at station a0 = sqrt(Rsph^2 - R_foot^2). On a FLAT
  * plane there is no sagitta, so this header provides flat-native analogues:
@@ -11,12 +11,12 @@
  *   - foot ring at station 0 (in the plane), collar/disk purely in-plane (no Rsph projection),
  *   - shaft/fillet/cap as EXACT bodies of revolution about u, re-origined so station = z above the plane.
  *
- * Everything else is reused from stud_sphere_geom.hpp: the 2D collar map collar_point + add_collar_block
+ * Everything else is reused from collar_mount_geom.hpp: the 2D collar map collar_point + add_collar_block
  * (NOT the sphere-projecting collar_world / add_collar_block3 / emit_collar_sector family), collar_Nc,
  * the generalized-tip butterfly cap add_tip_cap_butterfly, coons/cline/carc, Vec2/Vec3/Mount, report_area.
  *
  * Canonical build: add_cilium_stud_flat builds one stud in a canonical "up" configuration (foot at z=0,
- * axis +z) -- exactly the sphere north-pole case (SphereMount has u = +z), so the shaft/fillet/collar/cap
+ * axis +z) -- exactly the sphere north-pole case (mount axis u = +z), so the shaft/fillet/collar/cap
  * sub-parts inherit the sphere code's verified mutual normal-orientation consistency. BuildCiliaCarpet
  * then PLACES each stud by pure translation (bottom plane) or z-reflection+translation (top plane); a
  * z-reflection reverses every element's normal uniformly, so a single group-flip still orients the whole
@@ -24,7 +24,7 @@
  * away from each other), matching the project's convention (DL constant-density identity = -1/2).
  */
 
-#include <quad_junctions/stud_sphere_geom.hpp>
+#include <quad_junctions/collar_mount_geom.hpp>
 
 namespace quad_junctions {
 using namespace sctl;
