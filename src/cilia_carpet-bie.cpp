@@ -10,7 +10,7 @@
  * targets, so periodic runs must exceed that (the banner prints node/target counts). Run with
  *   PVFMM_DIR=extern/pvfmm OMP_NUM_THREADS=8 ./bin/cilia_carpet-bie ...
  *
- *   ./bin/cilia_carpet-bie [Npatch order tol Naz bot_tip top_tip tilt_deg pdrop Nvis fingers fourier cheb n_axial]
+ *   ./bin/cilia_carpet-bie [Npatch order tol Naz bot_tip top_tip tilt_deg pdrop Nvis fingers fourier cheb n_axial z_plate]
  *
  * The cilium shaft radius is LOCKED to R_shaft = 0.25*S (S = L/(2*Npatch)); r_fil = 0.1*R_shaft. This
  * thin patch-relative shaft is scale-invariant in Npatch (same look / same volume fraction at every grid).
@@ -18,9 +18,11 @@
 #include <csbq.hpp>
 #include <stokes_bio.hpp>
 #include <quad_junctions/fmm_kernels.hpp>
+#include <quad_junctions/quad_scheme.hpp>     // QJDefaultScheme (Duffy default, SCTL_SELF_SCHEME=hybrid opt-out)
 #include <quad_junctions/plane_cilia_geom.hpp>
 #include <quad_junctions/plane_cilia_hybrid_geom.hpp>   // hybrid base (collar+fillet+cap, no shaft) + slender shafts
 #include <quad_junctions/periodic_flow_utils.hpp>
+#include <sctl/experimental/bench_quad.hpp>   // per-target near-setup breakdown (BENCH=1); no-op otherwise
 #include <chrono>
 #include <cstdlib>
 #include <iomanip>
@@ -103,7 +105,7 @@ void run_flow(const QuadElemList<Real>& base, const SlenderElemList<Real>& shaft
               const Real tol, const Real L,
               const Real pressure_drop, const Long Nvis, const bool fingers,
               const Real z_bottom, const Real z_top, const Real R_shaft,
-              const std::vector<CiliumCurveFlat<Real>>& curves) {
+              const std::vector<CiliumCurveFlat<Real>>& curves, const bool do_plot = true) {
   const Real SL_scal = 1.0, DL_scal = 1.0;
   const Real gmres_tol = std::max(tol, (Real)1e-8);
   const Long gmres_max_iter = 400;
@@ -156,30 +158,44 @@ void run_flow(const QuadElemList<Real>& base, const SlenderElemList<Real>& shaft
   //     LayerPotenSL.Setup() then LayerPotenDL.Setup(); each BoundaryIntegralOp::Setup prints child
   //     SetupSingular / SetupNear timers, so Profile::print shows two "Setup" blocks in order -- SL first,
   //     then DL -- each with its own SetupSingular / SetupNear (the four setup numbers).
-  // (3) The solve is repeated n_rep times with a FRESH (cleared) Krylov basis each time; each repeat is
+  // (3) The solve is repeated n_rep times; each repeat is
   //     Tic'd as cilia_carpet_gmres_solve<k> so Profile::print reports per-repeat t_avg/t_max/f-per-s, and
   //     we also print the wall-time average and the averaged per-ITERATION solve time (avg_solve / niter).
   Profile::Enable(true);
-  { Vector<Real> sigma_warm; KrylovPrecond<Real> kw;                       // warm-up: load matrices (not timed)
-    solver(&sigma_warm, BIO, rhs, (Real)1e-2, gmres_max_iter, false, nullptr, &kw); }
+  { Vector<Real> sigma_warm;                       // warm-up: load matrices (not timed)
+    solver(&sigma_warm, BIO, rhs, (Real)1e-2, gmres_max_iter); }
 
   Profile::reset(); Op.ClearSetup();
+#ifdef BENCH_QUAD
+  sctl::bench::Reset();                                                   // per-target near-setup counters (BENCH=1)
+  const auto t_setup0 = std::chrono::high_resolution_clock::now();
+#endif
   Profile::Tic("cilia_carpet_setup", &comm, true);
   Op.Setup();                                                             // SL then DL (see note above)
   Profile::Toc();
-  Profile::print(&comm, {"t_avg", "t_max"});                             // SetupSingular/SetupNear per SL,DL
+  Profile::print(&comm, {"t_avg", "t_max", "f_avg", "f_max"});                             // SetupSingular/SetupNear per SL,DL
+#ifdef BENCH_QUAD
+  const double setup_wall = std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - t_setup0).count();
+  // Sub-SetupNear breakdown (closest-point / subpanel-interp / cell-integrate) + angle-order attribution,
+  // summed over threads then SUM-reduced across ranks; the [nearbench] line is what parse_cilia_scaling.sh reads.
+  sctl::bench::ReportMPI(
+      [&](double* buf, int m) {
+        Vector<double> v(m); for (int i = 0; i < m; i++) v[i] = buf[i];
+        GlobalReduce(v, comm, CommOp::SUM);
+        for (int i = 0; i < m; i++) buf[i] = v[i];
+      },
+      !comm.Rank(), "cilia_near_setup", setup_wall);
+#endif
   Profile::reset();
 
-  // const Integer n_rep = 5;
   const Integer n_rep = 1;
   double t_solve_sum = 0;
   for (Integer rep = 0; rep < n_rep; rep++) {
-    KrylovPrecond<Real> krylov;                                          // cleared each repeat
     sigma.ReInit(0);
     const std::string lbl = "cilia_carpet_gmres_solve" + std::to_string(rep);
     const auto t0 = std::chrono::high_resolution_clock::now();
     Profile::Tic(lbl.c_str(), &comm, true);
-    solver(&sigma, BIO, rhs, gmres_tol, gmres_max_iter, false, &niter, &krylov);
+    solver(&sigma, BIO, rhs, gmres_tol, gmres_max_iter, false, &niter);
     Profile::Toc();
     t_solve_sum += std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - t0).count();
   }
@@ -187,7 +203,7 @@ void run_flow(const QuadElemList<Real>& base, const SlenderElemList<Real>& shaft
   const double t_solve_avg = GlobalReduce(t_solve_sum, comm, CommOp::MAX) / n_rep;   // max over ranks, per repeat
   if (!comm.Rank())
     std::cout << std::setprecision(6) << "  flow: GMRES converged in " << niter << " iters (" << n_rep
-              << " repeats, cleared Krylov each);  avg solve = " << t_solve_avg
+              << " repeats, );  avg solve = " << t_solve_avg
               << " s,  avg per-iter = " << (niter ? t_solve_avg / niter : 0) << " s\n";
 
   // ---- Dump the SOLVED density sigma onto BOTH element lists for inspection (per-rank layout matches
@@ -200,14 +216,17 @@ void run_flow(const QuadElemList<Real>& base, const SlenderElemList<Real>& shaft
     Vector<Real> sb(Nb*KD), ss(Ns*KD);
     for (Long i = 0; i < Nb*KD; i++) sb[i] = sigma[i];
     for (Long i = 0; i < Ns*KD; i++) ss[i] = sigma[Nb*KD + i];
-    base.WriteVTK("vis/CiliaCarpet_density_base", sb, comm);
-    shaft.WriteVTK("vis/CiliaCarpet_density_shaft", ss, comm);
+    if (do_plot) {
+      base.WriteVTK("vis/CiliaCarpet_density_base", sb, comm);
+      shaft.WriteVTK("vis/CiliaCarpet_density_shaft", ss, comm);
+    }
     // Per-rank density magnitude summary (base vs shaft) -- a huge shaft |sigma| vs base is another tell.
     Real bmax = 0, smax = 0;
     for (Long i = 0; i < Nb; i++) { Real m = std::sqrt(sb[i*KD]*sb[i*KD]+sb[i*KD+1]*sb[i*KD+1]+sb[i*KD+2]*sb[i*KD+2]); bmax = std::max(bmax, m); }
     for (Long i = 0; i < Ns; i++) { Real m = std::sqrt(ss[i*KD]*ss[i*KD]+ss[i*KD+1]*ss[i*KD+1]+ss[i*KD+2]*ss[i*KD+2]); smax = std::max(smax, m); }
     bmax = GlobalReduce((double)bmax, comm, CommOp::MAX); smax = GlobalReduce((double)smax, comm, CommOp::MAX);
-    if (!comm.Rank()) std::cout << std::setprecision(6) << "  wrote vis/CiliaCarpet_density_{base,shaft}.pvtu"
+    if (!comm.Rank()) std::cout << std::setprecision(6)
+                                << (do_plot ? "  wrote vis/CiliaCarpet_density_{base,shaft}.pvtu" : "  QJ_PLOT=0 -- skipped density VTK")
                                 << "  (max|sigma| base=" << bmax << " shaft=" << smax << ")\n";
   }
 
@@ -262,8 +281,9 @@ void run_flow(const QuadElemList<Real>& base, const SlenderElemList<Real>& shaft
   // returns EMPTY coords for N<2 (its N0<2 early-out), and an empty off-surface target set makes BIO fall
   // back to the on-surface apply -> U sized Nsurf*KDIM while bg_flow is dim 0 -> `U -= Ub` dim-mismatch abort.
   // So bail out here rather than feed the degenerate grid through eval_induced.
-  if (Nvis <= 1) {
-    if (!comm.Rank()) std::cout << "  flow: Nvis<=1, skipping the volume-vis slice (timing/scaling run)\n";
+  if (Nvis <= 1 || !do_plot) {
+    if (!comm.Rank()) std::cout << (do_plot ? "  flow: Nvis<=1, skipping the volume-vis slice (timing/scaling run)\n"
+                                            : "  flow: QJ_PLOT=0, skipping the volume-vis slice\n");
     return;
   }
   // Geometry-accurate finger mask: a target is inside solid iff it lies within ~R_shaft of some cilium's
@@ -341,7 +361,12 @@ int main(int argc, char** argv) {
   {
     Comm comm = Comm::World();
 
-    // CLI: [Npatch order tol Naz bot_tip top_tip tilt_deg pdrop Nvis fingers fourier cheb n_axial]
+    // Plotting master switch: QJ_PLOT=0 disables ALL VTK output (geometry, shaft, solved density, and the
+    // volume-flow slice) so scaling/timing runs pay no VTK I/O. Default ON (unset or !=0). The volume slice
+    // is ALSO skipped by Nvis<=1 (independent knob); QJ_PLOT=0 additionally drops the geom+density dumps.
+    const bool do_plot = !std::getenv("QJ_PLOT") || std::atoi(std::getenv("QJ_PLOT")) != 0;
+
+    // CLI: [Npatch order tol Naz bot_tip top_tip tilt_deg pdrop Nvis fingers fourier cheb n_axial z_plate]
     // The slender-shaft carpet: cilia REACH the midplane z=0.5 (both planes), tilted +-x, with a random
     // per-cilium sine wiggle + collision resolution (env QJ_CILIA_SEED sets the RNG seed).
     const Integer Npatch   = (argc > 1)  ? std::atoi(argv[1])  : 4;   // >=3 required (see guard below)
@@ -355,26 +380,44 @@ int main(int argc, char** argv) {
     // PATCH-RELATIVE shaft (LOCKED): R_shaft = 0.25*S (S = L/(2*Npatch)) -- the thin cilium; r_fil = 0.1*R_shaft.
     // Scale-invariant: the shaft radius tracks the patch pitch, so the carpet looks the same at every Npatch and
     // its solid volume fraction is Npatch-independent. H_reach stays box-driven (bot_tip/top_tip). See
-    // cilium_scale_from_patch() in stud_sphere_geom.hpp.
+    // cilium_scale_from_patch() in collar_mount_geom.hpp.
     const Real    L_box    = 1.0, S_patch = L_box / (Real)(2 * Npatch);
     const Real    R_shaft  = (Real)0.25 * S_patch;
     const Real    r_fil    = (Real)0.1 * R_shaft;
     const Real    bot_tip  = (argc > 5)  ? std::atof(argv[5])  : 0.50;  // bottom cilia reach the midplane z=0.5
     const Real    top_tip  = (argc > 6)  ? std::atof(argv[6])  : 0.50;  // top cilia reach the midplane z=0.5
-    const Real    tilt_deg = (argc > 7)  ? std::atof(argv[7])  : 10.0;  // nominal tilt (reduced per-column to fit the box).
-                                                                        // 10deg is the largest non-overlapping tilt at the dense
-                                                                        // 8x8 pitch (lateral swing < pitch); larger tilts overlap
-                                                                        // same-plane neighbours. Eases as Npatch drops (wider pitch).
+    const Real    tilt_deg = (argc > 7)  ? std::atof(argv[7])  : 10.0;  // REFERENCE tilt at Npatch=NPATCH_REF (see tilt_rad
+                                                                        // below): 10deg is the largest non-overlapping tilt at
+                                                                        // the 8x8 pitch. Auto-scaled to the actual Npatch so the
+                                                                        // geometry stays scale-invariant (thins with density).
     const Real    pdrop    = (argc > 8)  ? std::atof(argv[8])  : -1.0;
     const Long    Nvis     = (argc > 9)  ? std::atol(argv[9])  : 60;
     const bool    fingers  = (argc > 10) ? (std::atoi(argv[10]) != 0) : true;  // volume-vis finger mask toggle
     const Long    fourier  = (argc > 11) ? std::atol(argv[11]) : 36;    // slender azimuthal Fourier order
     const Long    cheb     = (argc > 12) ? std::atol(argv[12]) : 10;    // slender Chebyshev order (CSBQ tables)
     const Integer n_axial_in = (argc > 13) ? std::atoi(argv[13]) : -1;  // slender axial panels/fiber (-1 = auto)
+    // Bottom-plate z offset (symmetric about the midplane z=0.5): z_bottom=z_plate, z_top=L-z_plate. Default
+    // 0.01 reproduces the old fixed 0.01/0.99 plates. Shrinking z_plate->0.5 brings the two plates together;
+    // the weak-scaling script scales it (with bot_tip/top_tip) as 1/Npatch so the slender-rod aspect ratio
+    // (length/R_shaft) and the tip-gap/R_shaft ratio stay fixed as the carpet densifies (R_shaft ~ 1/Npatch).
+    const Real    z_plate  = (argc > 14) ? std::atof(argv[14]) : 0.01;
+    SCTL_ASSERT_MSG(z_plate > 0 && z_plate < 0.5, "z_plate must be in (0, 0.5)");
 
-    const Real L = L_box, z_bottom = 0.01, z_top = 0.99, S = S_patch;
+    const Real L = L_box, z_bottom = z_plate, z_top = L_box - z_plate, S = S_patch;
     const Real core_frac = 0.40, grade_exp = 1.0;
-    const Real tilt_rad = tilt_deg * const_pi<Real>() / 180;
+    // Tilt is SCALE-INVARIANT in Npatch. The lateral tip swing is reach*tan(tilt) (reach is fixed --
+    // cilia reach the midplane z=0.5 at every grid), while the neighbour pitch is 2S = L/Npatch. Holding
+    // swing/pitch constant -- so the same-plane clearance margin does NOT shrink as the carpet densifies --
+    // requires tan(tilt) proportional to 1/Npatch. The CLI arg is therefore the tilt AT Npatch=NPATCH_REF,
+    // and the effective tilt is tan(tilt_eff) = tan(tilt_ref)*NPATCH_REF/Npatch. This is exact at 8x8
+    // (arg 10 -> 10deg, backward-compatible) and auto-thins with density (16x16 -> 5.04deg, inside the
+    // verified non-overlapping window [5,6.5]deg). QJ_TILT_SCALE=0 uses the CLI tilt verbatim (opt-out).
+    const Integer NPATCH_REF = 8;
+    const bool tilt_scale = !std::getenv("QJ_TILT_SCALE") || std::atoi(std::getenv("QJ_TILT_SCALE")) != 0;
+    const Real tilt_rad = tilt_scale
+        ? std::atan(std::tan(tilt_deg * const_pi<Real>() / 180) * (Real)NPATCH_REF / (Real)Npatch)
+        : tilt_deg * const_pi<Real>() / 180;
+    const Real tilt_deg_eff = tilt_rad * 180 / const_pi<Real>();
     // Straight base panels, then POU-transition panels. Each is n*az long with az = 2*pi*R_shaft/Naz.
     // Env-tunable QJ_N_STRAIGHT / QJ_N_TRANS (default 3).
     const Integer n_straight = std::getenv("QJ_N_STRAIGHT") ? std::atoi(std::getenv("QJ_N_STRAIGHT")) : 3;
@@ -388,13 +431,23 @@ int main(int argc, char** argv) {
     // edge) 0.1 can drive the outer column toward 0 deg tilt -- watch the geom report's tilt-cut/edge counts.
     const char* bb_env = std::getenv("QJ_BOX_BUFFER");
     const Real box_buffer = bb_env ? (Real)std::atof(bb_env) : (Real)0.1;
+    // Random per-cilium sine wiggle: ON by default (QJ_CILIA_WIGGLE unset or !=0). Set QJ_CILIA_WIGGLE=0 to
+    // disable -- every cilium reduces to the nominal tilted stud (used by the weak-scaling study to keep a
+    // strictly self-similar carpet; the 8x8 and strong-scaling scripts leave it ON).
+    const char* wig_env = std::getenv("QJ_CILIA_WIGGLE");
+    const bool cilia_wiggle = !wig_env || std::atoi(wig_env) != 0;
 
     // Shared curve set (ONE source of truth: base butterfly-cap placement + slender fibers -> conforming
-    // seams). generate_cilia_carpet applies per-column tilt reduction (box-fit, box_buffer), a random sine
-    // wiggle per cilium, and collision resolution (regenerate wiggle up to 3x, then shorten). Deterministic
-    // in `seed` (identical on every rank => consistent replicated base + partitioned shaft).
+    // seams). generate_cilia_carpet applies per-column tilt reduction (box-fit, box_buffer), an optional random
+    // sine wiggle per cilium (QJ_CILIA_WIGGLE), and collision resolution. Deterministic in `seed` (identical
+    // on every rank => consistent replicated base + partitioned shaft).
+    // Time the GEOMETRY build separately from the operator setup. generate_cilia_carpet's collision
+    // resolution is potentially O(cilia^2) and runs replicated on every rank, so it is a weak-not-strong
+    // suspect (grows with the global carpet, invisible to strong scaling) that Op.Setup()'s tree never sees.
+    Profile::Enable(true);
+    Profile::Tic("cilia_geometry_build", &comm, true);
     std::vector<CiliumCurveFlat<Real>> curves = generate_cilia_carpet<Real>(
-        Npatch, z_bottom, z_top, L, R_shaft, bot_tip, top_tip, r_fil, Naz, tilt_rad, n_straight, n_trans, seed, comm, box_buffer);
+        Npatch, z_bottom, z_top, L, R_shaft, bot_tip, top_tip, r_fil, Naz, tilt_rad, n_straight, n_trans, seed, comm, box_buffer, (Real)0.005, cilia_wiggle);
     // Default axial panels = the curve's own Ns (Naz-based az). Uniform-in-arc slender panels then land on
     // the tilt-transition POU window edges (M8 "windows align to panels"), and Ns scales as 1/R_shaft.
     const Integer n_axial = (n_axial_in >= 1) ? n_axial_in : curves[0].Ns;
@@ -405,7 +458,9 @@ int main(int argc, char** argv) {
       std::cout << "cilia-carpet HYBRID Npatch=" << Npatch << " (cilia=" << 2*Npatch*Npatch << ")"
                 << " order=" << order << " tol=" << tol << " (Nbeta=" << Nbeta << " max_depth=" << max_depth << ")"
                 << " Naz=" << Naz << " R_shaft=" << R_shaft
-                << " r_fil=" << r_fil << " tips(z)=" << bot_tip << "/" << top_tip << " tilt=" << tilt_deg << "deg\n"
+                << " r_fil=" << r_fil << " plates(z)=" << z_bottom << "/" << z_top << " tips(z)=" << bot_tip << "/" << top_tip
+                << " tilt=" << tilt_deg_eff << "deg" << (tilt_scale ? " (scaled from " : " (verbatim, ref ") << tilt_deg
+                << "deg@Npatch" << NPATCH_REF << ")\n"
                 << "  slender shaft: fourier=" << fourier << " cheb=" << cheb << " n_axial/fiber=" << n_axial
                 << " (Sarc=" << curves[0].Sarc << ")" << std::endl;
     }
@@ -417,17 +472,22 @@ int main(int argc, char** argv) {
     QuadElemList<Real> base = BuildCiliaCarpetHybridBase<Real>(order, curves, R_shaft, r_fil, Naz, S,
         core_frac, grade_exp, n_straight, n_trans, comm);
     SlenderElemList<Real> shaft = BuildCiliaCarpetHybridShafts<Real>(curves, n_axial, R_shaft, cheb, fourier, comm);
-    base.SetQuadScheme(QuadElemList<Real>::QuadScheme::Hybrid, 10, Nbeta, max_depth);
+    Profile::Toc();                                    // cilia_geometry_build
+    Profile::print(&comm, {"t_avg", "t_max"});         // standalone (run_flow resets Profile before its setup)
+    base.SetQuadScheme(quad_junctions::QJDefaultScheme<Real>(), 10, Nbeta, max_depth);
     report_area<Real>(base, comm);
-    base.WriteVTK("vis/CiliaCarpet_geom", Vector<Real>(), comm);
-    shaft.WriteVTK("vis/CiliaCarpet_shaft", Vector<Real>(), comm);
+    if (do_plot) {
+      base.WriteVTK("vis/CiliaCarpet_geom", Vector<Real>(), comm);
+      shaft.WriteVTK("vis/CiliaCarpet_shaft", Vector<Real>(), comm);
+    }
     {
       const Long nbp = GlobalReduce((Long)base.Size(),  comm, CommOp::SUM);
       const Long nsp = GlobalReduce((Long)shaft.Size(), comm, CommOp::SUM);
       Vector<Real> Xb, Xnb, Xs, Xns; base.GetNodeCoord(&Xb,&Xnb,nullptr); shaft.GetNodeCoord(&Xs,&Xns,nullptr);
       const Long nbn = GlobalReduce((Long)(Xb.Dim()/3), comm, CommOp::SUM), nsn = GlobalReduce((Long)(Xs.Dim()/3), comm, CommOp::SUM);
       if (!comm.Rank())
-        std::cout << "  wrote vis/CiliaCarpet_{geom(base),shaft}.pvtu/.vtu\n"
+        std::cout << (do_plot ? "  wrote vis/CiliaCarpet_{geom(base),shaft}.pvtu/.vtu\n"
+                              : "  QJ_PLOT=0 -- skipped geometry VTK\n")
                   << "  base panels=" << nbp << " (" << nbn << " nodes)   shaft slender-panels=" << nsp
                   << " (" << nsn << " nodes)   TOTAL nodes=" << (nbn+nsn) << "\n";
       Long pci=-1, pcj=-1; const Real gap = cilia_min_clearance<Real>(curves, pci, pcj);
@@ -441,7 +501,7 @@ int main(int argc, char** argv) {
     if (std::getenv("QJ_GEOM_ONLY") && std::atoi(std::getenv("QJ_GEOM_ONLY")) != 0) {
       if (!comm.Rank()) std::cout << "  QJ_GEOM_ONLY set -- geometry only, skipping the flow solve.\n";
     } else {
-      run_flow<Real>(base, shaft, comm, tol, L, pdrop, Nvis, fingers, z_bottom, z_top, R_shaft, curves);
+      run_flow<Real>(base, shaft, comm, tol, L, pdrop, Nvis, fingers, z_bottom, z_top, R_shaft, curves, do_plot);
     }
   }
   Comm::MPI_Finalize();
