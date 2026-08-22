@@ -3,7 +3,7 @@
  * QuadElemList junction+transitions+caps  +  CSBQ SlenderElemList arms, both in one
  * BoundaryIntegralOp, for the Laplace OR Stokes single-layer kernel. Sets the on-surface targets,
  * clears any setup, then TIMES a single cold Setup(); the SCTL profiler reports the SetupSingular
- * (self) and SetupNear phases. The setup speed compared against fmm3dbie is
+ * (self) and SetupNear phases. The setup throughput metric is
  *     Nnodes / t_avg(SetupSingular + SetupNear).
  *
  *   make bin/ybifurc-bie-selfsetup
@@ -53,9 +53,9 @@ void run_setup(const char* kername, Integer order, Integer nref, Real tol,
   BIOp.AddElemList(junc, "0_junc");
   BIOp.AddElemList(arms, "1_arms");
 
-  // ---- 2. set the targets = the on-surface discretization nodes (same as fmm3dbie's
-  //         targs = srcvals positions). This is the established on-surface pattern
-  //         (junction_precond.hpp): GetNodeCoord -> AddElemList -> SetTargetCoord. ----
+  // ---- 2. set the targets = the on-surface discretization nodes. This is the established
+  //         on-surface pattern (junction_precond.hpp):
+  //         GetNodeCoord -> AddElemList -> SetTargetCoord. ----
   Vector<Real> Xj, Xa;
   junc.GetNodeCoord(&Xj, nullptr, nullptr);
   arms.GetNodeCoord(&Xa, nullptr, nullptr);
@@ -68,9 +68,8 @@ void run_setup(const char* kername, Integer order, Integer nref, Real tol,
   const Long Nnodes = (Xj.Dim() + Xa.Dim()) / 3;   // junc order^2/elem + slender cheb*fourier/elem
 
   // ---- 3. clear any setup state, then TIME a single cold Setup() ----
-  // Setup() = SetupBasic + SetupFar + SetupSelf(=SetupSingular) + SetupNear. The fair
-  // apples-to-apples against fmm3dbie's getnearquad is SetupSingular + SetupNear (self + near);
-  // SetupFarField is the get_far_order analog and is excluded from that metric.
+  // Setup() = SetupBasic + SetupFar + SetupSelf(=SetupSingular) + SetupNear. The near/self
+  // setup metric is SetupSingular + SetupNear (self + near); SetupFarField is excluded from it.
   BIOp.ClearSetup();
   Profile::Enable(true);
   Profile::reset();

@@ -2,8 +2,8 @@
  * SETUP-TIME driver for the SCTL BIE solver on the TWISTED cubed sphere (pure QuadElemList),
  * for the Laplace OR Stokes single-layer kernel. Same measurement as src/ybifurc-bie-selfsetup.cpp:
  * set up the SL BoundaryIntegralOp, set the on-surface targets, clear any setup, then TIME a single
- * cold Setup(); the SCTL profiler reports the SetupSingular (self) and SetupNear phases. Setup speed
- * compared against fmm3dbie is
+ * cold Setup(); the SCTL profiler reports the SetupSingular (self) and SetupNear phases. The setup
+ * throughput metric is
  *     Nnodes / t_avg(SetupSingular + SetupNear).
  *
  *   make bin/twisted-sphere-selfsetup
@@ -49,8 +49,8 @@ void run_setup(const char* kername, Integer order, Long ppf, Real tol, Integer N
   BIOp.SetAccuracy(tol);
   BIOp.AddElemList(surf, "0_sphere");
 
-  // ---- 2. set the targets = the on-surface discretization nodes (same as fmm3dbie's
-  //         targs = srcvals positions; established on-surface pattern GetNodeCoord -> SetTargetCoord) ----
+  // ---- 2. set the targets = the on-surface discretization nodes (established on-surface
+  //         pattern GetNodeCoord -> SetTargetCoord) ----
   Vector<Real> Xs;
   surf.GetNodeCoord(&Xs, nullptr, nullptr);
   BIOp.SetTargetCoord(Xs);
@@ -69,9 +69,8 @@ void run_setup(const char* kername, Integer order, Long ppf, Real tol, Integer N
   BIOp.Setup();
   BIOp.ClearSetup();
 
-  // Setup() = SetupBasic + SetupFar + SetupSelf(=SetupSingular) + SetupNear. The fair apples-to-apples
-  // against fmm3dbie's getnearquad is SetupSingular + SetupNear (self + near); SetupFarField is the
-  // get_far_order analog and is excluded from that metric.
+  // Setup() = SetupBasic + SetupFar + SetupSelf(=SetupSingular) + SetupNear. The near/self setup
+  // metric is SetupSingular + SetupNear (self + near); SetupFarField is excluded from that metric.
   Profile::Enable(true);
   Profile::reset();
   BIOp.Setup();
