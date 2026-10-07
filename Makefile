@@ -152,7 +152,8 @@ TARGET_BIN = \
 	$(BINDIR)/ybifurc-bie-selfsetup \
 	$(BINDIR)/twisted-sphere-selfsetup \
 	$(BINDIR)/cilia_carpet-bie \
-	$(BINDIR)/cilia_bridge-bie
+	$(BINDIR)/cilia_bridge-bie \
+	$(BINDIR)/csbq-spectrum
 
 all: $(TARGET_BIN)
 
