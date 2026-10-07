@@ -19,6 +19,7 @@
 #include <quad_junctions/gen_network_geom.hpp>
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <iomanip>
 #include <iostream>
@@ -93,6 +94,16 @@ int main(int argc, char** argv) {
       << " leadP=" << leadP << " leadFrac=" << leadFrac << " cornerP=" << cornerP << " ===\n";
 
     NetworkGraph<Real> g = ReadNetworkGraph<Real>(graph_path);
+    // GLOBAL radius scale (QJ_RADIUS_SCALE, default 0.5 -- the half-shrink is now applied by default; set =1 to disable). Scales every node radius, which drives BOTH the
+    // junction body placement scale (scale=node.radius/meanR0, body+seams together) AND the arm mouth/tube
+    // radii (rA/rB = owner/neighbour seam R0). Node POSITIONS are untouched, so the centerline curvature
+    // radius rho is unchanged while every tube radius r scales -> rho/r rescales by 1/factor. A self-fold
+    // (rho<r) at factor 1 is cleared at factor 0.5 (rho/r doubles). The self-similar half-shrink of the
+    // whole network requested when the mid-arm radius dip alone floors out on the tightest bends.
+    const Real rad_scale = std::getenv("QJ_RADIUS_SCALE") ? (Real)std::atof(std::getenv("QJ_RADIUS_SCALE")) : (Real)0.5;
+    if ((double)rad_scale != 1.0) { for (auto& nd : g.nodes) nd.radius *= rad_scale;
+      if (!comm.Rank()) std::cout << "  [radscale] all node radii x" << (double)rad_scale
+                                  << " (junction bodies + arm radii shrink; positions fixed)\n"; }
     const Integer nnode = (Integer)g.nodes.size(), nedge = (Integer)g.edges.size(), nclu = (Integer)g.clusters.size();
     Integer njunc = 0, ncap = 0; for (auto& nd : g.nodes) (nd.is_junc ? njunc : ncap)++;
     if (!comm.Rank()) std::cout << "  graph: " << nnode << " nodes (" << njunc << " junc, " << ncap << " cap), "
@@ -120,7 +131,7 @@ int main(int argc, char** argv) {
       const Real sig_in = clu_sigma.count(c) ? clu_sigma[c] : (Real)-1;
       canon[c] = build_canonical<Real>(g.clusters[c], order, level, nref, etaj, NsTr, s_cap, Ncap, alphaD, clampf, sig_in);
       Real mR = 0; for (Real r : canon[c].R0) mR += r; mR /= std::max<size_t>(1, canon[c].R0.size());
-      if (!comm.Rank()) std::cout << "  cluster " << c << " (deg " << g.clusters[c].degree << ")  meanR0=" << std::setprecision(4) << mR << "\n";
+      if (getenv("QJ_CLUDIAG") && !comm.Rank()) std::cout << "  cluster " << c << " (deg " << g.clusters[c].degree << ")  meanR0=" << std::setprecision(4) << mR << "\n";
     }
 
     // ---- 2. place every junction: incident edges, arm<->edge match, world seams ----
@@ -138,6 +149,11 @@ int main(int argc, char** argv) {
     // MIN at LO. Tune/disable via env (QJ_SHRINK_MIN=1 disables); explicit per-junction QJ_SHRINK wins.
     const Real sh_on  = getenv("QJ_SHRINK_ONSET") ? (Real)atof(getenv("QJ_SHRINK_ONSET")) : (Real)0.13;
     const Real sh_lo  = getenv("QJ_SHRINK_LO")    ? (Real)atof(getenv("QJ_SHRINK_LO"))    : (Real)0.10;
+    // Default sh_min=0.5 => the auto ramp shrinks ONLY the FEW tightest-gap junctions (meanR0 in
+    // [sh_lo,sh_on] ~= 6 junctions on the vessels net) down to at most 0.5, leaving all the rest byte-
+    // identical -- exactly the "only a few need their arm holes rescaled" behaviour. QJ_SHRINK_MIN=1
+    // disables it entirely; explicit QJ_SHRINK="id:f,..." overrides per junction. Dropping it costs ~4x
+    // on the whole-network |int n dA| (the tight junctions then dominate the closure).
     const Real sh_min = getenv("QJ_SHRINK_MIN")   ? (Real)atof(getenv("QJ_SHRINK_MIN"))   : (Real)0.5;
     auto auto_shrink = [&](Real mR0)->Real{ if (mR0 >= sh_on) return (Real)1;
       const Real t = (mR0 - sh_lo)/std::max<Real>((Real)1e-9, sh_on - sh_lo);
@@ -175,8 +191,42 @@ int main(int argc, char** argv) {
     Vector<Long> gelem, gforder; Vector<Real> gcoord, gradius, gorient;   // combined slender
 
     const bool straight = (getenv("QJ_STRAIGHT") != nullptr);
+    // Approximation-graph dump (QJ_DUMP_APPROX=<path>): the placed junction centers + each arm's ACTUAL
+    // meshed centerline, overlaid on the vmtk graph by python/plot_network_approx.py to verify connectivity.
+    const bool dump_approx = (getenv("QJ_DUMP_APPROX") != nullptr);
+    struct ApproxArm { Integer owner, other; int is_cap; Vec3<Real> cA, uA; std::vector<Vec3<Real>> pts, ref; };
+    std::vector<ApproxArm> approx_arms;
+
+    // ---- LENGTH-ADAPTIVE n_axial (blend arms). A single fixed n_axial over-refines the short edges and
+    // chord-cuts (stiff, sharp turns) the long ones. Instead hold the PANEL ARCLENGTH ~constant across the
+    // network: the 10% shortest edges keep the base nAx (arg 8), and every longer edge scales n up ~linearly
+    // with its vmtk arclength so one panel ~= L10/nAx everywhere. The COAXIAL LEAD is then pinned to exactly
+    // ONE such panel: lead_panels=1 and lead length = h_panel (== L/n), so the axis-conforming seam stub is a
+    // single uniform panel on every arm regardless of length. Straight tubes (QJ_STRAIGHT) keep the fixed nAx.
+    // QJ_ARM_BLEND: fixed to production ON (was env; baked 2026-10-07 as the seamsettle_tr6 baseline)
+    const bool blend_mode = true;
+    auto arclen = [](const std::vector<Vec3<Real>>& c)->Real{
+      Real s = 0; for (size_t k = 1; k < c.size(); k++) s += gnet::nrm(gnet::sub(c[k], c[k-1])); return s; };
+    Real L10 = (Real)1;
+    { std::vector<Real> Ls; Ls.reserve(nedge);
+      for (Integer e = 0; e < nedge; e++) Ls.push_back(arclen(g.edges[e].cl));
+      if (!Ls.empty()) { std::sort(Ls.begin(), Ls.end());
+        const size_t k10 = (size_t)std::floor(0.10*(double)(Ls.size()-1));
+        if ((double)Ls[k10] > 1e-12) L10 = Ls[k10]; } }
+    const Real h_panel = L10 / (Real)std::max<Integer>(1, nAx);           // target panel arclength = 1 short-edge panel
+    auto arm_narm = [&](const std::vector<Vec3<Real>>& cl)->Integer{      // per-arm n ~ arclength / h_panel, floored at nAx
+      return std::max<Integer>(nAx, (Integer)std::lround((double)nAx * (double)arclen(cl) / (double)L10)); };
+    if (blend_mode) {
+      if (!getenv("QJ_ARM_BLEND_LEAD")) {                                 // pin the coaxial lead to one panel (h_panel)
+        static char leadbuf[64]; snprintf(leadbuf, sizeof leadbuf, "%.17g", (double)h_panel);
+        setenv("QJ_ARM_BLEND_LEAD", leadbuf, 1); }
+      if (!comm.Rank()) std::cout << "  [blend] length-adaptive n_axial: base " << nAx << " for the 10% shortest edges"
+        << " (L10=" << (double)L10 << "), scaling ~ L/L10; coaxial lead = 1 panel = " << (double)h_panel << "\n";
+    }
     auto push_arm = [&](Integer owner, const ArmSeam<Real>& sA, const Vec3<Real>& endC, const Vec3<Real>& endTang,
-                        const std::vector<Vec3<Real>>& cl, Real rA, Real rB, Integer other, bool is_cap) {
+                        const std::vector<Vec3<Real>>& cl, Real rA, Real rB, Integer other, bool is_cap,
+                        const Vec3<Real>& endE1 = Vec3<Real>{(Real)0,(Real)0,(Real)0},
+                        Vec3<Real>* out_termC = nullptr, Vec3<Real>* out_termU = nullptr) {
       NetworkArmBundle<Real>& B = bundle[owner];
       const Long p0 = (Long)B.elem_order.Dim();
       // The arm mouth radius at t=0 IS rA (radius=rA+t*(rB-rA)); rA=owner seam R0 (shrunk if the owner
@@ -192,15 +242,25 @@ int main(int argc, char** argv) {
       // straight leaf tube pointed its mouth ring at (tip - seamC) instead of seamA.u, tilting it off the
       // hole -> the junction<->cap gap. The cap tip position and centerline still come from the network.
       // QJ_STRAIGHT forces the old straight tube for A/B.
-      auto emit = [&](Vector<Long>& eo, Vector<Long>& fo, Vector<Real>& co, Vector<Real>& ra, Vector<Real>& oo) {
+      std::vector<Vec3<Real>> sampled, sampled_ref;
+      const Integer n_arm  = blend_mode ? arm_narm(cl) : nAx;             // length-adaptive panels (blend); constant otherwise
+      const Integer lead_p = blend_mode ? 1 : leadP;                      // coaxial lead = exactly 1 panel in blend mode
+      auto emit = [&](Vector<Long>& eo, Vector<Long>& fo, Vector<Real>& co, Vector<Real>& ra, Vector<Real>& oo,
+                      std::vector<Vec3<Real>>* samp, std::vector<Vec3<Real>>* sref,
+                      Vec3<Real>* tC, Vec3<Real>* tU) {
         if (straight) append_straight_fiber<Real>(sA, endC, rA, rB, nAx, cheb, fourier, eo, fo, co, ra, oo);
-        else append_centerline_fiber<Real>(sA, endC, endTang, cl, rA, rB, nAx, leadP, cheb, fourier, eo, fo, co, ra, oo,
-                                           getenv("QJ_CONSTORIENT") != nullptr, leadFrac, cornerP, turnThr);
+        else append_centerline_fiber<Real>(sA, endC, endTang, cl, rA, rB, n_arm, lead_p, cheb, fourier, eo, fo, co, ra, oo,
+                                           getenv("QJ_CONSTORIENT") != nullptr, leadFrac, cornerP, turnThr, samp, sref, endE1, is_cap, tC, tU);
       };
-      emit(B.elem_order, B.forder, B.coord, B.radius, B.orient);
+      emit(B.elem_order, B.forder, B.coord, B.radius, B.orient, dump_approx ? &sampled : nullptr,
+           dump_approx ? &sampled_ref : nullptr, out_termC, out_termU);
       B.other_node.push_back(other); B.is_cap.push_back(is_cap ? 1 : 0);
       B.npanel.push_back((Long)B.elem_order.Dim() - p0);
-      emit(gelem, gforder, gcoord, gradius, gorient);                 // mirror into combined slender list
+      emit(gelem, gforder, gcoord, gradius, gorient, nullptr, nullptr, nullptr, nullptr); // mirror into combined slender list
+      if (dump_approx) {
+        if (sampled.empty()) sampled = { sA.C, endC };                // straight fallback: just the endpoints
+        approx_arms.push_back({owner, other, is_cap ? 1 : 0, sA.C, sA.u, sampled, sampled_ref});
+      }
     };
 
     // Optional connection diagnostic: per interior edge, the TURN each junction mouth axis makes relative
@@ -216,7 +276,13 @@ int main(int argc, char** argv) {
       const bool ji = g.nodes[i].is_junc, jj = g.nodes[j].is_junc;
       if (ji && jj) {
         // interior: owner = min, other = max. centerline oriented owner->other.
-        const Integer own = std::min(i, j), oth = std::max(i, j);
+        Integer own = std::min(i, j), oth = std::max(i, j);
+        // A/B TEST (QJ_FLIP_CONN): swap owner<->other for EVERY interior edge, inverting which physical end
+        // is corner0 (near/home, always-merged) vs corner1 (far, sometimes-kept). The tube in space should be
+        // unchanged IF the two-end construction were symmetric; comparing the corner asymmetry before/after
+        // isolates a construction-ROLE artifact (asymmetry follows corner0/corner1) from a vmtk-DATA property
+        // (asymmetry stays on the same physical junction ends). Diagnostic only.
+        if (getenv("QJ_FLIP_CONN")) std::swap(own, oth);
         const ArmSeam<Real>& sA = seam[own].at(e);
         const ArmSeam<Real>& sB = seam[oth].at(e);
         std::vector<Vec3<Real>> cl = E.cl; if (E.n0 != own) std::reverse(cl.begin(), cl.end());
@@ -232,16 +298,55 @@ int main(int argc, char** argv) {
           ctrOff.push_back((Lc>0)?(double)gnet::nrm(gnet::sub(sA.C, g.nodes[own].pos))/(double)Lc:0.0);
           owA.push_back(own); owB.push_back(oth);
         }
-        push_arm(own, sA, sB.C, endTang, cl, sA.R0, sB.R0, oth, false);
+        // FRAME-DRIFT diagnostic (QJ_FRAMEDIAG): the fiber's RMF is seeded ONLY from sA.e1 (owner) and
+        // propagated by double-reflection to the far end. Reproduce that propagation on the raw centerline
+        // and report the angle between the ARRIVED frame and the neighbour seam sB.e1 -- the azimuthal
+        // misalignment between the arm's far ring nodes and junction oth's hole nodes (0 at the home end
+        // by construction). Large drift => the far seam LOOKS misaligned though it is the same circle.
+        if (getenv("QJ_FRAMEDIAG") && !comm.Rank()) {
+          const Integer M = (Integer)cl.size();
+          if (M >= 2) {
+            auto tg = [&](Integer k)->Vec3<Real>{
+              if (k<=0)   return gnet::unit(gnet::sub(cl[1],cl[0]));
+              if (k>=M-1) return gnet::unit(gnet::sub(cl[M-1],cl[M-2]));
+              return gnet::unit(gnet::sub(cl[k+1],cl[k-1])); };
+            Vec3<Real> ti = tg(0);
+            Vec3<Real> r  = gnet::unit(gnet::sub(sA.e1, gnet::scal(gnet::dot(sA.e1,ti), ti)));
+            for (Integer k=0;k<M-1;k++){
+              const Vec3<Real> v1=gnet::sub(cl[k+1],cl[k]); const Real c1=gnet::dot(v1,v1);
+              const Vec3<Real> ti1=tg(k+1);
+              const Vec3<Real> rL=(double)c1>0?gnet::sub(r ,gnet::scal(2*gnet::dot(v1,r )/c1,v1)):r ;
+              const Vec3<Real> tL=(double)c1>0?gnet::sub(ti,gnet::scal(2*gnet::dot(v1,ti)/c1,v1)):ti;
+              const Vec3<Real> v2=gnet::sub(ti1,tL); const Real c2=gnet::dot(v2,v2);
+              Vec3<Real> r1=(double)c2>0?gnet::sub(rL,gnet::scal(2*gnet::dot(v2,rL)/c2,v2)):rL;
+              r=gnet::unit(r1); ti=ti1; }
+            const Vec3<Real> eBt=gnet::unit(gnet::sub(sB.e1, gnet::scal(gnet::dot(sB.e1,ti),ti)));
+            double c=(double)gnet::dot(r,eBt); c=std::max(-1.0,std::min(1.0,c));
+            std::cout<<"  [framediag] edge "<<e<<" j"<<own<<"->j"<<oth<<" drift="<<std::acos(c)*180.0/M_PI<<" deg\n";
+          }
+        }
+        push_arm(own, sA, sB.C, endTang, cl, sA.R0, sB.R0, oth, false, sB.e1);   // match neighbour seam frame at far ring
       } else if (ji || jj) {
         // leaf: junction endpoint owns; far end is a cap tip.
         const Integer own = ji ? i : j, cap = ji ? j : i;
         const ArmSeam<Real>& sA = seam[own].at(e);
         std::vector<Vec3<Real>> cl = E.cl; if (E.n0 != own) std::reverse(cl.begin(), cl.end());
         const Vec3<Real> tip = g.nodes[cap].pos;
-        Vec3<Real> endTang = gnet::unit(gnet::sub(tip, sA.C));
-        const Real rB = (E.n0 == cap) ? E.r0 : E.r1;                    // vessel radius at the cap
-        const Real rBt = (rB > 0) ? rB : sA.R0;
+        Vec3<Real> endTang = gnet::unit(gnet::sub(tip, sA.C));            // owner->tip chord (straight-tube axis)
+        if (blend_mode) {
+          // BLEND caps: conform the cap mouth axis to the VESSEL at the tip, not the owner->tip chord.
+          // On a curved leaf the chord is tens of degrees off the local vmtk tangent (measured 40-73 deg),
+          // which tilts the cap seam ring and forces the coaxial lead+corner into a large detour (the
+          // dominant B-end displacement). The local vmtk tangent makes the cap ring vessel-conforming, so
+          // the lead barely deviates -- same 0-tilt situation the owner (A) mouth already enjoys.
+          const Integer Ncl = (Integer)cl.size();
+          if (Ncl >= 4)      endTang = gnet::unit(gnet::sub(cl[Ncl-1], cl[Ncl-4]));
+          else if (Ncl >= 2) endTang = gnet::unit(gnet::sub(cl[Ncl-1], cl[Ncl-2]));
+        }
+        // Uniform arm radius: cap the leaf tube at the owner seam R0 (== the uniform value) so the leaf
+        // never tapers to a differing vmtk endpoint radius. (E.r0/E.r1 are already uniform after Phase B;
+        // pinning to sA.R0 guarantees uniformity regardless of the graph's endpoint columns.)
+        const Real rBt = sA.R0;
         if (seamdiag) {
           const Vec3<Real> ch = gnet::sub(tip, sA.C); const Real Lc = gnet::nrm(ch);
           const Vec3<Real> cd = (Lc > 0) ? gnet::scal((Real)1/Lc, ch) : ch;
@@ -250,12 +355,38 @@ int main(int argc, char** argv) {
           radErr.push_back(0.0); ctrOff.push_back(0.0);
           owA.push_back(own); owB.push_back(cap); kind.push_back(1);
         }
-        push_arm(own, sA, tip, endTang, cl, sA.R0, rBt, cap, true);
-        // hemisphere cap butterfly at the tip (world frame): any e1 perp to endTang.
+        // hemisphere cap frame at the tip: e1 any vector perp to the mouth axis. Build it FIRST so the arm's
+        // far ring is twisted to match it (closure twist) -- otherwise the arm's RMF frame drifts to an
+        // arbitrary azimuth at the tip while the cap dome uses THIS e1, a nonsmooth arm->cap frame join.
         ArmSeam<Real> capring; capring.C = tip; capring.u = endTang; capring.R0 = rBt;
-        Vec3<Real> a{1, 0, 0}; if (std::fabs((double)endTang[0]) > 0.9) a = Vec3<Real>{0, 1, 0};
-        capring.e1 = gnet::unit(gnet::sub(a, gnet::scal(gnet::dot(a, endTang), endTang)));
+        {
+          Vec3<Real> a{1, 0, 0}; if (std::fabs((double)endTang[0]) > 0.9) a = Vec3<Real>{0, 1, 0};
+          capring.e1 = gnet::unit(gnet::sub(a, gnet::scal(gnet::dot(a, endTang), endTang)));
+        }
         capring.e2 = gnet::cross(capring.e1, endTang);
+        // Capture the tube's ACTUAL meshed terminal cross-section so the dome can be registered to the real
+        // tube tip ring (flagella recipe) instead of the idealized endTang. DEFAULT ON (validated: full-net
+        // DL 29.4->1.05, closure 1.76e-6->8.96e-7, see [[network-cap-dome-tube-seam]]); opt out w/ QJ_CAP_TERM_REG=0.
+        Vec3<Real> capTermC{0,0,0}, capTermU{0,0,0};
+        const char* ctr_env = getenv("QJ_CAP_TERM_REG");
+        const bool cap_term_reg = !(ctr_env && ctr_env[0] == '0');
+        push_arm(own, sA, tip, endTang, cl, sA.R0, rBt, cap, true, capring.e1,   // arm far ring conforms to cap frame
+                 cap_term_reg ? &capTermC : nullptr, cap_term_reg ? &capTermU : nullptr);
+        if (cap_term_reg && gnet::nrm(capTermU) > (Real)0.5) {
+          // Re-seat the dome on the tube's actual terminal ring: center = curve(1), axis = meshed terminal
+          // tangent. Removes the endTang-vs-meshed tilt that dips the equator inside the tube (near-singular
+          // cross-list cap blow-up). Radius unchanged (rBt) => watertight; azimuth of e1 is cross-list-inert.
+          capring.C = capTermC; capring.u = gnet::unit(capTermU);
+          Vec3<Real> a{1, 0, 0}; if (std::fabs((double)capring.u[0]) > 0.9) a = Vec3<Real>{0, 1, 0};
+          capring.e1 = gnet::unit(gnet::sub(a, gnet::scal(gnet::dot(a, capring.u), capring.u)));
+          capring.e2 = gnet::cross(capring.e1, capring.u);
+          if (getenv("QJ_CAP_TERM_REG_DIAG") && !comm.Rank()) {
+            double d = (double)gnet::dot(gnet::unit(endTang), capring.u); d = std::max(-1.0, std::min(1.0, d));
+            std::cout << "  [capreg] j" << own << "->" << cap << "  endTang-vs-meshed axis tilt = "
+                      << std::acos(d)*180.0/M_PI << " deg;  C shift = "
+                      << (double)gnet::nrm(gnet::sub(capring.C, tip)) << "\n";
+          }
+        }
         add_cap_hemisphere_frame<Real>(Xbody[own], capring, order, Ncap > 0 ? Ncap : 2, coreF);
       }
     }
@@ -365,6 +496,44 @@ int main(int argc, char** argv) {
       SlenderElemList<Real> arms_all(gelem, gforder, gcoord, gradius, gorient);
       quad_all.WriteVTK(out_prefix + "-junc.vtu"); arms_all.WriteVTK(out_prefix + "-arms.vtu");
       std::cout << "  wrote " << out_prefix << "-{junc,arms}.vtu\n";
+    }
+
+    // ---- approximation-graph dump (junction centers + seams + meshed arm centerlines) ----
+    if (dump_approx && !comm.Rank()) {
+      const std::string path = getenv("QJ_DUMP_APPROX");
+      std::ofstream fo(path);
+      fo << std::setprecision(9);
+      fo << "# approx-network dump v1 (world coords): placed junctions + meshed arm centerlines\n";
+      Integer njunc = 0; for (Integer i = 0; i < nnode; i++) if (g.nodes[i].is_junc) njunc++;
+      fo << "NJUNC " << njunc << "\n";
+      for (Integer i = 0; i < nnode; i++) if (g.nodes[i].is_junc) {
+        const auto& p = g.nodes[i].pos;
+        fo << i << " " << (double)p[0] << " " << (double)p[1] << " " << (double)p[2] << "\n";
+      }
+      fo << "NARM " << approx_arms.size() << "\n";
+      for (const auto& A : approx_arms) {
+        fo << A.owner << " " << A.other << " " << A.is_cap
+           << " " << (double)A.cA[0] << " " << (double)A.cA[1] << " " << (double)A.cA[2]
+           << " " << (double)A.uA[0] << " " << (double)A.uA[1] << " " << (double)A.uA[2]
+           << " " << A.pts.size() << "\n";
+        for (const auto& q : A.pts)
+          fo << (double)q[0] << " " << (double)q[1] << " " << (double)q[2] << "\n";
+      }
+      std::cout << "  [approx] wrote " << njunc << " junctions + " << approx_arms.size()
+                << " arms to " << path << "\n";
+      // Companion reference file (blend mode): per-arm raw vmtk centerline v(l) at the SAME stations as the
+      // meshed arm, so the exact displacement |c(l)-v(l)| is measurable (plot_network_blend.py reads it).
+      bool any_ref = false; for (const auto& A : approx_arms) if (!A.ref.empty()) any_ref = true;
+      if (any_ref) {
+        std::ofstream rf(std::string(path) + ".ref");
+        rf << std::setprecision(9) << "# per-arm reference vmtk centerline v(l) (same stations as approx pts)\n";
+        rf << "NARM " << approx_arms.size() << "\n";
+        for (const auto& A : approx_arms) {
+          rf << A.owner << " " << A.other << " " << A.ref.size() << "\n";
+          for (const auto& q : A.ref) rf << (double)q[0] << " " << (double)q[1] << " " << (double)q[2] << "\n";
+        }
+        std::cout << "  [approx] wrote per-arm reference centerlines to " << path << ".ref\n";
+      }
     }
 
     // ---- 5. per-junction bundles ----

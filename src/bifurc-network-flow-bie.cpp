@@ -21,7 +21,25 @@
  *     (the shared solve_dirichlet_bvp in hybrid_bie_tests.hpp), evaluate the interior velocity at a
  *     geometry-aware cloud (arm cross-section stars + per-junction boxes filtered to the interior).
  *
- * Env overrides for the port assignment:
+ * TEST MODES (QJ_NET_MODE, default "flow"):
+ *   "flow"          the physical inflow/outflow BVP described above (stages 4-9).
+ *   "manufactured"  (alias "mfg") an analytic-field acceptance sweep on the SAME coupled operator:
+ *                   two manufactured-solution tests over a quadrature-tol sweep --
+ *                     mfg-int: sources EXTERIOR (on the enclosing sphere, radius padded 0.2x) => the
+ *                              field is smooth in the interior lumen => interior jump -1/2 (SL=-1,DL=+1,
+ *                              the flow operator); checked at interior arm-centerline points.
+ *                     mfg-ext: sources INTERIOR (arm centerlines) => smooth in the exterior => exterior
+ *                              jump +1/2 (SL=+1,DL=+1); checked on the enclosing sphere.
+ *                   The RHS is built by test_manufactured (hybrid_bie_tests.hpp) from combined_nodes,
+ *                   so it is automatically in the "0_junc"->"1_arms" node order. rel-L2 is capped by
+ *                   the geometry watertightness floor (~1e-6 for the netfix build). Only tol is swept
+ *                   (order/cheb/fourier are baked into the bundles; Duffy ignores cov_q/Nbeta/max_depth).
+ *                   Env: QJ_MFG_TOLS (comma list; default 1e-4,1e-5,1e-6,1e-7,1e-8,1e-9), QJ_MFG_NLON,
+ *                   QJ_MFG_NLAT (sphere grid, ~8x8), QJ_MFG_JITTER (source offset frac of R_encl, 0.02),
+ *                   QJ_MFG_SEED. QJ_MFG_DRYRUN builds+validates the clouds then exits before the solve
+ *                   (cheap local smoke). Runs on the cluster via scripts/submit-network-mfg.sh (PVFMM).
+ *
+ * Env overrides for the "flow" port assignment:
  *   QJ_INFLOW_NODES="id,id,..."   graph node ids (the cap `other_node` in the bundle) to force as INFLOWs
  *                                 (split equally); default = the single extreme-axis cap.
  *   QJ_INFLOW_AXIS=x|y|z|x-|...   axis whose EXTREME cap is the default inflow (default "x" = max-x).
@@ -30,17 +48,18 @@
  *   make MPI=1 bin/bifurc-network-flow-bie          # or: make PVFMM=1 bin/bifurc-network-flow-bie
  *   OMP_NUM_THREADS=8 mpirun -n <ranks> ./bin/bifurc-network-flow-bie \
  *       [bundle_prefix] [tol] [p_in] [cov_q] [Nbeta] [max_depth] [gmres_max_iter] [Nvis] [Ngrid]
- *   e.g.  ... ./bin/bifurc-network-flow-bie vis/network 1e-7 10   (prefix = whatever you assembled to)
+ *   e.g.  ... ./bin/bifurc-network-flow-bie geom/netfix 1e-7 10   (prefix = whatever you assembled to)
  *
  * The bundles bake in the DISCRETIZATION (order + fourier), so accuracy is dialed by choosing the bundle
  * set plus the near-eval tol / cov_q / Nbeta / max_depth here.
  *
- * GEOMETRY PROVENANCE -- REGENERATE BEFORE EVERY RUN (no bundle is committed; vis/ is gitignored):
+ * GEOMETRY PROVENANCE -- the production bundles live at geom/netfix-jNNN.{mesh,arms} (a build artifact,
+ * NOT committed -- only the geom/ generalized-bifurcation presets are; regenerate before a production run):
  *   The CANONICAL geometry is the assembler run on data/vmtk/vessels_fixed.graph (TRUE per-junction branch
  *   angles + every watertightness fix -- bigon3, lead-corner arm bend, leaf-arm fix, turn-adaptive corners,
  *   sigma-floor 0.075->0.05, auto size-shrink). It closes to |int n dA| ~1e-3 on area ~5e5 (rel ~1e-5).
- *   DEFAULT ASSEMBLE PARAMETERS (bifurc-network-assemble); use order=12 fourier=24 for 6-digit quadrature:
- *       data/vmtk/vessels_fixed.graph  <prefix>  <order> 1 1.5 0.4 3 12 10 <fourier> 2
+ *   PRODUCTION ASSEMBLE PARAMETERS (bifurc-network-assemble): order=12 cheb=10 fourier=24 for 6-digit quadrature:
+ *       data/vmtk/vessels_fixed.graph  geom/netfix  12 1 1.5 0.4 3 12 10 24 2
  *       (nref=1 level=1.5 eta_join=0.4 Ns_trans=3 n_axial=12 cheb=10 lead_panels=2; all other flags default)
  *   The driver prints the combined watertightness |int n dA| up front so you can confirm you built the fixed
  *   geometry (~1e-5) before trusting the solve -- a rel ~2.8e-3 closure means an angle-approximated/stale
@@ -101,6 +120,257 @@ Vector<Real> extrap_weights(Long cheb, Real s) {
   return wts;
 }
 
+// Smallest axis-aligned-bbox-centered sphere enclosing the whole (MPI-partitioned) network: center =
+// bbox midpoint, radius = max node distance to it. Reduced across ranks so every rank agrees.
+void enclosing_sphere(const QuadElemList<Real>& junc, const SlenderElemList<Real>& arms,
+                      const Comm& comm, Vec3<Real>& center, Real& radius) {
+  Vector<Real> X, Xn; Long Nj, Na; combined_nodes(junc, arms, X, Xn, Nj, Na);
+  const Long N = X.Dim()/3;
+  double lo[3] = {1e300, 1e300, 1e300}, hi[3] = {-1e300, -1e300, -1e300};
+  for (Long i = 0; i < N; i++) for (int k = 0; k < 3; k++) { const double v = (double)X[3*i+k]; lo[k] = std::min(lo[k], v); hi[k] = std::max(hi[k], v); }
+  for (int k = 0; k < 3; k++) { lo[k] = GlobalReduce(lo[k], comm, CommOp::MIN); hi[k] = GlobalReduce(hi[k], comm, CommOp::MAX); center[k] = (Real)(0.5*(lo[k]+hi[k])); }
+  double r2 = 0;
+  for (Long i = 0; i < N; i++) { double d2 = 0; for (int k = 0; k < 3; k++) { const double d = (double)X[3*i+k] - (double)center[k]; d2 += d*d; } r2 = std::max(r2, d2); }
+  radius = (Real)std::sqrt(GlobalReduce(r2, comm, CommOp::MAX));
+}
+
+// Manufactured-solution acceptance on the loaded network -- TWO tests over a quadrature-tol sweep:
+//   test 1 "mfg-int": point sources placed EXTERIOR to the whole network (on the enclosing sphere,
+//                     radius padded 0.2x) => field smooth in the interior lumen => interior jump -1/2
+//                     (SL=-1, DL=+1: the SAME operator the flow solve uses); checked at interior
+//                     arm-centerline points.
+//   test 2 "mfg-ext": point sources placed INTERIOR (arm centerlines = tube axes) => field smooth in
+//                     the exterior => exterior jump +1/2 (SL=+1, DL=+1); checked on the enclosing
+//                     sphere (exterior to every tube).
+// The Dirichlet RHS is built INSIDE test_manufactured from combined_nodes(junc,arms), so it is
+// automatically in the "0_junc"->"1_arms" node ordering (no manual RHS assembly). Xsrc/Fsrc are built
+// identically on every rank (fixed seed) since test_manufactured uses them in the per-rank RHS Eval;
+// the check clouds Xtrg live on rank 0 only (the routine GlobalReduce-sums, expecting each target once).
+// Only tol is swept (order/cheb/fourier are baked into the bundles; the Duffy near-eval ignores
+// cov_q/Nbeta/max_depth). rel-L2 is capped by the geometry watertightness floor (~1e-6 for the netfix
+// build): expect it to track tol down to that floor, then plateau.
+// Env: QJ_MFG_TOLS (comma list), QJ_MFG_NLON/NLAT (sphere grid, ~8x8), QJ_MFG_JITTER (source offset as
+// a fraction of R_encl, default 0.02), QJ_MFG_SEED.
+void run_network_manufactured(const QuadElemList<Real>& junc, const SlenderElemList<Real>& arms,
+                              const Vector<Real>& a_coord, const Comm& comm, const Real tol_fallback,
+                              const Long gmaxit, const Integer order, const Long cheb, const Long fourier) {
+  const Integer pid = comm.Rank();
+  const Real PI = (Real)3.14159265358979323846;
+
+  // (a) enclosing sphere, padded 0.2x.
+  Vec3<Real> ctr{(Real)0,(Real)0,(Real)0}; Real rad = 0; enclosing_sphere(junc, arms, comm, ctr, rad);
+  const Real R_encl = (Real)1.2 * rad;
+
+  // (b) knobs.
+  const Integer Nlon = std::getenv("QJ_MFG_NLON") ? (Integer)atoi(std::getenv("QJ_MFG_NLON")) : 8;
+  const Integer Nlat = std::getenv("QJ_MFG_NLAT") ? (Integer)atoi(std::getenv("QJ_MFG_NLAT")) : 8;
+  const Real jitter  = std::getenv("QJ_MFG_JITTER") ? (Real)atof(std::getenv("QJ_MFG_JITTER")) : (Real)0.02;
+  const long seed    = std::getenv("QJ_MFG_SEED") ? atol(std::getenv("QJ_MFG_SEED")) : 12345L;
+  // Sweep list: QJ_MFG_TOLS if set, else a default sweep bracketing the ~1e-6 floor and probing below.
+  // (The CLI positional tol is not used to drive the sweep -- it always has a default; kept for signature
+  // stability and as a last-resort single value only if the default list is ever emptied.)
+  (void)tol_fallback;
+  std::vector<Real> tols;
+  if (const char* e = std::getenv("QJ_MFG_TOLS")) { std::stringstream ss(e); std::string t;
+    while (std::getline(ss, t, ',')) if (!t.empty()) tols.push_back((Real)atof(t.c_str())); }
+  if (tols.empty()) { const double d[] = {1e-4,1e-5,1e-6,1e-7,1e-8,1e-9}; for (double x : d) tols.push_back((Real)x); }
+
+  // unit sphere direction from a (lat,lon) grid index; the +0.5 lat offset avoids the poles.
+  auto sph_dir = [PI](Integer ila, Integer Nla, Integer ilo, Integer Nlo) -> Vec3<Real> {
+    const Real phi = PI * ((Real)ila + (Real)0.5) / (Real)Nla;      // polar 0..pi
+    const Real th  = (Real)2 * PI * (Real)ilo / (Real)Nlo;          // azimuth
+    return Vec3<Real>{ std::sin(phi)*std::cos(th), std::sin(phi)*std::sin(th), std::cos(phi) };
+  };
+
+  // (c) EXTERIOR sources (test 1): sphere grid @ R_encl + jitter; strengths ~ U[-5,5]. Fixed seed +
+  //     identical loop order => byte-identical on every rank.
+  Vector<Real> Xs_ext, Fs_ext; srand48(seed);
+  for (Integer ila = 0; ila < Nlat; ila++) for (Integer ilo = 0; ilo < Nlon; ilo++) {
+    const Vec3<Real> d = sph_dir(ila, Nlat, ilo, Nlon);
+    for (int k = 0; k < 3; k++) Xs_ext.PushBack(ctr[k] + R_encl*d[k] + (Real)(jitter*R_encl*(Real)(2*drand48()-1)));
+    for (int k = 0; k < 3; k++) Fs_ext.PushBack((Real)(10.0*drand48()-5.0));
+  }
+  { const Long M = Xs_ext.Dim()/3; double dmin = 1e300;
+    for (Long i = 0; i < M; i++) { double d2 = 0; for (int k = 0; k < 3; k++) { const double dd = (double)Xs_ext[3*i+k]-(double)ctr[k]; d2 += dd*dd; } dmin = std::min(dmin, std::sqrt(d2)); }
+    SCTL_ASSERT_MSG(dmin > (double)rad, "manufactured exterior source fell inside the network bounding sphere"); }
+
+  // (d) INTERIOR sources (test 2): stride-sampled arm centerlines (a_coord = tube axes). EVERY stored
+  //     centerline node is interior to the closed surface by construction: nodes lie on the tube axis at
+  //     s<1 (the cap dome center is the terminal panel extrapolated to s=1, BEYOND the last node), so they
+  //     end inside the tube before the convex cap is attached -- and the junction-end nodes sit inside the
+  //     junction solid the arm plugs into. No containment test / end-trim needed. Strengths ~ U[-5,5] under
+  //     a disjoint seed; replicated on every rank (fixed seed + identical loop order => byte-identical).
+  const Long Ncen = a_coord.Dim()/3;
+  const Long Mint = (Long)Nlon*(Long)Nlat;
+  Vector<Real> Xs_int, Fs_int; srand48(seed + 7);
+  if (Ncen > 0) { const Long stride = std::max<Long>(1, Ncen/std::max<Long>(1, Mint));
+    for (Long i = 0; i < Ncen && (Long)(Xs_int.Dim()/3) < Mint; i += stride) {
+      for (int k = 0; k < 3; k++) Xs_int.PushBack(a_coord[3*i+k]);
+      for (int k = 0; k < 3; k++) Fs_int.PushBack((Real)(10.0*drand48()-5.0)); } }
+
+  // (e) check clouds -- rank 0 ONLY.
+  Vector<Real> Xt_int, Xt_ext;
+  if (!pid) {
+    const Long want = std::min<Long>(256, Ncen);   // interior checks: centerlines, offset from the sources.
+    if (Ncen > 0 && want > 0) { const Long stride = std::max<Long>(1, Ncen/want);
+      for (Long i = stride/2; i < Ncen; i += stride) for (int k = 0; k < 3; k++) Xt_int.PushBack(a_coord[3*i+k]); }
+    const Integer Cla = 16, Clo = 16;              // exterior checks: sphere grid @ R_encl.
+    for (Integer ila = 0; ila < Cla; ila++) for (Integer ilo = 0; ilo < Clo; ilo++) {
+      const Vec3<Real> d = sph_dir(ila, Cla, ilo, Clo);
+      for (int k = 0; k < 3; k++) Xt_ext.PushBack(ctr[k] + R_encl*d[k]); }
+  }
+
+  if (!pid)
+    std::cout << "\n=== manufactured-solution acceptance on the loaded network (2 tests, tol sweep) ===\n"
+              << "  geometry (baked, NOT swept): order=" << order << " cheb=" << cheb << " fourier=" << fourier << "\n"
+              << "  enclosing sphere: center=(" << std::setprecision(4) << ctr[0] << "," << ctr[1] << "," << ctr[2]
+              << ") radius=" << rad << "  => sources/checks @ R_encl=" << R_encl << " (pad 0.2x)\n"
+              << "  test 1 mfg-int: " << (Xs_ext.Dim()/3) << " EXTERIOR sources, interior jump -1/2 (SL=-1,DL=+1), "
+              << (Xt_int.Dim()/3) << " interior checks\n"
+              << "  test 2 mfg-ext: " << (Xs_int.Dim()/3) << " INTERIOR sources, exterior jump +1/2 (SL=+1,DL=+1), "
+              << (Xt_ext.Dim()/3) << " exterior checks\n"
+              << "  NOTE: rel-L2 is capped by the geometry watertightness floor (~1e-6 for the netfix build);\n"
+              << "        expect it to track tol down to that floor then plateau. GMRES iters print per test.\n";
+
+  // QJ_MFG_DRYRUN: build + validate the source/target clouds and exit BEFORE the GMRES solve. The full
+  // solve is a ~22M-DOF multi-node PVFMM job (not local); this is the cheap local smoke of the setup.
+  if (std::getenv("QJ_MFG_DRYRUN")) {
+    if (!pid) std::cout << "\n[QJ_MFG_DRYRUN] clouds built + sources validated exterior/interior; skipping solve.\n";
+    return;
+  }
+
+  // QJ_MFG_ONLY selects which test(s) run: "int" (mfg-int only), "ext" (mfg-ext only), or "both" (default).
+  // The exterior-source interior problem (mfg-int) converges in tens of GMRES iters; the interior-source
+  // exterior problem (mfg-ext) is far worse conditioned (thousands of iters at eta=1) and can starve a
+  // time-limited sweep -- run them separately when that matters.
+  const char* only_env = std::getenv("QJ_MFG_ONLY");
+  const std::string only = only_env ? std::string(only_env) : std::string("both");
+  SCTL_ASSERT_MSG(only=="int"||only=="ext"||only=="both", "QJ_MFG_ONLY must be 'int', 'ext', or 'both'");
+  const bool do_int = (only != "ext"), do_ext = (only != "int");
+  if (!pid) std::cout << "  QJ_MFG_ONLY=" << only << " -> running "
+                      << (do_int ? "mfg-int " : "") << (do_ext ? "mfg-ext" : "") << "\n";
+
+  std::vector<Real> r1(tols.size(), (Real)-1), r2(tols.size(), (Real)-1);
+  for (size_t it = 0; it < tols.size(); it++) {
+    const Real tl = tols[it];
+    if (!pid) std::cout << "\n----- tol = " << std::setprecision(1) << (double)tl << " -----\n";
+    if (do_int)
+      r1[it] = test_manufactured<Real, Stokes3D_FxU, Stokes3D_DxU>(junc, arms, comm, tl, Xs_ext, Fs_ext,
+                   /*interior=*/true,  Xt_int, /*SL_scal=*/(Real)-1., /*DL_scal=*/(Real)1., "mfg-int", gmaxit);
+    if (do_ext)
+      r2[it] = test_manufactured<Real, Stokes3D_FxU, Stokes3D_DxU>(junc, arms, comm, tl, Xs_int, Fs_int,
+                   /*interior=*/false, Xt_ext, /*SL_scal=*/(Real) 1., /*DL_scal=*/(Real)1., "mfg-ext", gmaxit);
+  }
+
+  if (!pid) {
+    std::cout << "\n=== manufactured convergence summary (rel-L2; GMRES iters in the per-test lines above) ===\n"
+              << "           tol      mfg-int (exterior src)   mfg-ext (interior src)\n";
+    for (size_t it = 0; it < tols.size(); it++) {
+      std::cout << "  " << std::setw(12) << std::setprecision(2) << (double)tols[it] << "         ";
+      if (r1[it] < (Real)0) std::cout << std::setw(12) << "(skipped)";
+      else                  std::cout << std::setw(12) << std::setprecision(6) << (double)r1[it];
+      std::cout << "            ";
+      if (r2[it] < (Real)0) std::cout << std::setw(12) << "(skipped)";
+      else                  std::cout << std::setw(12) << std::setprecision(6) << (double)r2[it];
+      std::cout << "\n";
+    }
+  }
+}
+
+// On-surface Green's third-identity acceptance on the loaded network -- a DIRECT quadrature check (NO
+// GMRES, NO solve). For a known field u (the single-layer potential of point sources) we verify the
+// on-surface representation  S[du/dn] - D_pv[u] = +-0.5 u  over the WHOLE coupled surface:
+//   * EXTERIOR source: sources on the padded enclosing sphere (field regular in the interior lumen).
+//                      test_greens_identity default jump -0.5.
+//   * INTERIOR source: sources on the arm centerlines (= tube axes, inside the closed surface by
+//                      construction; field regular in the exterior). jump -1.5.
+// The reported number is a RELATIVE error (max|err|/max|u|), hence scale-invariant -- identical on the
+// 10x-down geometry. Env: QJ_GREENS_KER=laplace|stokes|both (default both), QJ_GREENS_NLON/NLAT (source
+// grid, default 6x6), QJ_GREENS_JITTER (0.02), QJ_GREENS_SEED.
+void run_network_greens(const QuadElemList<Real>& junc, const SlenderElemList<Real>& arms,
+                        const Vector<Real>& a_coord, const Comm& comm, const Real tol) {
+  const Integer pid = comm.Rank();
+  const Real PI = (Real)3.14159265358979323846;
+
+  Vec3<Real> ctr{(Real)0,(Real)0,(Real)0}; Real rad = 0; enclosing_sphere(junc, arms, comm, ctr, rad);
+  const Real R_encl = (Real)1.2 * rad;
+  const Integer Nlon = std::getenv("QJ_GREENS_NLON") ? (Integer)atoi(std::getenv("QJ_GREENS_NLON")) : 6;
+  const Integer Nlat = std::getenv("QJ_GREENS_NLAT") ? (Integer)atoi(std::getenv("QJ_GREENS_NLAT")) : 6;
+  const Real jitter  = std::getenv("QJ_GREENS_JITTER") ? (Real)atof(std::getenv("QJ_GREENS_JITTER")) : (Real)0.02;
+  const long seed    = std::getenv("QJ_GREENS_SEED") ? atol(std::getenv("QJ_GREENS_SEED")) : 12345L;
+
+  auto sph_dir = [PI](Integer ila, Integer Nla, Integer ilo, Integer Nlo) -> Vec3<Real> {
+    const Real phi = PI * ((Real)ila + (Real)0.5) / (Real)Nla;
+    const Real th  = (Real)2 * PI * (Real)ilo / (Real)Nlo;
+    return Vec3<Real>{ std::sin(phi)*std::cos(th), std::sin(phi)*std::sin(th), std::cos(phi) };
+  };
+
+  // EXTERIOR sources: padded enclosing sphere (validated strictly outside the network bbox sphere).
+  Vector<Real> Xs_ext; srand48(seed);
+  for (Integer ila = 0; ila < Nlat; ila++) for (Integer ilo = 0; ilo < Nlon; ilo++) {
+    const Vec3<Real> d = sph_dir(ila, Nlat, ilo, Nlon);
+    for (int k = 0; k < 3; k++) Xs_ext.PushBack(ctr[k] + R_encl*d[k] + (Real)(jitter*R_encl*(Real)(2*drand48()-1)));
+  }
+  { const Long M = Xs_ext.Dim()/3; double dmin = 1e300;
+    for (Long i = 0; i < M; i++) { double d2 = 0; for (int k = 0; k < 3; k++) { const double dd = (double)Xs_ext[3*i+k]-(double)ctr[k]; d2 += dd*dd; } dmin = std::min(dmin, std::sqrt(d2)); }
+    SCTL_ASSERT_MSG(dmin > (double)rad, "greens exterior source fell inside the network bounding sphere"); }
+
+  // INTERIOR sources: stride-sampled arm centerlines (tube axes -- interior by construction, see mfg note).
+  const Long Ncen = a_coord.Dim()/3, Mint = (Long)Nlon*(Long)Nlat;
+  Vector<Real> Xs_int;
+  if (Ncen > 0) { const Long stride = std::max<Long>(1, Ncen/std::max<Long>(1, Mint));
+    for (Long i = 0; i < Ncen && (Long)(Xs_int.Dim()/3) < Mint; i += stride)
+      for (int k = 0; k < 3; k++) Xs_int.PushBack(a_coord[3*i+k]); }
+
+  const char* ker_env = std::getenv("QJ_GREENS_KER");
+  const std::string ker = ker_env ? std::string(ker_env) : std::string("both");
+  SCTL_ASSERT_MSG(ker=="laplace"||ker=="stokes"||ker=="both", "QJ_GREENS_KER must be 'laplace','stokes','both'");
+  const bool do_lap = (ker != "stokes"), do_stk = (ker != "laplace");
+
+  if (!pid) std::cout << "\n=== on-surface Green's identity acceptance on the loaded network (direct, no solve) ===\n"
+                      << "  tol=" << std::setprecision(1) << (double)tol << "  kernels=" << ker
+                      << "  enclosing sphere r=" << std::setprecision(4) << rad << " => exterior src @ R_encl=" << R_encl << "\n"
+                      << "  " << (Xs_ext.Dim()/3) << " EXTERIOR sources (jump -1/2), "
+                      << (Xs_int.Dim()/3) << " INTERIOR sources (jump +1/2)\n";
+
+  // QJ_GREENS_DLONLY: run ONLY the constant-density DL identity (both ext -1/2 and int +1/2 formulations,
+  // reported together by test_DLIdentity) for the requested kernel(s), then return -- no Green's third
+  // identity. This is the cheap geometry-floor gate (watertightness ran before the mode switch): a single
+  // forward DL apply per kernel, so Laplace fits on far fewer nodes than the Stokes Green's sweep.
+  if (std::getenv("QJ_GREENS_DLONLY")) {
+    // QJ_GREENS_DUMP=<prefix>: also write <prefix>-<ker>-{junc,arms}.vtu colored by the per-target DL error,
+    // for a ParaView spatial map. test_DLIdentity always prints the MPI-safe global top-20 error nodes.
+    const char* dp = std::getenv("QJ_GREENS_DUMP");
+    const std::string dbase = dp ? std::string(dp) : std::string();
+    if (do_lap) {
+      if (!pid) std::cout << "\n--- Laplace DL const-density identity (ext -1/2 & int +1/2) ---" << std::endl;
+      test_DLIdentity<Real, Laplace3D_DxU>(junc, arms, comm, tol, dbase.empty()?"":dbase+"-lap");
+    }
+    if (do_stk) {
+      if (!pid) std::cout << "\n--- Stokes DL const-density identity (ext -1/2 & int +1/2) ---" << std::endl;
+      test_DLIdentity<Real, Stokes3D_DxU>(junc, arms, comm, tol, dbase.empty()?"":dbase+"-stk");
+    }
+    return;
+  }
+
+  const Real J_EXT = (Real)-0.5, J_INT = (Real)-1.5;   // BIOp returns PV DL; add the interior/exterior jump
+  const bool warm = std::getenv("QJ_GREENS_WARMUP");   // default: skip the benchmark warm-up (halves cost)
+  if (do_lap) {
+    if (!pid) std::cout << "\n--- Laplace DL const-density identity (closed outward surface -> -1/2) ---" << std::endl;
+    test_DLIdentity<Real, Laplace3D_DxU>(junc, arms, comm, tol);
+    if (!pid) std::cout << "\n--- Laplace, EXTERIOR source ---" << std::endl;
+    test_greens_identity<Real, Laplace3D_FxU, Laplace3D_DxU, Laplace3D_FxdU>(junc, arms, comm, tol, Xs_ext, "", J_EXT, warm);
+    if (!pid) std::cout << "\n--- Laplace, INTERIOR source ---" << std::endl;
+    test_greens_identity<Real, Laplace3D_FxU, Laplace3D_DxU, Laplace3D_FxdU>(junc, arms, comm, tol, Xs_int, "", J_INT, warm);
+  }
+  if (do_stk) {
+    if (!pid) std::cout << "\n--- Stokes, EXTERIOR source ---" << std::endl;
+    test_greens_identity<Real, Stokes3D_FxU, Stokes3D_DxU, Stokes3D_FxT>(junc, arms, comm, tol, Xs_ext, "", J_EXT, warm);
+    if (!pid) std::cout << "\n--- Stokes, INTERIOR source ---" << std::endl;
+    test_greens_identity<Real, Stokes3D_FxU, Stokes3D_DxU, Stokes3D_FxT>(junc, arms, comm, tol, Xs_int, "", J_INT, warm);
+  }
+}
+
 } // anonymous namespace
 
 int main(int argc, char** argv) {
@@ -109,13 +379,13 @@ int main(int argc, char** argv) {
     const Comm comm = Comm::World();
     const Integer Np = comm.Size(), pid = comm.Rank();
 
-    const std::string prefix = (argc > 1) ? std::string(argv[1]) : std::string("vis/network");
+    const std::string prefix = (argc > 1) ? std::string(argv[1]) : std::string("geom/netfix");
     const Real    tol     = (argc > 2) ? (Real)atof(argv[2]) : (Real)1e-7;
     const Real    p_in    = (argc > 3) ? (Real)atof(argv[3]) : (Real)10;   // total inflow flux magnitude
     const Integer cov_q   = (argc > 4) ? (Integer)atoi(argv[4]) : 6;
     const Integer Nbeta   = (argc > 5) ? (Integer)atoi(argv[5]) : 200;
     const Integer maxdep  = (argc > 6) ? (Integer)atoi(argv[6]) : 12;
-    const Long    gmaxit  = (argc > 7) ? (Long)atoi(argv[7]) : 800;
+    const Long    gmaxit  = (argc > 7) ? (Long)atoi(argv[7]) : 60000;
     const Long    Nvis    = (argc > 8) ? (Long)atoi(argv[8]) : 0;          // junction-box per-axis samples; 0 => cbrt(Ngrid)
     const Long    Ngrid   = (argc > 9) ? (Long)atoi(argv[9]) : 200;
 
@@ -197,6 +467,28 @@ int main(int argc, char** argv) {
     }
 
     // ----------------------------------------------------------------------------------------------
+    // (2b) QJ_GEOM_SCALE: uniform similarity scale of the WHOLE assembled network. A pure similarity
+    //     multiplies every LENGTH by s -- junction-body node coords, arm centerline coords, and the arm
+    //     cross-section radius -- but leaves the unit cross-section orientation frame (a_orient) alone
+    //     (it is a direction, not a length). The surface is exactly self-similar, so every normal is
+    //     unchanged, area -> s^2*area, and the watertightness residual |int n dA| (units of area) ->
+    //     s^2 * (original). At s=0.1 that is 1/100 of the s=1 floor -- confirming the loose watertight
+    //     value is the large surface AREA, not a geometric gap. Also scale the viz centroid/bounding
+    //     radius and the cap frames so a downstream solve stays consistent.
+    // ----------------------------------------------------------------------------------------------
+    const Real gscale = std::getenv("QJ_GEOM_SCALE") ? (Real)atof(std::getenv("QJ_GEOM_SCALE")) : (Real)1;
+    if (gscale != (Real)1) {
+      for (Long m = 0; m < Xjunc_all.Dim(); m++) Xjunc_all[m] *= gscale;
+      for (Long m = 0; m < a_coord.Dim();   m++) a_coord[m]   *= gscale;
+      for (Long m = 0; m < a_radius.Dim();  m++) a_radius[m]  *= gscale;
+      for (Long m = 0; m < jctr.Dim();      m++) jctr[m]      *= gscale;
+      for (size_t m = 0; m < jhalf.size();  m++) jhalf[m]     *= gscale;
+      for (size_t m = 0; m < caps.size();   m++) { caps[m].C = mul3(gscale, caps[m].C); caps[m].R0 *= gscale; }
+      if (!pid) std::cout << "  [QJ_GEOM_SCALE] uniform similarity scale s=" << (double)gscale
+                          << " applied (lengths & radii x s; orientation frame unchanged)\n";
+    }
+
+    // ----------------------------------------------------------------------------------------------
     // (3) Build the coupled MPI-partitioned lists. QuadElemList(order,coord,comm) keeps this rank's
     //     element slice; slice the slender panels the same way HybridAssembly::slender does.
     // ----------------------------------------------------------------------------------------------
@@ -234,8 +526,22 @@ int main(int argc, char** argv) {
     // the geometry loads/closes before committing a multi-node PVFMM solve).
     if (std::getenv("QJ_GEOM_ONLY")) { if (!pid) std::cout << "\n[QJ_GEOM_ONLY] geometry loaded + checked; skipping solve.\n"; Comm::MPI_Finalize(); return 0; }
 
+    // Mode select (QJ_NET_MODE, default "flow"). "manufactured"/"mfg" runs the analytic-field
+    // acceptance sweep on the SAME coupled operator instead of the physical flow BVP below.
+    const char* mode_env = std::getenv("QJ_NET_MODE");
+    const std::string mode = mode_env ? std::string(mode_env) : std::string("flow");
+    if (mode == "manufactured" || mode == "mfg") {
+      run_network_manufactured(junc, arms, a_coord, comm, tol, gmaxit, order, cheb, fourier);
+      Comm::MPI_Finalize(); return 0;
+    }
+    if (mode == "greens") {
+      run_network_greens(junc, arms, a_coord, comm, tol);
+      Comm::MPI_Finalize(); return 0;
+    }
+    SCTL_ASSERT_MSG(mode == "flow", "QJ_NET_MODE must be 'flow' (default), 'manufactured'/'mfg', or 'greens'");
+
     // ----------------------------------------------------------------------------------------------
-    // (4) Assign inflow/outflow ports (connectivity: every leaf cap is a port).
+    // (4) [flow mode] Assign inflow/outflow ports (connectivity: every leaf cap is a port).
     //     default: single inflow = extreme-axis cap; QJ_INFLOW_NODES overrides (graph node ids).
     //     outflow split: equal, or QJ_OUTFLOW_FLUX relative weights; normalized so net flux = 0.
     // ----------------------------------------------------------------------------------------------
@@ -340,10 +646,41 @@ int main(int argc, char** argv) {
     // ----------------------------------------------------------------------------------------------
     // (8) Solve the interior Stokes Dirichlet BVP (SL=-1, DL=+1 => jump -1/2) + evaluate at the cloud.
     // ----------------------------------------------------------------------------------------------
+    // CSBQ well-conditioned per-node single-layer scaling on the slender arms (Malhotra-Barnett 2024,
+    // Eq. 33): replace the constant arm SL coefficient with eta(s)=1/(2*eps*log(1/eps)) so the combined
+    // field stays O(1)-conditioned as the tube radius eps->0. Env-gated (default OFF -> results identical):
+    //   QJ_SLENDER_SCALING=1   enable
+    //   QJ_SLENDER_EPS_MAX=<r> slender-regime cutoff (default 0.1); nodes with eps>cutoff keep SL_scal.
+    // Computed ONCE here from each arm node's radius; solve_dirichlet_bvp multiplies it into the arm slice
+    // of the density once per GMRES iteration.
+    Vector<Real> arm_sl_eta;                                          // empty => scaling OFF
+    {
+      const char* sbenv = std::getenv("QJ_SLENDER_SCALING");
+      if (sbenv && atoi(sbenv) != 0) {
+        const char* emenv = std::getenv("QJ_SLENDER_EPS_MAX");
+        const Real eps_max = emenv ? (Real)atof(emenv) : (Real)0.1;
+        quad_junctions::arm_slender_sl_eta<Real>(arms, cheb, arm_sl_eta, eps_max);
+        // Diagnostics: how many arm nodes fall in the slender regime, and the eta range applied.
+        Long n_scaled = 0; Real emin = 1e300, emax = 0;
+        for (Long i = 0; i < arm_sl_eta.Dim(); i++) if (arm_sl_eta[i] > 0) { n_scaled++; emin = std::min(emin, (Real)arm_sl_eta[i]); emax = std::max(emax, (Real)arm_sl_eta[i]); }
+        const Long n_arm = arm_sl_eta.Dim();
+        const long g_scaled = (long)GlobalReduce((double)n_scaled, comm, CommOp::SUM);
+        const long g_arm    = (long)GlobalReduce((double)n_arm,    comm, CommOp::SUM);
+        const double g_emin = (n_scaled ? GlobalReduce((double)emin, comm, CommOp::MIN) : GlobalReduce(1e300, comm, CommOp::MIN));
+        const double g_emax = GlobalReduce((double)emax, comm, CommOp::MAX);
+        if (!pid)
+          std::cout << "  [slender-scaling] ON  eps_max=" << (double)eps_max << "  scaled "
+                    << g_scaled << " / " << g_arm << " arm nodes  eta in ["
+                    << (g_scaled ? g_emin : 0.0) << ", " << g_emax << "]\n";
+      } else if (!pid) {
+        std::cout << "  [slender-scaling] OFF (set QJ_SLENDER_SCALING=1 to enable CSBQ Eq.33 arm SL scaling)\n";
+      }
+    }
     Vector<Real> Ugrid;
     const Vector<Real> sigma = solve_dirichlet_bvp<Real, Stokes3D_FxU, Stokes3D_DxU>(
         junc, arms, comm, tol, bc, /*interior=*/true, /*SL_scal=*/(Real)-1., /*DL_scal=*/(Real)1.,
-        Xgrid, &Ugrid, "network inflow/outflow", /*gmres_max_iter=*/gmaxit);
+        Xgrid, &Ugrid, "network inflow/outflow", /*gmres_max_iter=*/gmaxit,
+        /*precond=*/nullptr, /*arm_sl_eta=*/arm_sl_eta);
 
     // ----------------------------------------------------------------------------------------------
     // (9) Interior filter (Laplace DL const-density indicator ~ -1 interior / ~0 exterior) + output.
