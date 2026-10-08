@@ -78,31 +78,35 @@ export NTASK=$((${SLURM_NNODES}*${SLURM_NTASKS_PER_NODE}))
 NCORE=$((NTASK*OMP_NUM_THREADS))
 
 # ---- manufactured mode + sweep parameters (ONE source of truth: log header + mpirun line). The bundle
-# ---- bakes in order 12 / cheb 10 / fourier 24; only the quadrature tol below is swept. The tol list
-# ---- brackets the ~1e-6 watertightness floor and probes a few magnitudes below it.
+# ---- bakes in order 12 / cheb 10 / fourier 24 (same discretization as submit-network-greens.sh's
+# ---- production baseline, assembled with CLI params "12 1 1.5 0.4 3 12 10 24"); only the quadrature tol
+# ---- below is swept. The tol list brackets the ~1e-6 watertightness floor and probes a few magnitudes below.
 export QJ_NET_MODE=manufactured
 # mfg-int ONLY: the interior-source exterior problem (mfg-ext) is far worse conditioned (thousands of GMRES
 # iters at eta=1) and starved the previous sweep at the 12h wall limit -- run it separately if needed.
 export QJ_MFG_ONLY=${QJ_MFG_ONLY:-int}
 # Skip 1e-4 and 1e-5: mfg-int at those tols already completed in job 7016918 (rel-L2 6.33e-4, 1.66e-4).
 export QJ_MFG_TOLS=${QJ_MFG_TOLS:-1e-6,1e-7,1e-8}
+# GMRES stop tol, DECOUPLED from the swept near-eval tol (new QJ_MFG_GMRES_TOL knob; unset => the historical
+# tol*10). Pinned to 1e-3 here so the Krylov solve stops at a loose tolerance regardless of the quadrature tol.
+export QJ_MFG_GMRES_TOL=${QJ_MFG_GMRES_TOL:-1e-3}
 export QJ_MFG_NLON=${QJ_MFG_NLON:-8}         # exterior-source sphere grid (~8x8 => ~64 sources)
 export QJ_MFG_NLAT=${QJ_MFG_NLAT:-8}
 export QJ_MFG_JITTER=${QJ_MFG_JITTER:-0.02}  # per-source random offset as a fraction of R_encl
 export QJ_MFG_SEED=${QJ_MFG_SEED:-12345}
 # The positional tol below is only the single-value fallback (QJ_MFG_TOLS drives the sweep); p_in unused.
 TOL=1e-7 ; PIN=10 ; NBETA=100 ; MAXD=8 ; COVQ=6
-GMAXIT=60000            # tight-tol solves on the ~22M-DOF network -- cap high (default is already 60000)
+GMAXIT=5000             # GMRES max iters (>=5000); at the 1e-3 stop tol the mfg-int solve converges well inside this
 NVIS=0 ; NGRID=0        # viz cloud unused in manufactured mode
 
 echo "======== layout: ${SLURM_NNODES} node(s) x ${SLURM_NTASKS_PER_NODE} ranks x ${OMP_NUM_THREADS}" \
      "threads = ${NTASK} ranks / ${NCORE} cores ========"
 echo "======== network manufactured: bundles ${PREFIX} | tests ${QJ_MFG_ONLY} | tols ${QJ_MFG_TOLS} | sphere ${QJ_MFG_NLON}x${QJ_MFG_NLAT}" \
-     "jitter ${QJ_MFG_JITTER} seed ${QJ_MFG_SEED} | gmres_max_iter ${GMAXIT} ========"
+     "jitter ${QJ_MFG_JITTER} seed ${QJ_MFG_SEED} | gmres_tol ${QJ_MFG_GMRES_TOL} gmres_max_iter ${GMAXIT} ========"
 
 # Args: bundle_prefix tol p_in cov_q Nbeta max_depth gmres_max_iter Nvis Ngrid
 mpirun -n ${NTASK} --map-by slot:pe=${OMP_NUM_THREADS} \
-    -x QJ_NET_MODE -x QJ_MFG_ONLY -x QJ_MFG_TOLS -x QJ_MFG_NLON -x QJ_MFG_NLAT -x QJ_MFG_JITTER -x QJ_MFG_SEED -x PVFMM_DIR \
+    -x QJ_NET_MODE -x QJ_MFG_ONLY -x QJ_MFG_TOLS -x QJ_MFG_GMRES_TOL -x QJ_MFG_NLON -x QJ_MFG_NLAT -x QJ_MFG_JITTER -x QJ_MFG_SEED -x PVFMM_DIR \
     ./bin/bifurc-network-flow-bie \
     ${PREFIX} ${TOL} ${PIN} ${COVQ} ${NBETA} ${MAXD} ${GMAXIT} ${NVIS} ${NGRID} 2>&1
 

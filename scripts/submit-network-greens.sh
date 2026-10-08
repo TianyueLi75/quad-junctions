@@ -60,7 +60,9 @@
 # (that reaches ~1e-7 at tol=1e-9 even on sheared panels) but GEOMETRY CONFORMITY: the hybrid surface is
 # flux-closed (~1e-9) yet not pointwise C^1 at the junction<->arm seams, and arms can near-touch/self-fold --
 # both LOCAL and refinement-insensitive. A single hotspot rings a seam edge; a mirrored PAIR marks a
-# near-touch / self-fold. Set QJ_GREENS_DUMP=<prefix> to ALSO write <prefix>-<ker>-{junc,arms}.vtu.
+# near-touch / self-fold. Set QJ_GREENS_DUMP=<prefix> to ALSO write VTUs; WHICH error it colors depends on
+# QJ_GREENS_DLONLY: DLONLY set => <prefix>-<ker>-{junc,arms}.vtu colored by the DL const-density error;
+# DLONLY unset (full Green's run) => <prefix>-<ker>-<ext|int>-{junc,arms}.vtu colored by the Green's error.
 
 #SBATCH --job-name=network-greens
 #SBATCH --nodes=4

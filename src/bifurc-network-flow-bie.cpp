@@ -166,6 +166,9 @@ void run_network_manufactured(const QuadElemList<Real>& junc, const SlenderElemL
   const Integer Nlat = std::getenv("QJ_MFG_NLAT") ? (Integer)atoi(std::getenv("QJ_MFG_NLAT")) : 8;
   const Real jitter  = std::getenv("QJ_MFG_JITTER") ? (Real)atof(std::getenv("QJ_MFG_JITTER")) : (Real)0.02;
   const long seed    = std::getenv("QJ_MFG_SEED") ? atol(std::getenv("QJ_MFG_SEED")) : 12345L;
+  // GMRES stop tol, decoupled from the swept quadrature tol. Default (<=0) keeps test_manufactured's
+  // historical tol*10; set QJ_MFG_GMRES_TOL to pin the Krylov tolerance regardless of the near-eval tol.
+  const Real gmres_tol = std::getenv("QJ_MFG_GMRES_TOL") ? (Real)atof(std::getenv("QJ_MFG_GMRES_TOL")) : (Real)-1;
   // Sweep list: QJ_MFG_TOLS if set, else a default sweep bracketing the ~1e-6 floor and probing below.
   // (The CLI positional tol is not used to drive the sweep -- it always has a default; kept for signature
   // stability and as a last-resort single value only if the default list is ever emptied.)
@@ -249,6 +252,12 @@ void run_network_manufactured(const QuadElemList<Real>& junc, const SlenderElemL
   const bool do_int = (only != "ext"), do_ext = (only != "int");
   if (!pid) std::cout << "  QJ_MFG_ONLY=" << only << " -> running "
                       << (do_int ? "mfg-int " : "") << (do_ext ? "mfg-ext" : "") << "\n";
+  if (!pid) {
+    std::cout << "  GMRES stop tol = ";
+    if (gmres_tol > (Real)0) std::cout << "QJ_MFG_GMRES_TOL " << std::setprecision(1) << (double)gmres_tol;
+    else                     std::cout << "tol*10 (default, per swept tol)";
+    std::cout << "  (max_iter=" << gmaxit << ")\n";
+  }
 
   std::vector<Real> r1(tols.size(), (Real)-1), r2(tols.size(), (Real)-1);
   for (size_t it = 0; it < tols.size(); it++) {
@@ -256,10 +265,10 @@ void run_network_manufactured(const QuadElemList<Real>& junc, const SlenderElemL
     if (!pid) std::cout << "\n----- tol = " << std::setprecision(1) << (double)tl << " -----\n";
     if (do_int)
       r1[it] = test_manufactured<Real, Stokes3D_FxU, Stokes3D_DxU>(junc, arms, comm, tl, Xs_ext, Fs_ext,
-                   /*interior=*/true,  Xt_int, /*SL_scal=*/(Real)-1., /*DL_scal=*/(Real)1., "mfg-int", gmaxit);
+                   /*interior=*/true,  Xt_int, /*SL_scal=*/(Real)-1., /*DL_scal=*/(Real)1., "mfg-int", gmaxit, gmres_tol);
     if (do_ext)
       r2[it] = test_manufactured<Real, Stokes3D_FxU, Stokes3D_DxU>(junc, arms, comm, tl, Xs_int, Fs_int,
-                   /*interior=*/false, Xt_ext, /*SL_scal=*/(Real) 1., /*DL_scal=*/(Real)1., "mfg-ext", gmaxit);
+                   /*interior=*/false, Xt_ext, /*SL_scal=*/(Real) 1., /*DL_scal=*/(Real)1., "mfg-ext", gmaxit, gmres_tol);
   }
 
   if (!pid) {
@@ -355,19 +364,27 @@ void run_network_greens(const QuadElemList<Real>& junc, const SlenderElemList<Re
 
   const Real J_EXT = (Real)-0.5, J_INT = (Real)-1.5;   // BIOp returns PV DL; add the interior/exterior jump
   const bool warm = std::getenv("QJ_GREENS_WARMUP");   // default: skip the benchmark warm-up (halves cost)
+  // QJ_GREENS_DUMP=<prefix> (full-Green's path only): write <prefix>-<ker>-<ext|int>-{junc,arms}.vtu colored by
+  // the per-target Green's error, one pair per (kernel, source) config so none overwrites another. The DLONLY
+  // branch above instead dumps the DL const-density error (unchanged) and never reaches here.
+  const char* gdp = std::getenv("QJ_GREENS_DUMP");
+  const std::string gbase = gdp ? std::string(gdp) : std::string();
+  const auto gtag = [&gbase](const std::string& suf) {
+    return gbase.empty() ? std::string() : gbase + suf;
+  };
   if (do_lap) {
     if (!pid) std::cout << "\n--- Laplace DL const-density identity (closed outward surface -> -1/2) ---" << std::endl;
     test_DLIdentity<Real, Laplace3D_DxU>(junc, arms, comm, tol);
     if (!pid) std::cout << "\n--- Laplace, EXTERIOR source ---" << std::endl;
-    test_greens_identity<Real, Laplace3D_FxU, Laplace3D_DxU, Laplace3D_FxdU>(junc, arms, comm, tol, Xs_ext, "", J_EXT, warm);
+    test_greens_identity<Real, Laplace3D_FxU, Laplace3D_DxU, Laplace3D_FxdU>(junc, arms, comm, tol, Xs_ext, gtag("-lap-ext"), J_EXT, warm);
     if (!pid) std::cout << "\n--- Laplace, INTERIOR source ---" << std::endl;
-    test_greens_identity<Real, Laplace3D_FxU, Laplace3D_DxU, Laplace3D_FxdU>(junc, arms, comm, tol, Xs_int, "", J_INT, warm);
+    test_greens_identity<Real, Laplace3D_FxU, Laplace3D_DxU, Laplace3D_FxdU>(junc, arms, comm, tol, Xs_int, gtag("-lap-int"), J_INT, warm);
   }
   if (do_stk) {
     if (!pid) std::cout << "\n--- Stokes, EXTERIOR source ---" << std::endl;
-    test_greens_identity<Real, Stokes3D_FxU, Stokes3D_DxU, Stokes3D_FxT>(junc, arms, comm, tol, Xs_ext, "", J_EXT, warm);
+    test_greens_identity<Real, Stokes3D_FxU, Stokes3D_DxU, Stokes3D_FxT>(junc, arms, comm, tol, Xs_ext, gtag("-stk-ext"), J_EXT, warm);
     if (!pid) std::cout << "\n--- Stokes, INTERIOR source ---" << std::endl;
-    test_greens_identity<Real, Stokes3D_FxU, Stokes3D_DxU, Stokes3D_FxT>(junc, arms, comm, tol, Xs_int, "", J_INT, warm);
+    test_greens_identity<Real, Stokes3D_FxU, Stokes3D_DxU, Stokes3D_FxT>(junc, arms, comm, tol, Xs_int, gtag("-stk-int"), J_INT, warm);
   }
 }
 

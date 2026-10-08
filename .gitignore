@@ -36,6 +36,9 @@ __pycache__/
 # markdown docs (keep README.md tracked)
 *.md
 !README.md
+# Claude Code agent definitions are shared project config (override the *.md rule)
+!.claude/agents/
+!.claude/agents/*.md
 
 # LaTeX sources
 *.tex

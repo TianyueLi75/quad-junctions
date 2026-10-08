@@ -172,7 +172,8 @@ void test_DLIdentity(const QuadElemList<Real>& junc, const ArmList& arms, const 
 //      EVERY source. M=1 is byte-identical to a single-source run (same drand48 draw sequence). ----
 template <class Real, class KerSL, class KerDL, class KerGrad, class ArmList>
 void test_greens_identity(const QuadElemList<Real>& junc, const ArmList& arms,
-                          const Comm& comm, const Real tol, const Vector<Real> X0, const std::string& dump_tag = "") {
+                          const Comm& comm, const Real tol, const Vector<Real> X0, const std::string& dump_tag = "",
+                          const Real jump = (Real)-0.5, const bool warmup = true) {
   static constexpr Integer CDIM = 3;
   KerSL ksl; KerDL kdl; KerGrad kgr;
   BoundaryIntegralOp<Real,KerSL> BIOpSL(ksl, false, comm); BoundaryIntegralOp<Real,KerDL> BIOpDL(kdl, false, comm);
@@ -197,12 +198,15 @@ void test_greens_identity(const QuadElemList<Real>& junc, const ArmList& arms,
     }
     Fd = Uref; Fs.ReInit(N*KDIM0);
     for (Long i = 0; i < N; i++) for (Integer j = 0; j < KDIM0; j++) { Real d=0; for (Long k=0;k<CDIM;k++) d += dU[(i*KDIM0+j)*CDIM+k]*Xn[i*CDIM+k]; Fs[i*KDIM0+j]=d; } }
-  // Warm-up run (warms caches/allocations), then clear setup so the timed run re-measures Setup+Eval
-  BIOpSL.ComputePotential(Us, Fs);
-  BIOpDL.ComputePotential(Ud, Fd);
-  BIOpSL.ClearSetup();
-  BIOpDL.ClearSetup();
-  Us = 0; Ud = 0;
+  // Warm-up run (warms caches/allocations), then clear setup so the timed run re-measures Setup+Eval.
+  // Skipped when warmup=false (halves cost); the timed region then absorbs the first-call setup.
+  if (warmup) {
+    BIOpSL.ComputePotential(Us, Fs);
+    BIOpDL.ComputePotential(Ud, Fd);
+    BIOpSL.ClearSetup();
+    BIOpDL.ClearSetup();
+    Us = 0; Ud = 0;
+  }
 
   Profile::Enable(true);
   Profile::reset();   // clear warm-up counters so only the timed Setup+Eval region is reported
@@ -212,7 +216,7 @@ void test_greens_identity(const QuadElemList<Real>& junc, const ArmList& arms,
   Profile::Toc();
   Profile::print(&comm, {"t_avg", "f/s_avg"});
   Profile::reset();
-  Ud -= 0.5*Fd;
+  Ud += jump*Fd;   // BIOp returns PV DL; add the on-surface jump (default -1/2 reproduces the old -0.5*Fd)
   Vector<Real> Uerr = (Us - Ud) - Uref;
   Real me = 0, mv = 0; for (auto x : Uerr) me = std::max<Real>(me, std::fabs(x)); for (auto x : Uref) mv = std::max<Real>(mv, std::fabs(x));
   me = GlobalReduce((double)me, comm, CommOp::MAX);   // local slices -> global max error / value
@@ -255,7 +259,7 @@ Real test_manufactured(const QuadElemList<Real>& junc, const ArmList& arms, cons
                        const Real tol, const Vector<Real>& Xsrc, const Vector<Real>& Fsrc,
                        const bool interior, const Vector<Real>& Xtrg,
                        Real SL_scal, Real DL_scal, const std::string& name,
-                       const Long gmres_max_iter = 400) {
+                       const Long gmres_max_iter = 400, const Real gmres_tol_override = (Real)-1) {
   // The solve runs through StokesBIO, which hardcodes the Stokes3D kernel family; KerSL/KerDL stay in the
   // signature because callers name them explicitly and ker_sl still supplies the exact reference field.
   static_assert(std::is_same<KerSL, Stokes3D_FxU>::value && std::is_same<KerDL, Stokes3D_DxU>::value,
@@ -296,7 +300,9 @@ Real test_manufactured(const QuadElemList<Real>& junc, const ArmList& arms, cons
   KrylovPrecond<Real> krylov;
   Vector<Real> sigma;
   Long iter = 0;
-  const Real gmres_tol = tol * (Real)10;
+  // GMRES stop tol: caller override (>0) when the Krylov tolerance must be decoupled from the quadrature
+  // tol (e.g. a loose 1e-3 solve against a tight near-eval); otherwise the historical tol*10.
+  const Real gmres_tol = (gmres_tol_override > (Real)0) ? gmres_tol_override : tol * (Real)10;
   Profile::Enable(true); Profile::reset();
   Profile::Tic("gmres solve", &comm);
   solver(&sigma, ApplyK, bc, gmres_tol, gmres_max_iter, false, &iter, &krylov);
