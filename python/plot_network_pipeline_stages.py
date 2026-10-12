@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Truthful per-stage visuals of the arm-centerline construction for a node chain.
 All plotted curves/points are read from the C++ per-stage dump (STAGES) and the .graph;
-nothing is re-implemented (no Taubin/spline/Hermite math here).  Only finite-difference
-diagnostics of dumped points (labelled) are computed.  Theory: obj_to_quadrature_methods.tex
+nothing is re-implemented (no Taubin/spline/Hermite math here).  Only simple
+diagnostics of dumped points (three-point circumradius rho, |dx|; labelled) are computed.  Theory: obj_to_quadrature_methods.tex
 sec:smooth (curv-limit, Taubin eq:taubin1/2), sec:centerline (Hermite eq:hermite, tridiag
 eq:tridiag, spline eq:spline), sec:taper.
 
@@ -83,7 +83,7 @@ def parse_stages(path, tags):
 
 
 def rho_fd(P):
-    """diagnostic (finite-diff of dumped points): circumradius of consecutive triples; arclength s."""
+    """diagnostic: three-point (Menger) circumradius of consecutive dumped points; s = cumulative chord length."""
     d = np.linalg.norm(np.diff(P, axis=0), axis=1); s = np.r_[0, np.cumsum(d)]
     a, b, c = d[:-1], d[1:], np.linalg.norm(P[2:] - P[:-2], axis=1)
     cr = np.linalg.norm(np.cross(P[1:-1] - P[:-2], P[2:] - P[1:-1]), axis=1)
@@ -180,7 +180,7 @@ def plot_chain(chain, nodes, edges, st, path, title):
         a2.semilogy(*rr["raw"], "-", c=C_RAW, lw=0.8, label="raw knots"); a2.semilogy(*rr["lowpass"], "-", c=C_LOW, lw=0.9, label="lowpass knots")
         a2.semilogy(*rr["final"], "-", c=col, lw=1.2, label="final meshed")
         a2.axhline(c["rA"], c="k", ls=":", lw=0.8, label="rA (tube radius)")
-        a2.set_title("diagnostic (finite-diff of dumped points): curvature radius rho(s)\nsource: STAGE raw / lowpass / final", fontsize=8); a2.set_ylabel("rho"); a2.legend(fontsize=6)
+        a2.set_title("diagnostic (three-point Menger circumradius of dumped points): rho(s)\nsource: STAGE raw / lowpass / final", fontsize=8); a2.set_ylabel("rho"); a2.legend(fontsize=6)
         a3.plot(np.linspace(0, c["S"], len(d["raw"])), A["gr"], "-o", c=C_RAW, ms=2, lw=0.8, label="raw per-knot Radius (.graph, uniform R_fix)")
         sf = np.r_[0, np.cumsum(np.linalg.norm(np.diff(d["final"][:, :3], axis=0), axis=1))]
         a3.plot(sf, d["final"][:, 3], "-", c=col, lw=1.4, label="final r (STAGE final r=)")
