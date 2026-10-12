@@ -188,7 +188,14 @@ def plot_chain(chain, nodes, edges, st, path, title):
         a3.set_title("radius: raw -> final (QJ_RADIUS_SCALE & taper, sec:taper)\nraw s axis = uniform stand-in (raw knot index scaled to S)", fontsize=8)
         a3.set_ylabel("r"); a3.legend(fontsize=6); a3.set_ylim(0, 1.15 * max(A["gr"].max(), d["final"][:, 3].max()))
         kn = d["spline_knots"]; a4.plot(sk, np.linalg.norm(kn[:, 4:7], axis=1), "-o", c=C_LOW, ms=2, lw=0.9)
-        a4.set_ylabel("|M_i|"); a4.set_title("C2 natural-cubic knots: |M_i| (2nd-deriv coeff, M_0=M_n-1=0)\n[STAGE spline_knots M=; eq:tridiag]; s = chord arclength", fontsize=8)
+        X, Mm = kn[:, :3], kn[:, 4:7]; h = np.diff(sk)
+        lhs = h[:-1, None] * Mm[:-2] + 2 * (h[:-1] + h[1:])[:, None] * Mm[1:-1] + h[1:, None] * Mm[2:]
+        rhs = 6 * ((X[2:] - X[1:-1]) / h[1:, None] - (X[1:-1] - X[:-2]) / h[:-1, None])
+        res = np.abs(lhs - rhs).max()      # verifies the dumped M solve the tridiagonal system (eq:tridiag) for the dumped knots
+        a4.set_ylabel("|M_i|")
+        a4.set_title("C2 natural cubic, %d knots: max|M_i|=%.3g, |M_0|=%.0g, |M_n-1|=%.0g\n"
+                     "tridiag eq: h_(i-1)M_(i-1)+2(h_(i-1)+h_i)M_i+h_i M_(i+1)\n=6(dP_i/h_i - dP_(i-1)/h_(i-1)); max residual %.1e\n[STAGE spline_knots, eq:tridiag]"
+                     % (len(kn), np.linalg.norm(Mm, axis=1).max(), np.linalg.norm(Mm[0]), np.linalg.norm(Mm[-1]), res), fontsize=7)
         a4.set_xlabel("knot arclength s")
     fig.savefig(path, dpi=110, bbox_inches="tight"); plt.close(fig)
 

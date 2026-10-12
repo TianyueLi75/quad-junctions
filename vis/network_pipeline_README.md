@@ -18,3 +18,5 @@ Panels (columns = arms in chain order):
 Spot check: for all 6 arms of both chains, STAGE raw == .graph edge points (reversed when edge n0 != owner), max abs diff 0.0 over all points (first 3 also 0.0), printed by the script.
 
 Findings: curvature limiter changed knots only in j199-209, j243-331, j27-33 (a few knots); it is a no-op (identical to raw) in j209-243, j20-27, j33-39. Taubin low-pass moves knots by up to ~0.1 units everywhere but is visually indistinguishable from raw at figure scale in xy/xz. Radius: raw 2.0 (uniform R_fix) -> final 1.0 (QJ_RADIUS_SCALE 0.5); a visible taper only in j199-209 (~0.65->1.0, shrunken seam rA); no radius dip visible. Final r tracks the rA->rB line.
+
+Row 5 titles now carry the real dumped values (n knots, max|M_i|, |M_0|,|M_n-1| = 0 natural, and the max residual of the tridiagonal system h_(i-1)M_(i-1)+2(h_(i-1)+h_i)M_i+h_iM_(i+1)=6(...) evaluated on the dumped knots/s/M; ~1e-16 for all arms).
