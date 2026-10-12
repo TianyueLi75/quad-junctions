@@ -213,6 +213,9 @@ int main(int argc, char** argv) {
       if (!Ls.empty()) { std::sort(Ls.begin(), Ls.end());
         const size_t k10 = (size_t)std::floor(0.10*(double)(Ls.size()-1));
         if ((double)Ls[k10] > 1e-12) L10 = Ls[k10]; } }
+    // QJ_L10=<len>: pin the reference panel arclength (default unset => computed above, byte-identical). Lets a SUBSET
+    // graph reproduce the FULL network's panelization exactly (a subset re-derives L10 from its own edges).
+    if (const char* l10e = getenv("QJ_L10")) { const double v = atof(l10e); if (v > 1e-12) L10 = (Real)v; }
     const Real h_panel = L10 / (Real)std::max<Integer>(1, nAx);           // target panel arclength = 1 short-edge panel
     auto arm_narm = [&](const std::vector<Vec3<Real>>& cl)->Integer{      // per-arm n ~ arclength / h_panel, floored at nAx
       return std::max<Integer>(nAx, (Integer)std::lround((double)nAx * (double)arclen(cl) / (double)L10)); };
@@ -222,6 +225,7 @@ int main(int argc, char** argv) {
         setenv("QJ_ARM_BLEND_LEAD", leadbuf, 1); }
       if (!comm.Rank()) std::cout << "  [blend] length-adaptive n_axial: base " << nAx << " for the 10% shortest edges"
         << " (L10=" << (double)L10 << "), scaling ~ L/L10; coaxial lead = 1 panel = " << (double)h_panel << "\n";
+      if (!comm.Rank()) { char l10b[64]; snprintf(l10b, sizeof l10b, "%.17g", (double)L10); std::cout << "  [blend] L10 exact (feed to QJ_L10 for subset graphs) = " << l10b << "\n"; }
     }
     auto push_arm = [&](Integer owner, const ArmSeam<Real>& sA, const Vec3<Real>& endC, const Vec3<Real>& endTang,
                         const std::vector<Vec3<Real>>& cl, Real rA, Real rB, Integer other, bool is_cap,

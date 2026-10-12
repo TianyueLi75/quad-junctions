@@ -1573,6 +1573,45 @@ template <class Real> void append_centerline_fiber(const ArmSeam<Real>& seamA, c
       std::cout << "  [role-refine] x" << (long)role_refine << " span " << (long)role_span
                 << " => " << (long)(tk.size() - 1) << " panels (was " << (long)n << ")\n";
   }
+  // ---- Panel-SIZE GRADING (QJ_ARM_PANEL_GRADE=<R>, R>1; default OFF => tk untouched, bundle byte-identical).
+  // Turn-refine splits a bent panel into ceil(bend/6) equal sub-panels but leaves its straight neighbours at the
+  // full h_panel, so the arc length jumps by up to ~7x (and 24x cap) across one knot (e.g. 2.61 -> 0.37). The
+  // production DL hotspots (out/network-greens-7158497: all top-20 nodes, 5 sites) sit exactly on these long|short
+  // knots: the long panel carries a steep curvature RAMP (violating the toroidal rule's near-constant-curvature
+  // assumption) and its neighbour's near-quad sees a 7x smaller element. Remedy = 2:1-style BALANCING (as in an
+  // octree): repeatedly bisect (in t) any panel whose arc length exceeds R x its shorter neighbour until all
+  // neighbour ratios <= R. Same curve, same radius, same surface => closure-neutral; terminal knots 0/1 kept.
+  // Costs ~+5% arm panels at R=2 on n298. QJ_ARM_PANEL_GRADE_MAX bounds the sweeps (default 8).
+  if (const char* gre = std::getenv("QJ_ARM_PANEL_GRADE")) {
+    const double gR = std::atof(gre);
+    if (gR > 1.0 && (Integer)tk.size() >= 3) {
+      const Integer gmax = std::getenv("QJ_ARM_PANEL_GRADE_MAX") ? std::max<Integer>(1, (Integer)std::atoi(std::getenv("QJ_ARM_PANEL_GRADE_MAX"))) : (Integer)8;
+      auto plen = [&](Real ta, Real tb) -> double {
+        double s = 0; Vec3<Real> pp = curve(ta);
+        for (int q = 1; q <= 8; q++) { const Vec3<Real> pq = curve(ta + (tb - ta) * (Real)q / (Real)8); s += (double)nrm(sub(pq, pp)); pp = pq; }
+        return s; };
+      const size_t np0 = tk.size() - 1;
+      for (Integer sweep = 0; sweep < gmax; sweep++) {
+        const size_t np = tk.size() - 1;
+        std::vector<double> L(np);
+        for (size_t p = 0; p < np; p++) L[p] = plen(tk[p], tk[p + 1]);
+        std::vector<Real> tkn; tkn.reserve(tk.size() + 8);
+        bool changed = false;
+        for (size_t p = 0; p < np; p++) {
+          tkn.push_back(tk[p]);
+          double nbmin = 1e300;
+          if (p > 0) nbmin = std::min(nbmin, L[p - 1]);
+          if (p + 1 < np) nbmin = std::min(nbmin, L[p + 1]);
+          if (L[p] > gR * nbmin * 1.0001) { tkn.push_back((Real)0.5 * (tk[p] + tk[p + 1])); changed = true; }
+        }
+        tkn.push_back(tk.back());
+        tk.swap(tkn);
+        if (!changed) break;
+      }
+      if (std::getenv("QJ_CORNER"))
+        std::cout << "  [panel-grade] R=" << gR << " => " << (long)(tk.size() - 1) << " panels (was " << (long)np0 << ")\n";
+    }
+  }
   // ---- Panel-boundary DIRECTION-JUMP diagnostic (QJ_ARM_PANEL_DIAG): confirms whether the breaks sit at role
   // transitions. Reports the max inter-panel chord-tangent turn at ROLE knots vs at interior-RUN knots.
   if (std::getenv("QJ_ARM_PANEL_DIAG") && (Integer)tk.size() >= 3) {
