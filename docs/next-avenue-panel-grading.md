@@ -59,7 +59,7 @@ residual max moves to a new spot 4 radii off site 2 (112,-681,268) at ~2e-4, and
 Laplace Green's (subset, abs error ext/int): base 6.0e-4 / 5.6e-4 -> GRADE=2 9.2e-5 / 9.8e-5 (6x). Subset Green's
 sources differ from the full gate, so only the ratio is meaningful.
 FULL BUNDLE (built, geom/n298_tr6_grade2): COMBINED 0.0179 -> 0.0146 (rel 6.67e-8 -> ~5.5e-8); junc/arms minWt unchanged
-(5.08e-6 / 1.04e-4, Jac>0). Full DL/Green's NOT run (needs Slurm).
+(5.08e-6 / 1.04e-4, Jac>0). Full DL/Green's gate RAN (job 7223686) — see "full-network gate result" below.
 Order-independence: not re-tested; no order/fourier/tol was changed anywhere, geometry only.
 Caveats: subset numbers are from 4 of 5 faithful sites; R=2 is recommended (R=3 nearly as good, cheaper); the next
 floor (~2e-4 residual + junction 7e-5) will need cand. 1-3 or RADIUS_SCALE.
@@ -71,5 +71,42 @@ Gate: `sbatch scripts/submit-network-greens-grade2.sh` (DL only), `--export=ALL,
 `OMP_NUM_THREADS=8 mpirun -n 2 env QJ_NET_MODE=greens QJ_GREENS_DLONLY=1 QJ_GREENS_KER=laplace ./bin/bifurc-network-flow-bie geom/n298_tr6_grade2 1e-6`.
 Note: this checkout's test_DLIdentity prints only the argmax node (no top-20 [map]); set QJ_GREENS_DUMP=vis/g2 for the VTU map.
 
+## Full-network gate result (2026-10-12, out/network-greens-7223686.log, geom/n298_tr6_grade2, GRADE=2)
+
+GRADE=2 was validated on the FULL network (job 7223686), not just the subset:
+
+| metric | production (7158497) | grade2 (7223686) | verdict |
+|---|---|---|---|
+| arm panels (slender) | 18973 | 20093 (+5.9%) | cost |
+| COMBINED / rel closure | 0.0179 / 6.67e-8 | 0.01464 / ~5.5e-8 | slightly better |
+| DL const-density max rel err (max abs) | 1.328e-3 (6.64e-4) | 4.296e-4 (2.15e-4) | IMPROVED 3.1x (subset predicted 5.3x) |
+| Green's ext ("identity error", like-for-like) | 5.636e-4 | 1.64e-4 | improved 3.4x |
+| Green's int ("identity error") | 5.899e-5 | 7.90e-4 | NOT COMPARABLE (artifact, see below) |
+
+Note on format: this checkout's driver prints a "Green's identity error" (max-err/max|u|), not the rel-L2 the production
+4.6e-6/8.7e-6 came from (different build); the columns above are the like-for-like quantity, identical in format across
+logs 7158497 / 7198067 / 7202023 / 7223686.
+
+**Interior Green's is inconclusive, NOT a real regression.** The interior sources are stride-sampled arm-centerline NODES
+(stride = Ncen/36); grading changes Ncen, so the 36 sources physically MOVED between the two runs (the two source lists were
+verified to differ point by point) — the same pitfall the a16 run hit (int 5.8e-3). A one-off fixed-source cross-check on the
+hot5 subset (identical source points for both bundles) gave base 6.03e-4/5.58e-4 -> grade2 9.2e-5/6.0e-5 (interior ~9x BETTER),
+i.e. the full-net "13x worsening" is a source-set artifact. (That fixed-source tooling was a probe only and has been reverted;
+this route is not being pursued. A clean confirmation would require a full run with pinned interior sources.)
+
+**Localization (full net).** The driver prints only the argmax node (no top-20, no VTU dumped). The full max is 2.15e-4 abs at
+(-329,-382,369); the five baseline hotspot sites were 4.2e-4..6.6e-4 abs, so all five are now BELOW 2.15e-4 (subset: 3e-5..9e-5)
+— grade2 cleared them as intended. The new argmax is arm j296->300 panel 10/24 (a 2:1 knot, len 2.69|1.34, bends 5.1|3.9 deg),
+UNTOUCHED by grading (identical panels in both bundles) — a pre-existing site just below the baseline top-20 cutoff; a 1-junction
+faithful subset reproduces it exactly (base 4.2957e-4, GRADE=2 4.2876e-4). No new fold (junc/arms minWt unchanged 5.08e-6/1.04e-4)
+and no new long|short jump (all neighbour ratios <= 2 by construction). The C1 mismatch there is only ~0.03 deg (as at non-hot
+knots), so it is not a panel-join defect: the centerline curvature still oscillates over ~2-3 radii despite the 64 Taubin passes.
+
+**Verdict: GRADE=2 (R=2) is a KEEPER** — it removes the five size-jump hotspots (confirmed at the real sites and by the full-net
+max falling 3.1x to a different, pre-existing site), costs +5.9% panels, improves closure, and creates no fold. R=3 leaves ~1.5x
+more error; R<2 is degenerate for bisection. It does NOT reach the subset's 5.3x on the full net because the new floor (4.3e-4) is
+a DIFFERENT mechanism — curvature (dkappa/ds) noise on bent arms, independent of panel size. That next floor is diagnosed but not
+pursued here; seam coverage/overlap (cand. 1-3) remain not indicated since the remaining site is not at a mouth.
+
 ## Memory proposal (one line)
-"network panel grading: DL hotspots = turn-refine long|short panel-size knots (6-8x); QJ_ARM_PANEL_GRADE=2 (+5% panels) cut hot5 subset DL 1.33e-3 -> 2.5e-4; subset faithful via QJ_L10; full gate pending."
+"GRADE=2 full gate (7223686): DL 1.33e-3 -> 4.3e-4 (3.1x), closure ~5.5e-8, ext Green's 3.4x better, five baseline hotspots cleared, no new fold; int Green's NOT comparable (stride-sampled sources shift with node count); new floor = j296 curvature-noise knot (not panel size)."
