@@ -742,7 +742,7 @@ template <class Real> void append_centerline_fiber(const ArmSeam<Real>& seamA, c
       const bool allarms = (lps == "all");
       const bool on = allarms ? true : is_cap;
       Integer passes = allarms ? (Integer)12 : (Integer)std::atoi(lpe);
-      passes = std::getenv("QJ_ARM_CL_LOWPASS_PASSES") ? (Integer)std::atoi(std::getenv("QJ_ARM_CL_LOWPASS_PASSES")) : (Integer)64;   // QJ_ARM_CL_LOWPASS_PASSES: fixed to production 64 (was env; baked 2026-10-07 as the seamsettle_tr6 baseline)
+      passes = (Integer)64;   // QJ_ARM_CL_LOWPASS_PASSES: fixed to production 64 (was env; baked 2026-10-07 as the seamsettle_tr6 baseline)
       if (on && passes > 0 && cl_s.size() >= 5) {
         const Real lam = std::getenv("QJ_ARM_CL_LOWPASS_LAMBDA") ? (Real)std::atof(std::getenv("QJ_ARM_CL_LOWPASS_LAMBDA")) : (Real)0.5;
         const Real mu  = std::getenv("QJ_ARM_CL_LOWPASS_MU")     ? (Real)std::atof(std::getenv("QJ_ARM_CL_LOWPASS_MU"))     : (Real)-0.53;
