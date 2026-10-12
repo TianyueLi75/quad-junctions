@@ -28,6 +28,8 @@
 
 #include <quad_junctions/gen_junction_geom.hpp>
 #include <quad_junctions/ybifurc_assembly.hpp>
+#include <fstream>
+#include <iomanip>
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
@@ -418,8 +420,18 @@ template <class Real> void append_centerline_fiber(const ArmSeam<Real>& seamA, c
     bool constant_orient = false, Real lead_frac = (Real)0.18, Integer corner_panels = -1,
     Real turn_thresh_deg = (Real)20, std::vector<Vec3<Real>>* sampled_out = nullptr,
     std::vector<Vec3<Real>>* sampled_ref = nullptr, Vec3<Real> endE1 = Vec3<Real>{(Real)0,(Real)0,(Real)0},
-    bool is_cap = false, Vec3<Real>* out_termC = nullptr, Vec3<Real>* out_termU = nullptr) {
+    bool is_cap = false, Vec3<Real>* out_termC = nullptr, Vec3<Real>* out_termU = nullptr,
+    const char* dump_tag = nullptr) {
   using namespace gnet;
+  // ---- Opt-in, READ-ONLY per-stage centerline dump (QJ_DUMP_STAGES=<path>). Inert/byte-identical when
+  // unset or when the caller passes no tag. Snapshots the ACTUAL in-memory arrays at each centerline stage
+  // (raw vmtk knots -> curvature-limited -> Taubin low-pass -> C2 spline knots+coeffs -> lead/corner control
+  // geometry -> final meshed curve+radius) so a downstream reader can draw the process truthfully, with no
+  // Python re-implementation of the smoothing math. Diagnostic only; never changes the mesh.
+  const char* _qj_dsf = std::getenv("QJ_DUMP_STAGES");
+  const bool dbg = (_qj_dsf && _qj_dsf[0] && dump_tag);
+  std::vector<Vec3<Real>> dbg_raw, dbg_curv, dbg_lowpass;
+  if (dbg) dbg_raw = cl_in;
   Integer n = std::max<Integer>(6, n_axial);
   Integer lp = std::max<Integer>(1, lead_panels);
   Integer cp = (corner_panels > 0) ? corner_panels : lp;
@@ -710,6 +722,7 @@ template <class Real> void append_centerline_fiber(const ArmSeam<Real>& seamA, c
       bridge_end(false);   // recomputes arclength internally, so the far end sees the de-kinked front
     }
   }
+  if (dbg) dbg_curv = cl_s;   // snapshot after curvature-limiting (+bridge, default off), before low-pass
   if (blend) {
     // ---- Curvature-noise LOW-PASS (QJ_ARM_CL_LOWPASS, default off => cl_s unchanged). The rho-FLOOR limiter
     // (QJ_ARM_CL_SMOOTH) only pulls points where rho<target, so it cannot touch the high-frequency curvature
@@ -749,6 +762,7 @@ template <class Real> void append_centerline_fiber(const ArmSeam<Real>& seamA, c
                     << " x" << (long)passes << " passes on " << (long)n << " knots\n";
       }
     }
+    if (dbg) dbg_lowpass = cl_s;   // snapshot after Taubin low-pass, i.e. the knots the C2 spline interpolates
     // C2 centerline (QJ_ARM_C2_SPLINE, default off => byte-identical C1 centripetal CR). For caps the flag is
     // scoped to CAP arms only unless QJ_ARM_C2_SPLINE=all (interior arms are near-straight; their C1 knots are
     // absorbed). Removes the per-panel curvature-jump straddle on the curved cap body (the M8 hard rule).
@@ -1399,6 +1413,48 @@ template <class Real> void append_centerline_fiber(const ArmSeam<Real>& seamA, c
   // part of the ring dips ~1e-4 INSIDE the tube surface => the cross-list near-singular cap blow-up.
   if (out_termC) *out_termC = curve((Real)1);
   if (out_termU) *out_termU = tang(Ng);
+  // ---- QJ_DUMP_STAGES: emit every captured stage for this arm (append; keyed by dump_tag). READ-ONLY. ----
+  if (dbg) {
+    std::ofstream ds(_qj_dsf, std::ios::app);
+    if (ds) {
+      ds << std::setprecision(17);
+      ds << "# ARM " << dump_tag << " is_cap=" << (is_cap ? 1 : 0) << " blend=" << (blend ? 1 : 0)
+         << " seam_settle=" << (seam_settle ? 1 : 0) << "\n";
+      auto dump_pts = [&](const char* nm, const std::vector<Vec3<Real>>& P) {
+        ds << "STAGE " << nm << " n=" << P.size() << "\n";
+        for (const auto& p : P) ds << (double)p[0] << " " << (double)p[1] << " " << (double)p[2] << "\n";
+      };
+      dump_pts("raw", dbg_raw);                 // raw resampled vmtk knots (== .graph edge points)
+      dump_pts("curv_limited", dbg_curv);        // after QJ_ARM_CL_SMOOTH curvature limiter (+bridge)
+      dump_pts("lowpass", dbg_lowpass);          // after Taubin QJ_ARM_CL_LOWPASS; these are the C2 knots
+      // C2 natural-cubic-spline knots: position, cumulative arclength s, and 2nd-derivative coeff M (empty => C1)
+      ds << "STAGE spline_knots n=" << bcl.P.size() << "\n";
+      for (size_t k = 0; k < bcl.P.size(); k++)
+        ds << (double)bcl.P[k][0] << " " << (double)bcl.P[k][1] << " " << (double)bcl.P[k][2]
+           << " s=" << (double)(k < bcl.s.size() ? bcl.s[k] : (Real)0)
+           << " M=" << (double)(k < bcl.M.size() ? bcl.M[k][0] : (Real)0)
+           << "," << (double)(k < bcl.M.size() ? bcl.M[k][1] : (Real)0)
+           << "," << (double)(k < bcl.M.size() ? bcl.M[k][2] : (Real)0) << "\n";
+      // Lead/corner control geometry (describes the coaxial-lead + quintic-Hermite corner + seam-settle stage)
+      ds << "CONTROL lead_corner\n";
+      ds << "A0 " << (double)A0[0] << " " << (double)A0[1] << " " << (double)A0[2] << "\n";
+      ds << "uA " << (double)uA[0] << " " << (double)uA[1] << " " << (double)uA[2] << "\n";
+      ds << "QA " << (double)bQA[0] << " " << (double)bQA[1] << " " << (double)bQA[2] << " bse=" << (double)bse << "\n";
+      ds << "endC " << (double)endC[0] << " " << (double)endC[1] << " " << (double)endC[2] << "\n";
+      ds << "uB " << (double)uB[0] << " " << (double)uB[1] << " " << (double)uB[2] << "\n";
+      ds << "QB " << (double)bQB[0] << " " << (double)bQB[1] << " " << (double)bQB[2] << " bsx=" << (double)bsx << "\n";
+      ds << "params S=" << (double)bcl.total << " lead_len=" << (double)bLl << " corner_kr=" << (double)corner_kr
+         << " rA=" << (double)rA << " rB=" << (double)rB << "\n";
+      // Final meshed centerline + radius (the curve CSBQ actually sweeps; also recoverable from the .arms bundle)
+      const Integer Nf = std::max<Integer>((Integer)4*n, (Integer)64);
+      ds << "STAGE final n=" << (Nf + 1) << "\n";
+      for (Integer k = 0; k <= Nf; k++) {
+        const Real t = (Real)k / Nf; const Vec3<Real> c = curve(t);
+        ds << (double)c[0] << " " << (double)c[1] << " " << (double)c[2] << " r=" << (double)radius_at(t) << "\n";
+      }
+      ds << "# END ARM " << dump_tag << "\n";
+    }
+  }
   std::vector<Vec3<Real>> Rtab((size_t)Ng+1);
   Vec3<Real> ti = tang(0);
   Vec3<Real> r = unit(sub(seamA.e1, scal(dot(seamA.e1, ti), ti)));

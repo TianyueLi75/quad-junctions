@@ -227,6 +227,10 @@ int main(int argc, char** argv) {
                         const std::vector<Vec3<Real>>& cl, Real rA, Real rB, Integer other, bool is_cap,
                         const Vec3<Real>& endE1 = Vec3<Real>{(Real)0,(Real)0,(Real)0},
                         Vec3<Real>* out_termC = nullptr, Vec3<Real>* out_termU = nullptr) {
+      // QJ_DUMP_STAGES per-arm tag (rank 0 only; serial assembler). Null => the header's dump stays inert.
+      const bool dump_stages = (getenv("QJ_DUMP_STAGES") != nullptr) && !comm.Rank();
+      std::string stage_tag;
+      if (dump_stages) { char tb[64]; snprintf(tb, sizeof tb, "j%ld-%ld-%d", (long)owner, (long)other, is_cap ? 1 : 0); stage_tag = tb; }
       NetworkArmBundle<Real>& B = bundle[owner];
       const Long p0 = (Long)B.elem_order.Dim();
       // The arm mouth radius at t=0 IS rA (radius=rA+t*(rB-rA)); rA=owner seam R0 (shrunk if the owner
@@ -247,16 +251,16 @@ int main(int argc, char** argv) {
       const Integer lead_p = blend_mode ? 1 : leadP;                      // coaxial lead = exactly 1 panel in blend mode
       auto emit = [&](Vector<Long>& eo, Vector<Long>& fo, Vector<Real>& co, Vector<Real>& ra, Vector<Real>& oo,
                       std::vector<Vec3<Real>>* samp, std::vector<Vec3<Real>>* sref,
-                      Vec3<Real>* tC, Vec3<Real>* tU) {
+                      Vec3<Real>* tC, Vec3<Real>* tU, const char* dtag) {
         if (straight) append_straight_fiber<Real>(sA, endC, rA, rB, nAx, cheb, fourier, eo, fo, co, ra, oo);
         else append_centerline_fiber<Real>(sA, endC, endTang, cl, rA, rB, n_arm, lead_p, cheb, fourier, eo, fo, co, ra, oo,
-                                           getenv("QJ_CONSTORIENT") != nullptr, leadFrac, cornerP, turnThr, samp, sref, endE1, is_cap, tC, tU);
+                                           getenv("QJ_CONSTORIENT") != nullptr, leadFrac, cornerP, turnThr, samp, sref, endE1, is_cap, tC, tU, dtag);
       };
       emit(B.elem_order, B.forder, B.coord, B.radius, B.orient, dump_approx ? &sampled : nullptr,
-           dump_approx ? &sampled_ref : nullptr, out_termC, out_termU);
+           dump_approx ? &sampled_ref : nullptr, out_termC, out_termU, dump_stages ? stage_tag.c_str() : nullptr);
       B.other_node.push_back(other); B.is_cap.push_back(is_cap ? 1 : 0);
       B.npanel.push_back((Long)B.elem_order.Dim() - p0);
-      emit(gelem, gforder, gcoord, gradius, gorient, nullptr, nullptr, nullptr, nullptr); // mirror into combined slender list
+      emit(gelem, gforder, gcoord, gradius, gorient, nullptr, nullptr, nullptr, nullptr, nullptr); // mirror into combined slender list
       if (dump_approx) {
         if (sampled.empty()) sampled = { sA.C, endC };                // straight fallback: just the endpoints
         approx_arms.push_back({owner, other, is_cap ? 1 : 0, sA.C, sA.u, sampled, sampled_ref});
