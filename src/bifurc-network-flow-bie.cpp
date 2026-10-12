@@ -331,6 +331,15 @@ void run_network_greens(const QuadElemList<Real>& junc, const SlenderElemList<Re
     for (Long i = 0; i < Ncen && (Long)(Xs_int.Dim()/3) < Mint; i += stride)
       for (int k = 0; k < 3; k++) Xs_int.PushBack(a_coord[3*i+k]); }
 
+  // QJ_GREENS_INT_XYZ=<file>: replace the stride-sampled interior sources by the points in <file> (one "x y z" per line),
+  // so two bundles with DIFFERENT arm node counts (hence different stride picks) are compared with IDENTICAL sources.
+  // Unset => unchanged.
+  if (const char* ixf = std::getenv("QJ_GREENS_INT_XYZ")) {
+    std::ifstream fin(ixf); SCTL_ASSERT_MSG(fin.good(), "QJ_GREENS_INT_XYZ: cannot open file");
+    Xs_int.ReInit(0); double x, y, z; while (fin >> x >> y >> z) { Xs_int.PushBack((Real)x); Xs_int.PushBack((Real)y); Xs_int.PushBack((Real)z); }
+    if (!pid) std::cout << "  [QJ_GREENS_INT_XYZ] " << (Xs_int.Dim()/3) << " interior sources read from " << ixf << "\n";
+  }
+
   const char* ker_env = std::getenv("QJ_GREENS_KER");
   const std::string ker = ker_env ? std::string(ker_env) : std::string("both");
   SCTL_ASSERT_MSG(ker=="laplace"||ker=="stokes"||ker=="both", "QJ_GREENS_KER must be 'laplace','stokes','both'");

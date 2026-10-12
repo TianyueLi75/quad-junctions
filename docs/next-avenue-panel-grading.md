@@ -73,3 +73,64 @@ Note: this checkout's test_DLIdentity prints only the argmax node (no top-20 [ma
 
 ## Memory proposal (one line)
 "network panel grading: DL hotspots = turn-refine long|short panel-size knots (6-8x); QJ_ARM_PANEL_GRADE=2 (+5% panels) cut hot5 subset DL 1.33e-3 -> 2.5e-4; subset faithful via QJ_L10; full gate pending."
+
+---
+# UPDATE 2026-10-12: full-network gate result (out/network-greens-7223686.log, geom/n298_tr6_grade2, GRADE=2)
+
+| metric | production (7158497 / f36 7198067 same-format) | grade2 (7223686) | verdict |
+|---|---|---|---|
+| arm panels (slender) | 18973 | 20093 (+5.9%) | |
+| COMBINED / rel closure | 0.0179 / 6.67e-8 | 0.01464 / ~5.5e-8 | slightly better |
+| DL const-density max rel err (max abs) | 1.328e-3 (6.64e-4) | 4.296e-4 (2.15e-4) | IMPROVED 3.1x (subset predicted 5.3x) |
+| Green's ext ("error", same format) | 5.636e-4 | 1.64e-4 | improved 3.4x |
+| Green's int ("error") | 5.899e-5 | 7.90e-4 | NOT COMPARABLE (see below) |
+
+Rel-L2 is not printed by this checkout's driver (the production log came from a build that printed it); the "Green's identity
+error" column above is the like-for-like quantity (max-err/max|u|), identical in format across 7158497, 7198067, 7202023, 7223686.
+
+**Interior Green's is inconclusive, not shown regressed.** Interior sources are stride-sampled arm centerline NODES
+(`stride = Ncen/36`); grading changes Ncen (18973*10 -> 20093*10 panels) so the 36 sources MOVED (verified: the two source
+lists differ point by point). Same pitfall hit a16 (int 5.8e-3). Test with identical sources on the hot5 subset
+(new `QJ_GREENS_INT_XYZ`, `python/greens_int_sources.py`): base 6.03e-4 / 5.58e-4 -> grade2 9.2e-5 / 6.0e-5 (int improves 9x).
+So the 13x "worsening" is most likely a source-set artifact; a fixed-source full run decides (script below).
+
+**Localization.** This checkout prints only the argmax node (no top-20), and no VTU was dumped. Rigorous inference:
+the full max is 2.15e-4 abs at (-329,-382,369); the five baseline sites were 4.2e-4..6.6e-4 abs, so all five are now < 2.15e-4
+(subset: 3e-5..9e-5). The new argmax is arm j296->300 (cap) panel 10/24 = the p9|p10 2:1 knot (len 2.69|1.34, bends 5.1|3.9 deg),
+UNTOUCHED by grading (identical panels in both bundles), i.e. a pre-existing site that was just below the baseline top-20 cutoff.
+A 1-junction faithful subset (seed 300, QJ_L10) reproduces it EXACTLY: base 4.2957e-4, GRADE=2 4.2876e-4 (same value as the full net).
+No new fold: junc/arms minWt unchanged (5.08e-6 / 1.04e-4). No new long|short jump is created by construction (all neighbour
+ratios <= 2). Knot C1 mismatch there is only ~0.03 deg (as at non-hot knots), pos gap 1e-6: it is not a panel-join mismatch.
+Cause at this site: the centerline curvature still oscillates strongly over ~2-3 radii (kappa 0.012 -> 0.026 -> 0.054 -> 0.016 -> 0.065
+across p8..p12) despite 64 Taubin passes: the toroidal near-constant-curvature assumption again.
+
+**Probes on the j296 subset (1 junction, 3 caps; DL max rel err, base = 4.296e-4):**
+| variant | arm panels | DL max rel | note |
+|---|---|---|---|
+| GRADE=2 | 165 (+4%) | 4.288e-4 | no effect here (not a size-jump site) |
+| GRADE=2 + TURN_REFINE=4 | 181 | 3.87e-4 | -10% |
+| GRADE=2 + TURN_REFINE=3 | 196 | ~3.9e-4 | -10% |
+| GRADE=2 + LOWPASS_PASSES=256 | 165 | 2.85e-4 | 1.5x; centerline moves <= 0.69 r (mean 0.06-0.23 r) |
+| GRADE=2 + LOWPASS_PASSES=1024 | 165 | 1.64e-4 | 2.6x; but centerline moves up to 4.2 r (mean 1.5 r): too much |
+(`QJ_ARM_CL_LOWPASS_PASSES` was baked at 64; it is env-readable again, default 64 = byte-identical.)
+
+## Verdict and decision
+- GRADE=2 is a KEEPER: removes the five size-jump hotspots (verified at the real sites in faithful subsets and by the full-net
+  max falling 3.1x to a different site), +5.9% panels, closure better, minWt unchanged. R=2 is right (R=3 leaves ~1.5x more, R<2 is degenerate for bisection).
+- It does NOT reach the subset's 5.3x on the full net because the new floor (4.3e-4) is the NEXT mechanism: curvature
+  noise on bent arms, independent of panel size. Next-ranked lever that actually moves it: more centerline low-pass (candidate 6),
+  PASSES=256 (1.5x at that site, <= 0.7 r drift), possibly combined with graded refinement keyed on d(kappa)/ds (not built).
+  TURN_REFINE<6 is a weak lever (-10%), RADIUS_SCALE shrink stays the generic size lever. Seam coverage/overlap (cand. 1-3) are still
+  not indicated: neither remaining site is at a mouth.
+- Caveat on lowpass: 256 passes alters the centerline (tortuosity) up to 0.7 radius; check fold/minWt on the full bundle (built:
+  geom/n298_tr6_grade2_lp256) before trusting it.
+
+## Prepared next gate (NOT submitted)
+`sbatch scripts/submit-network-greens-grade2-fixsrc.sh` : production, grade2, grade2+lp256 with IDENTICAL interior sources
+(`geom/greens_int_prod.xyz`, via QJ_GREENS_INT_XYZ), full Laplace Green's + DL. `--export=ALL,DLONLY=1` for the cheap DL-only pass.
+Add `QJ_GREENS_DUMP=vis/<tag>` to get the spatial error map (VTU) since this build has no top-20 printout.
+
+Memory proposal: "GRADE=2 full gate: DL 1.33e-3 -> 4.3e-4, closure 5.5e-8, ext Green's 3.4x better; int Green's NOT comparable (stride-sampled sources shift with node count; use QJ_GREENS_INT_XYZ); new floor = j296 curvature-noise knot, lowpass 256 gives 1.5x there."
+
+Full bundle geom/n298_tr6_grade2_lp256 (GRADE=2 + LOWPASS_PASSES=256) built: COMBINED 0.0107 (rel ~4.0e-8), junc/arms minWt 5.08e-6 / 1.06e-4 (Jac>0, no fold),
+but arm area changed 2.615e5 -> 2.658e5 (+1.6%), i.e. the centerlines genuinely moved; full DL/Green's pending the fix-source gate.
