@@ -113,7 +113,7 @@ KER=${KER:-laplace}                                # laplace | stokes | both (DL
 # Default = production baseline (geom/n298_seamsettle_tr6: seam-settle + turn-refine 6/cap 24, gated ~1.3e-3 DL /
 # 6.7e-8 closure; built with CLI params 12 1 1.5 0.4 3 12 10 24). Old nettenth configs still work,
 # e.g. CONFIGS="geom/nettenth_o12f16:1e-6 geom/nettenth_o16f36:1e-9".
-CONFIGS=${CONFIGS:-"geom/n298_seamsettle_tr6f36:1e-6"}
+CONFIGS=${CONFIGS:-"geom/n298_seamsettle_tr6a16:1e-6"}
 
 export QJ_NET_MODE=greens
 # export QJ_GREENS_DLONLY=1                           # DL const-density identity only (NO Green's)

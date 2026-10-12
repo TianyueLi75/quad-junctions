@@ -578,6 +578,34 @@ template <class Real> class HybridAssembly {
   explicit HybridAssembly(Integer order) : order_(order) {}
   Integer order() const { return order_; }
 
+  // Quintic Hermite interpolation on s in [0,1] with full C2 endpoint data: position P, velocity V,
+  // acceleration A at each end. Used by the network seam-settle / corner bridges in gen_network_geom.hpp.
+  // p(0)=P0, p'(0)=V0, p''(0)=A0, p(1)=P1, p'(1)=V1, p''(1)=A1.
+  static Vec3<Real> hermite5_c2(const Vec3<Real>& P0, const Vec3<Real>& V0, const Vec3<Real>& A0,
+                                const Vec3<Real>& P1, const Vec3<Real>& V1, const Vec3<Real>& A1, Real s) {
+    const Real t = s, t2 = t*t, t3 = t2*t, t4 = t3*t, t5 = t4*t;
+    const Real H0 = (Real)1 - (Real)10*t3 + (Real)15*t4 - (Real)6*t5;
+    const Real H1 = t - (Real)6*t3 + (Real)8*t4 - (Real)3*t5;
+    const Real H2 = (Real)0.5*t2 - (Real)1.5*t3 + (Real)1.5*t4 - (Real)0.5*t5;
+    const Real H3 = (Real)10*t3 - (Real)15*t4 + (Real)6*t5;
+    const Real H4 = -(Real)4*t3 + (Real)7*t4 - (Real)3*t5;
+    const Real H5 = (Real)0.5*t3 - t4 + (Real)0.5*t5;
+    Vec3<Real> r;
+    for (int c = 0; c < 3; c++)
+      r[c] = H0*P0[c] + H1*V0[c] + H2*A0[c] + H3*P1[c] + H4*V1[c] + H5*A1[c];
+    return r;
+  }
+
+  // Quintic Hermite with endpoint positions, UNIT tangents T0/T1 scaled by h0/h1 (velocity = h*T), and
+  // zero endpoint acceleration -- the C1 (tangent-matching) variant used for the straight-chord bridges.
+  static Vec3<Real> hermite5(const Vec3<Real>& P0, const Vec3<Real>& T0, Real h0,
+                             const Vec3<Real>& P1, const Vec3<Real>& T1, Real h1, Real s) {
+    const Vec3<Real> V0{h0*T0[0], h0*T0[1], h0*T0[2]};
+    const Vec3<Real> V1{h1*T1[0], h1*T1[1], h1*T1[2]};
+    const Vec3<Real> Z{(Real)0, (Real)0, (Real)0};
+    return hermite5_c2(P0, V0, Z, P1, V1, Z, s);
+  }
+
   // Place a junction; append its quad nodes; return it so the caller reads its seams / placement.
   // `comm` is forwarded only so the canonical-mesh cache file is written by rank 0 alone.
   HybridJunction<Real> add_junction(const Placement<Real>& P, Real level, Integer nref, Real eta_join,
