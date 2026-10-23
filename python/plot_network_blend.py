@@ -1,20 +1,19 @@
 #!/usr/bin/env python3
-"""plot_network_blend.py -- verify the DISPLACEMENT-BLEND network arms (QJ_ARM_BLEND) against vmtk.
+"""plot_network_blend.py -- verify the meshed network arms against the vmtk centerline.
 
-The blend scheme keeps the raw vmtk centerline v(l) and adds a LOCALIZED correction that pulls each
-arm mouth onto the junction-dictated seam point:  c(l) = v(l) + a_A(l)*delta_A + a_B(l)*delta_B, with
-a smooth ramp a=1 at the mouth decaying to 0 a window inward.  So the meshed arm should (1) HUG the grey
-vmtk skeleton and (2) deviate from it only in a SHORT band near each junction seam.
-
-This script overlays the meshed arms on the vmtk graph AND plots, per arm, the displacement
+Shared arm-vs-vmtk diagnostic (also the source of `poly_dist`, imported by plot_network_maxdev.py /
+plot_network_zoom.py). It overlays the meshed arms on the vmtk graph AND plots, per arm, the displacement
 |c(l) - v(l)| (nearest distance from each meshed centerline node to its vmtk edge polyline) vs the
-normalized arclength along the arm -- the direct check that the displacement is small and localized.
+normalized arclength -- the direct check that the meshed arm hugs the grey vmtk skeleton.
+
+(Historical note: named for the removed BLEND arm pipeline. The current default builder is POLY-FIT; this
+check is pipeline-neutral -- it only reads the QJ_DUMP_APPROX dump, which any arm builder can emit.)
 
 Usage:
     python python/plot_network_blend.py <graph> <approx-dump> [out.png]
 
 Regenerate the dump:
-    QJ_ARM_BLEND=1 QJ_DUMP_APPROX=/tmp/net.approx \
+    QJ_DUMP_APPROX=/tmp/net.approx \
         ./bin/bifurc-network-assemble /tmp/subnet.graph geom/scratch 12 1
 """
 import os

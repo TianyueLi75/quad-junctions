@@ -203,8 +203,10 @@ int main(int argc, char** argv) {
     // with its vmtk arclength so one panel ~= L10/nAx everywhere. The COAXIAL LEAD is then pinned to exactly
     // ONE such panel: lead_panels=1 and lead length = h_panel (== L/n), so the axis-conforming seam stub is a
     // single uniform panel on every arm regardless of length. Straight tubes (QJ_STRAIGHT) keep the fixed nAx.
-    // QJ_ARM_BLEND: fixed to production ON (was env; baked 2026-10-07 as the seamsettle_tr6 baseline)
-    const bool blend_mode = true;
+    // Length-adaptive panelization is always on: it holds the panel arclength ~constant across the network
+    // (short edges keep the base nAx, longer edges scale up with arclength) and pins the coaxial lead to one
+    // such panel. Shared by every arm builder below; QJ_STRAIGHT opts out to a fixed-nAx straight tube.
+    const bool adaptive_panels = true;
     auto arclen = [](const std::vector<Vec3<Real>>& c)->Real{
       Real s = 0; for (size_t k = 1; k < c.size(); k++) s += gnet::nrm(gnet::sub(c[k], c[k-1])); return s; };
     Real L10 = (Real)1;
@@ -219,24 +221,23 @@ int main(int argc, char** argv) {
     const Real h_panel = L10 / (Real)std::max<Integer>(1, nAx);           // target panel arclength = 1 short-edge panel
     auto arm_narm = [&](const std::vector<Vec3<Real>>& cl)->Integer{      // per-arm n ~ arclength / h_panel, floored at nAx
       return std::max<Integer>(nAx, (Integer)std::lround((double)nAx * (double)arclen(cl) / (double)L10)); };
-    if (blend_mode) {
-      if (!getenv("QJ_ARM_BLEND_LEAD")) {                                 // pin the coaxial lead to one panel (h_panel)
-        static char leadbuf[64]; snprintf(leadbuf, sizeof leadbuf, "%.17g", (double)h_panel);
-        setenv("QJ_ARM_BLEND_LEAD", leadbuf, 1); }
-      if (!comm.Rank()) std::cout << "  [blend] length-adaptive n_axial: base " << nAx << " for the 10% shortest edges"
+    if (adaptive_panels) {
+      if (!comm.Rank()) std::cout << "  [arm] length-adaptive n_axial: base " << nAx << " for the 10% shortest edges"
         << " (L10=" << (double)L10 << "), scaling ~ L/L10; coaxial lead = 1 panel = " << (double)h_panel << "\n";
-      if (!comm.Rank()) { char l10b[64]; snprintf(l10b, sizeof l10b, "%.17g", (double)L10); std::cout << "  [blend] L10 exact (feed to QJ_L10 for subset graphs) = " << l10b << "\n"; }
+      if (!comm.Rank()) { char l10b[64]; snprintf(l10b, sizeof l10b, "%.17g", (double)L10); std::cout << "  [arm] L10 exact (feed to QJ_L10 for subset graphs) = " << l10b << "\n"; }
     }
     auto push_arm = [&](Integer owner, const ArmSeam<Real>& sA, const Vec3<Real>& endC, const Vec3<Real>& endTang,
                         const std::vector<Vec3<Real>>& cl, Real rA, Real rB, Integer other, bool is_cap,
                         const Vec3<Real>& endE1 = Vec3<Real>{(Real)0,(Real)0,(Real)0},
-                        Vec3<Real>* out_termC = nullptr, Vec3<Real>* out_termU = nullptr) {
-      // QJ_DUMP_STAGES per-arm tag (rank 0 only; serial assembler). Null => the header's dump stays inert.
+                        Vec3<Real>* out_termC = nullptr, Vec3<Real>* out_termU = nullptr, Real* out_termR = nullptr) {
+      // Per-arm tag j<owner>-<other>-<iscap>: always set so the [seam-check] line (and any QJ_DUMP_STAGES
+      // snapshot) identifies the arm. The stage DUMP itself stays gated by QJ_DUMP_STAGES (the header's `dbg`).
       const bool dump_stages = (getenv("QJ_DUMP_STAGES") != nullptr) && !comm.Rank();
       std::string stage_tag;
-      if (dump_stages) { char tb[64]; snprintf(tb, sizeof tb, "j%ld-%ld-%d", (long)owner, (long)other, is_cap ? 1 : 0); stage_tag = tb; }
+      { char tb[64]; snprintf(tb, sizeof tb, "j%ld-%ld-%d", (long)owner, (long)other, is_cap ? 1 : 0); stage_tag = tb; }
       NetworkArmBundle<Real>& B = bundle[owner];
       const Long p0 = (Long)B.elem_order.Dim();
+      const Long c0 = (Long)B.coord.Dim(), r0 = (Long)B.radius.Dim(), o0 = (Long)B.orient.Dim();  // slice offsets for the combined-list copy
       // The arm mouth radius at t=0 IS rA (radius=rA+t*(rB-rA)); rA=owner seam R0 (shrunk if the owner
       // junction is shrunk), rB=neighbour seam R0 (interior) or vessel/cap radius (leaf). So the arm
       // tapers to match EACH end's junction size. QJ_ARMDIAG proves it (mouth==shrunk seam, far==neighbour).
@@ -251,20 +252,32 @@ int main(int argc, char** argv) {
       // hole -> the junction<->cap gap. The cap tip position and centerline still come from the network.
       // QJ_STRAIGHT forces the old straight tube for A/B.
       std::vector<Vec3<Real>> sampled, sampled_ref;
-      const Integer n_arm  = blend_mode ? arm_narm(cl) : nAx;             // length-adaptive panels (blend); constant otherwise
-      const Integer lead_p = blend_mode ? 1 : leadP;                      // coaxial lead = exactly 1 panel in blend mode
+      const Integer n_arm  = adaptive_panels ? arm_narm(cl) : nAx;        // length-adaptive panels; constant if QJ_STRAIGHT
+      const Integer lead_p = adaptive_panels ? 1 : leadP;                 // coaxial lead = exactly 1 panel
       auto emit = [&](Vector<Long>& eo, Vector<Long>& fo, Vector<Real>& co, Vector<Real>& ra, Vector<Real>& oo,
                       std::vector<Vec3<Real>>* samp, std::vector<Vec3<Real>>* sref,
-                      Vec3<Real>* tC, Vec3<Real>* tU, const char* dtag) {
+                      Vec3<Real>* tC, Vec3<Real>* tU, const char* dtag, Real* tR) {
+        (void)samp; (void)sref;                 // QJ_DUMP_APPROX sampling was BLEND-only; polyfit uses the endpoint fallback
+        // POLY-FIT is THE network arm builder: wide-knot piecewise degree-9 Chebyshev body, panel boundaries on the
+        // segment knots (see polyfit_segfit.hpp::SegPolyFit). It internally falls back
+        // to append_downsampled_fiber for very short arms and append_straight_fiber for tiny ones.
         if (straight) append_straight_fiber<Real>(sA, endC, rA, rB, nAx, cheb, fourier, eo, fo, co, ra, oo);
-        else append_centerline_fiber<Real>(sA, endC, endTang, cl, rA, rB, n_arm, lead_p, cheb, fourier, eo, fo, co, ra, oo,
-                                           getenv("QJ_CONSTORIENT") != nullptr, leadFrac, cornerP, turnThr, samp, sref, endE1, is_cap, tC, tU, dtag);
+        else append_polyfit_fiber<Real>(sA, endC, endTang, cl, rA, rB, n_arm, lead_p, cheb, fourier, eo, fo, co, ra, oo,
+                                        getenv("QJ_CONSTORIENT") != nullptr, endE1, is_cap, tC, tU, dtag, tR);
       };
       emit(B.elem_order, B.forder, B.coord, B.radius, B.orient, dump_approx ? &sampled : nullptr,
-           dump_approx ? &sampled_ref : nullptr, out_termC, out_termU, dump_stages ? stage_tag.c_str() : nullptr);
+           dump_approx ? &sampled_ref : nullptr, out_termC, out_termU, stage_tag.c_str(), out_termR);
       B.other_node.push_back(other); B.is_cap.push_back(is_cap ? 1 : 0);
       B.npanel.push_back((Long)B.elem_order.Dim() - p0);
-      emit(gelem, gforder, gcoord, gradius, gorient, nullptr, nullptr, nullptr, nullptr, nullptr); // mirror into combined slender list
+      // Mirror into the combined slender list by COPYING the slice just appended to B, instead of rebuilding
+      // the whole fiber a second time (was a 2x arm-build cost, and ran the seam-check twice). Bit-identical:
+      // a second arm build with the same args produced the same bytes (verified), so the copy
+      // and the rebuild are the same arrays; only the out-params (sampled/term/dump), which never touch the
+      // geometry arrays, were ever null-vs-set between the two emits.
+      for (Long q = p0; q < (Long)B.elem_order.Dim(); q++) { gelem.PushBack(B.elem_order[q]); gforder.PushBack(B.forder[q]); }
+      for (Long q = c0; q < (Long)B.coord.Dim();  q++) gcoord.PushBack(B.coord[q]);
+      for (Long q = r0; q < (Long)B.radius.Dim(); q++) gradius.PushBack(B.radius[q]);
+      for (Long q = o0; q < (Long)B.orient.Dim(); q++) gorient.PushBack(B.orient[q]);
       if (dump_approx) {
         if (sampled.empty()) sampled = { sA.C, endC };                // straight fallback: just the endpoints
         approx_arms.push_back({owner, other, is_cap ? 1 : 0, sA.C, sA.u, sampled, sampled_ref});
@@ -340,9 +353,12 @@ int main(int argc, char** argv) {
         const ArmSeam<Real>& sA = seam[own].at(e);
         std::vector<Vec3<Real>> cl = E.cl; if (E.n0 != own) std::reverse(cl.begin(), cl.end());
         const Vec3<Real> tip = g.nodes[cap].pos;
+        // (QJ_CAP_CUT tip-truncation reverted 2026-10-15: the dominant cap error is the JUNCTION-SEAM cross-list
+        // at s/L~0.13, not the tip, so trimming the tip can't reach it; the loose detector also over-trimmed
+        // mid-arm vessel. See s11 in [[network-downsample-arm-pipeline]].)
         Vec3<Real> endTang = gnet::unit(gnet::sub(tip, sA.C));            // owner->tip chord (straight-tube axis)
-        if (blend_mode) {
-          // BLEND caps: conform the cap mouth axis to the VESSEL at the tip, not the owner->tip chord.
+        if (adaptive_panels) {
+          // Caps: conform the cap mouth axis to the VESSEL at the tip, not the owner->tip chord.
           // On a curved leaf the chord is tens of degrees off the local vmtk tangent (measured 40-73 deg),
           // which tilts the cap seam ring and forces the coaxial lead+corner into a large detour (the
           // dominant B-end displacement). The local vmtk tangent makes the cap ring vessel-conforming, so
@@ -376,10 +392,14 @@ int main(int argc, char** argv) {
         // tube tip ring (flagella recipe) instead of the idealized endTang. DEFAULT ON (validated: full-net
         // DL 29.4->1.05, closure 1.76e-6->8.96e-7, see [[network-cap-dome-tube-seam]]); opt out w/ QJ_CAP_TERM_REG=0.
         Vec3<Real> capTermC{0,0,0}, capTermU{0,0,0};
+        Real capTermR = rBt;   // arm terminal radius (polyfit cap-shrink may taper the free tip below rBt)
         const char* ctr_env = getenv("QJ_CAP_TERM_REG");
         const bool cap_term_reg = !(ctr_env && ctr_env[0] == '0');
         push_arm(own, sA, tip, endTang, cl, sA.R0, rBt, cap, true, capring.e1,   // arm far ring conforms to cap frame
-                 cap_term_reg ? &capTermC : nullptr, cap_term_reg ? &capTermU : nullptr);
+                 cap_term_reg ? &capTermC : nullptr, cap_term_reg ? &capTermU : nullptr, &capTermR);
+        // Size the hemisphere cap to the arm's ACTUAL terminal radius (== rBt unless QJ_PF_CAP_SHRINK tapered
+        // the free tip smaller), so the cap equator ring matches the tube tip ring exactly (watertight).
+        if ((double)capTermR > 0) capring.R0 = capTermR;
         if (cap_term_reg && gnet::nrm(capTermU) > (Real)0.5) {
           // Re-seat the dome on the tube's actual terminal ring: center = curve(1), axis = meshed terminal
           // tangent. Removes the endTang-vs-meshed tilt that dips the equator inside the tube (near-singular

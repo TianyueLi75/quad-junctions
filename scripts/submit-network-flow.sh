@@ -2,16 +2,16 @@
 
 # Slurm batch: physical interior Stokes INFLOW/OUTFLOW BVP on the LARGE vmtk-derived vessel network (the
 # ".obj network": 160 quad junctions + bent CSBQ slender arms + 177 hemisphere-capped leaves), loaded
-# from the pre-assembled per-junction bundles geom/n298_seamsettle_tr6-jNNN.{mesh,arms} (bifurc-network-flow-bie.cpp).
+# from the pre-assembled per-junction bundles geom/n298_polyfit-jNNN.{mesh,arms} (bifurc-network-flow-bie.cpp).
 #
 # ============================ REGENERATE THE GEOMETRY FIRST ============================================
-# The n298_seamsettle_tr6 bundle (production; bare-build reproducible, turn-refine default-on, no special env) are a build artifact -- NOT committed (only the geom/ generalized-bifurcation presets
+# The n298_polyfit bundle (production; bare-build reproducible, turn-refine default-on, no special env) are a build artifact -- NOT committed (only the geom/ generalized-bifurcation presets
 # are), so (re)assemble before a production run. The CANONICAL geometry is bifurc-network-assemble run on
 # data/vmtk/vessels_fixed_n298.graph (TRUE per-junction angles + all watertightness fixes), which closes to
 # |int n dA| rel ~1e-5. Assemble at the PRODUCTION PARAMETERS (order=12 / cheb=10 / fourier=24 for 6 digits):
 #   make bin/bifurc-network-assemble
 #   OMP_NUM_THREADS=8 ./bin/bifurc-network-assemble \
-#       data/vmtk/vessels_fixed_n298.graph  geom/n298_seamsettle_tr6  12 1 1.5 0.4 3 12 10 24
+#       data/vmtk/vessels_fixed_n298.graph  geom/n298_polyfit  12 1 1.5 0.4 3 12 10 24
 #       # order=12 nref=1 level=1.5 eta_join=0.4 Ns_trans=3 n_axial=12 cheb=10 fourier=24 lead_panels=2
 # The driver prints the combined watertightness |int n dA| up front -- confirm you are on the ~1e-5 (fixed)
 # geometry before trusting the solve (a rel ~2.8e-3 closure = an angle-approximated/stale build, whose
@@ -69,7 +69,7 @@ fi
 
 # Bundle prefix (the -jNNN.{mesh,arms} set). A build artifact (NOT committed), so (re)assemble it from the
 # FIXED graph before running (see the "REGENERATE THE GEOMETRY FIRST" banner above).
-PREFIX=${PREFIX:-geom/n298_seamsettle_tr6}
+PREFIX=${PREFIX:-geom/n298_polyfit}
 if [ ! -f ${PREFIX}-j001.mesh ]; then
     echo "ERROR: bundles ${PREFIX}-jNNN.{mesh,arms} missing -- (re)assemble them from the FIXED graph first:" >&2
     echo "  OMP_NUM_THREADS=8 ./bin/bifurc-network-assemble data/vmtk/vessels_fixed_n298.graph ${PREFIX} 12 1 1.5 0.4 3 12 10 24" >&2

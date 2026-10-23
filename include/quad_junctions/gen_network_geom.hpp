@@ -28,6 +28,7 @@
 
 #include <quad_junctions/gen_junction_geom.hpp>
 #include <quad_junctions/ybifurc_assembly.hpp>
+#include <quad_junctions/polyfit_segfit.hpp>
 #include <fstream>
 #include <iomanip>
 #include <algorithm>
@@ -338,18 +339,31 @@ template <class Real> struct ArcPolyline {
   // continuous everywhere, zero curvature at the ends so the straight leads/dome conform). Curvature-limited
   // smoothing (QJ_ARM_CL_SMOOTH) still runs first on the control points, so the C2 curve stays rho>r AND curved.
   bool c2 = false; std::vector<Vec3<Real>> M;         // per-knot 2nd derivative wrt arclength (empty => C1 CR)
+  // CLAMPED mode (opt-in, used by the downsample-interpolate arm path): instead of the natural end BC
+  // (M0=M_{n-1}=0, i.e. free end curvature) pin the end TANGENTS dP/ds to T0 at s=0 and T1 at s=total.
+  // This lets the clamped C2 spline arrive/leave along the two junction axes exactly, so the short straight
+  // coaxial leads join it C1 on a panel boundary (watertight mouth). Needs >=2 control points. clamped=false
+  // => the natural path above is byte-identical.
+  bool clamped = false; Vec3<Real> T0{(Real)0,(Real)0,(Real)0}, T1{(Real)0,(Real)0,(Real)0};
   void init(const std::vector<Vec3<Real>>& pts) {
     P = pts; s.assign(pts.size(), 0);
     for (size_t k = 1; k < pts.size(); k++) s[k] = s[k-1] + gnet::nrm(gnet::sub(pts[k], pts[k-1]));
     total = s.empty() ? 0 : s.back();
     M.clear();
-    if (c2 && P.size() >= 3) {                        // natural cubic spline: solve tridiagonal for M (per component)
+    if (c2 && ((clamped && P.size() >= 2) || (!clamped && P.size() >= 3))) {  // cubic spline: solve tridiagonal for M (per component)
       const size_t n = P.size();
       std::vector<Real> h(n-1); for (size_t i=0;i+1<n;i++) h[i]=std::max((Real)1e-30, s[i+1]-s[i]);
       M.assign(n, Vec3<Real>{(Real)0,(Real)0,(Real)0});
-      for (int d=0; d<3; d++) {                        // Thomas solve for interior M[1..n-2], natural M0=M_{n-1}=0
+      for (int d=0; d<3; d++) {                        // Thomas solve; natural (M0=M_{n-1}=0) or clamped end BC
         std::vector<Real> a(n,0), b(n,0), c(n,0), rhs(n,0), m(n,0);
-        b[0]=1; b[n-1]=1;                              // natural BC
+        if (clamped) {                                 // first-derivative (tangent) BC at both ends
+          b[0]=2*h[0]; c[0]=h[0];
+          rhs[0]=6*(((double)P[1][d]-(double)P[0][d])/(double)h[0] - (double)T0[d]);
+          a[n-1]=h[n-2]; b[n-1]=2*h[n-2];
+          rhs[n-1]=6*((double)T1[d] - ((double)P[n-1][d]-(double)P[n-2][d])/(double)h[n-2]);
+        } else {
+          b[0]=1; b[n-1]=1;                            // natural BC
+        }
         for (size_t i=1;i+1<n;i++) {
           a[i]=h[i-1]; b[i]=2*(h[i-1]+h[i]); c[i]=h[i];
           rhs[i]=6*(((double)P[i+1][d]-(double)P[i][d])/(double)h[i]
@@ -407,998 +421,517 @@ template <class Real> void append_straight_fiber(const ArmSeam<Real>& seamA, con
     Vector<Long>& elem_order, Vector<Long>& forder, Vector<Real>& coord, Vector<Real>& radius, Vector<Real>& orient);
 
 // ===================================================================================================
-// One bent, tapered, centerline-following slender arm appended to (elem_order,forder,coord,radius,orient).
-// The centerline r(t): straight panel-aligned lead off seamA along seamA.u, Catmull-Rom middle following
-// `cl` (endpoint-pinned to the lead ends), straight lead into `endC` along the travel direction endTang.
-// Radius tapers rA->rB. Orientation = double-reflection rotation-minimizing frame seeded at seamA.e1.
-// t=0 -> seamA.C (tangent seamA.u), t=1 -> endC (tangent endTang): terminal rings conform (watertight).
+// INTER-PANEL SEAM SMOOTHNESS CHECK for a just-built CSBQ slender arm (QJ_ARM_SEAM_CHECK, default ON).
+//
+// WHY this exists: CSBQ represents each arm panel as an independent order-`cheb` Lagrange polynomial
+// through its own Chebyshev centerline nodes (slender_element.cpp: Derivative(dx,coord,nds),
+// Derivative(d2x,dx,nds) -- EXACTLY the reconstruction mirrored below). Two neighbouring panels share a
+// knot (the "seam"), but each reconstructs position / tangent / curvature there from ITS OWN nodes only.
+// A smooth world curve does NOT guarantee the two per-panel polynomials agree at that shared knot: if the
+// centerline bends too fast across a panel, the degree-(cheb-1) fit over-/under-shoots and the two sides
+// disagree in tangent (C1) or curvature (C2). That disagreement is precisely what the per-panel toroidal
+// special-quad rule cannot resolve, and it is the geometric origin of the DL "open space" / cross-list
+// free-edge residuals. Measuring it from the CHEBYSHEV NODES ONLY (never curve()) reports the smoothness
+// of the surface CSBQ actually sees -- a cheap intermediate gate BEFORE the BIE verification step.
+//
+// `coord` is the global element-major node accumulator; `coord0` is its Dim() just before this arm's
+// panels were appended, `npanel`/`cheb` the panels/order of this arm. Reports, over all npanel-1 interior
+// seams: max |Delta position| (watertight continuity), max tangent turn (deg, C1), max |Delta curvature|
+// and its relative value (C2). Position/tangent/curvature are parametrization-invariant geometric
+// quantities, so the differing local panel-interval widths across a seam cancel and the two sides are
+// directly comparable. Pure diagnostic: reads `coord`, mutates nothing, byte-identical mesh.
+//   QJ_ARM_SEAM_CHECK=0 silences; =2 (or QJ_CORNER) prints every seam, not just the per-arm max.
+template <class Real> void report_arm_seam_smoothness(const Vector<Real>& coord, Long coord0,
+    Integer npanel, Long cheb, const char* tag, std::ostream& os = std::cout) {
+  using namespace gnet;
+  const char* env = std::getenv("QJ_ARM_SEAM_CHECK");
+  if (env && std::atoi(env) == 0) return;                                   // opt-out
+  if (npanel < 2 || cheb < 2) return;                                       // no interior seam to check
+  const bool verbose = (env && std::atoi(env) >= 2) || std::getenv("QJ_CORNER");
+
+  const Vector<Real>& nds = SlenderElemList<Real>::CenterlineNodes(cheb);   // local Chebyshev nodes in [0,1]
+  Vector<Real> tL(1), tR(1); tL[0] = (Real)0; tR[0] = (Real)1;              // panel endpoints (the shared knot)
+  Vector<Real> wL, wR;                                                      // cheb x 1 Lagrange eval weights
+  LagrangeInterp<Real>::Interpolate(wL, nds, tL);
+  LagrangeInterp<Real>::Interpolate(wR, nds, tR);
+
+  // Reconstruct position P, unit tangent T and curvature kappa at the panel endpoint selected by `w`
+  // (wL=left/t=0, wR=right/t=1), from this panel's `cheb` nodes ONLY -- the same Lagrange-derivative chain
+  // CSBQ uses internally (first derivative at nodes, then its derivative => second derivative at nodes).
+  auto panel_end = [&](Integer p, const Vector<Real>& w, Vec3<Real>& P, Vec3<Real>& T, Real& kappa) {
+    Vector<Real> c(3 * cheb), dx(3 * cheb), d2x(3 * cheb);                  // component-major (dof=3), like CSBQ
+    for (Long j = 0; j < cheb; j++)
+      for (int k = 0; k < 3; k++) c[k * cheb + j] = coord[coord0 + ((Long)p * cheb + j) * 3 + k];
+    LagrangeInterp<Real>::Derivative(dx, c, nds);                          // dP/ds at nodes
+    LagrangeInterp<Real>::Derivative(d2x, dx, nds);                        // d2P/ds2 at nodes
+    Vec3<Real> d1{(Real)0,(Real)0,(Real)0}, d2{(Real)0,(Real)0,(Real)0};
+    for (int k = 0; k < 3; k++) { P[k] = (Real)0; }
+    for (Long j = 0; j < cheb; j++)
+      for (int k = 0; k < 3; k++) {
+        P[k]  += w[j] * c  [k * cheb + j];
+        d1[k] += w[j] * dx [k * cheb + j];
+        d2[k] += w[j] * d2x[k * cheb + j];
+      }
+    T = unit(d1);
+    const Real sp = nrm(d1);                                               // |dP/ds|
+    kappa = ((double)sp > 1e-30) ? nrm(cross(d1, d2)) / (sp * sp * sp) : (Real)0;  // |r' x r''|/|r'|^3, invariant
+  };
+
+  double max_dpos = 0, max_dang = 0, max_dkap = 0, max_rkap = 0;
+  Integer worst_pos = -1, worst_ang = -1, worst_kap = -1;
+  for (Integer p = 0; p + 1 < npanel; p++) {
+    Vec3<Real> PR, TR, PL, TL2; Real kR, kL;
+    panel_end(p,     wR, PR, TR, kR);                                      // right end of panel p
+    panel_end(p + 1, wL, PL, TL2, kL);                                     // left end of panel p+1 (shared knot)
+    const double dpos = (double)nrm(sub(PR, PL));
+    double cd = (double)dot(TR, TL2); cd = std::max(-1.0, std::min(1.0, cd));
+    const double dang = std::acos(cd) * 180.0 / M_PI;
+    const double dkap = std::fabs((double)kR - (double)kL);
+    const double rkap = dkap / std::max(1e-30, std::max((double)kR, (double)kL));
+    if (dpos > max_dpos) { max_dpos = dpos; worst_pos = p; }
+    if (dang > max_dang) { max_dang = dang; worst_ang = p; }
+    if (dkap > max_dkap) { max_dkap = dkap; worst_kap = p; }
+    max_rkap = std::max(max_rkap, rkap);
+    if (verbose)
+      os << "  [seam-check" << (tag ? std::string(" ") + tag : "") << "] seam " << (long)p << "|" << (long)(p + 1)
+         << "  dpos=" << dpos << "  dtang=" << dang << " deg  dkappa=" << dkap << " (rel " << rkap << ")\n";
+  }
+  os << "  [seam-check" << (tag ? std::string(" ") + tag : "") << "] " << (long)(npanel - 1)
+     << " interior seams: max dpos=" << max_dpos << " (seam " << (long)worst_pos << ")"
+     << "  max dtang=" << max_dang << " deg (seam " << (long)worst_ang << ")"
+     << "  max dkappa=" << max_dkap << " (rel " << max_rkap << ", seam " << (long)worst_kap << ")\n";
+}
+
+
 // ===================================================================================================
-template <class Real> void append_centerline_fiber(const ArmSeam<Real>& seamA, const Vec3<Real>& endC,
+// DOWNSAMPLE-INTERPOLATE arm centerline -- INTERNAL short-arm FALLBACK for append_polyfit_fiber only.
+// (Historically the user-selectable QJ_ARM_DOWNSAMPLE "attempt 2"; retained solely as polyfit's fallback
+//  for arms too short to carry a poly-fit body window. Not reachable from the assembler dispatch.)
+// ---------------------------------------------------------------------------------------------------
+// The vmtk centerline is already smooth (vis/network_pipeline_pair*), so this path SMOOTHS the discrete-
+// curvature noise with a plain moving average, DOWNSAMPLES to a sparse set of UNIFORM-arclength
+// representative knots, and interpolates them with ONE globally-C2 NATURAL cubic spline (zero end
+// curvature). Uniform knot spacing (not data-adaptive) means the natural cubic cannot Runge-overshoot, so
+// no curvature limiter / radius dip / corner relax / monotone collapse is needed.
+//
+// Watertight mouths & the C2 lead join: short STRAIGHT coaxial leads along uA (home) and endTang (far),
+// each pinned to EXACTLY ONE panel, so the panel polynomial is an exact line whose extrapolation to t=0/1
+// lands on the seam center with axis uA/-uB -- correct even though the Chebyshev nodes never sample the
+// panel ENDPOINTS (the key pitfall: a panel's last node is NOT its interval end, so the mouth ring must
+// come from a genuinely straight lead, never "a node at t=0"). The spline spans QA->QB and carries COLLINEAR
+// ghost knots just inside each lead end; a natural cubic through collinear knots is EXACTLY straight (all
+// 2nd-moments zero), so it leaves QA along uA / arrives QB along uB with tangent exact AND curvature zero.
+// The glued straight lead therefore joins the spline fully C2 (position, tangent, curvature=0 all match) --
+// the lead is a zero-curvature line and C2 matches it with nothing clamped, hence no overshoot. Caps: the
+// far lead is coaxial with the cap axis and out_termC/out_termU report the ACTUAL meshed terminal ring so
+// QJ_CAP_TERM_REG seats the dome flush (same cap-care recipe).
+template <class Real> void append_downsampled_fiber(const ArmSeam<Real>& seamA, const Vec3<Real>& endC,
     const Vec3<Real>& endTang, const std::vector<Vec3<Real>>& cl_in, Real rA, Real rB,
     Integer n_axial, Integer lead_panels, Long cheb, Long fourier,
     Vector<Long>& elem_order, Vector<Long>& forder, Vector<Real>& coord, Vector<Real>& radius, Vector<Real>& orient,
-    bool constant_orient = false, Real lead_frac = (Real)0.18, Integer corner_panels = -1,
-    Real turn_thresh_deg = (Real)20, std::vector<Vec3<Real>>* sampled_out = nullptr,
-    std::vector<Vec3<Real>>* sampled_ref = nullptr, Vec3<Real> endE1 = Vec3<Real>{(Real)0,(Real)0,(Real)0},
-    bool is_cap = false, Vec3<Real>* out_termC = nullptr, Vec3<Real>* out_termU = nullptr,
-    const char* dump_tag = nullptr) {
+    bool constant_orient, Vec3<Real> endE1, bool is_cap,
+    Vec3<Real>* out_termC, Vec3<Real>* out_termU, const char* dump_tag) {
   using namespace gnet;
-  // ---- Opt-in, READ-ONLY per-stage centerline dump (QJ_DUMP_STAGES=<path>). Inert/byte-identical when
-  // unset or when the caller passes no tag. Snapshots the ACTUAL in-memory arrays at each centerline stage
-  // (raw vmtk knots -> curvature-limited -> Taubin low-pass -> C2 spline knots+coeffs -> lead/corner control
-  // geometry -> final meshed curve+radius) so a downstream reader can draw the process truthfully, with no
-  // Python re-implementation of the smoothing math. Diagnostic only; never changes the mesh.
-  const char* _qj_dsf = std::getenv("QJ_DUMP_STAGES");
-  const bool dbg = (_qj_dsf && _qj_dsf[0] && dump_tag);
-  std::vector<Vec3<Real>> dbg_raw, dbg_curv, dbg_lowpass;
-  if (dbg) dbg_raw = cl_in;
-  Integer n = std::max<Integer>(6, n_axial);
-  Integer lp = std::max<Integer>(1, lead_panels);
-  Integer cp = (corner_panels > 0) ? corner_panels : lp;
+  const bool diag = (std::getenv("QJ_CORNER") != nullptr);
   const Vec3<Real> A0 = seamA.C;
-  const Vec3<Real> chord = sub(endC, A0); const Real L = nrm(chord);
   const Vec3<Real> uA = unit(seamA.u);
-  const Vec3<Real> uB = scal((Real)-1, unit(endTang));                   // junction B's arm-exit axis
+  const Vec3<Real> fwdB = unit(endTang);                 // forward travel direction at the far end
+  const Vec3<Real> uB = scal((Real)-1, fwdB);            // junction B's arm-exit axis (= -endTang)
+  const Vec3<Real> chord = sub(endC, A0); const Real L = nrm(chord);
+  const Real r_arm = std::max(rA, rB);
 
-  // ---- DISPLACEMENT-BLEND arm (QJ_ARM_BLEND, the production centerline scheme). KEEP the raw vmtk
-  // centerline v(l) everywhere and correct only near the two seams: a SHORT coaxial lead along the junction
-  // axis u (axis-conforming / watertight mouth ring), a quintic-Hermite corner rotating u onto the vmtk
-  // tangent, then the RAW vmtk run v(l) (zero displacement in the middle), mirrored at the far mouth. The
-  // corner is kept GENTLE by the turn guard below (arclength lengthening + per-panel tangent cap). When
-  // QJ_ARM_BLEND is unset the function falls back to the plain straight lead-corner-straight racetrack.
-  //   (Earlier experimental schemes -- QJ_ARM_FOLLOW canonical-Hermite/vmtk-warp, the two-sided combine, and
-  //   the pure position ramp -- were removed 2026-09-23; the coaxial-lead blend is the sole followed path.)
-  // QJ_ARM_BLEND: fixed to production ON (was env; baked 2026-10-07 as the seamsettle_tr6 baseline)
-  const bool blend = true && (double)L > 1e-12 && cl_in.size() >= 2;
-
-  // TURN-ADAPTIVE corner: how far each mouth axis must swing to reach the straight chord. A gentle arm
-  // (turn <= 35 deg) keeps the short lead + base corner; a sharp arm gets (a) MORE corner panels to
-  // resolve the tighter bend and (b) a LONGER lead == larger corner radius == more legroom to swing out
-  // and hit the graph centerline. Extra corner panels are ADDED to n (2 per corner) so the straight run
-  // is unchanged. Lead grows with the turn, capped so the run never vanishes.
-  Real lead_frac_eff = std::max<Real>((Real)0, lead_frac);
-  if (!blend && (double)L > 0) {
-    const Vec3<Real> cd = scal((Real)1/L, chord);
-    auto ang = [](const Vec3<Real>& p, const Vec3<Real>& q){ double d=(double)(p[0]*q[0]+p[1]*q[1]+p[2]*q[2]); d=std::max(-1.0,std::min(1.0,d)); return std::acos(d)*180.0/M_PI; };
-    const double turn = std::max(ang(uA, cd), ang(uB, scal((Real)-1, cd)));
-    const double thr = std::max(1.0, (double)turn_thresh_deg);
-    if (turn > thr) {
-      const double f = std::min(turn/thr, 3.0);                          // scale factor, capped 3x
-      const Integer extra = std::min<Integer>((Integer)std::lround((f-1.0)*cp), 3*cp);   // added corner panels/side
-      cp += extra; n += 2*extra;                                         // more corner resolution, run unchanged
-      lead_frac_eff = std::min<Real>((Real)(lead_frac*f), (Real)0.40);   // more legroom, capped at 0.40*L
-    }
+  // Degenerate arm => exact straight tapered tube (handled by the dedicated helper).
+  if ((double)L < 1e-12 || cl_in.size() < 2) {
+    append_straight_fiber<Real>(seamA, endC, rA, rB, std::max<Integer>(6, n_axial), cheb, fourier,
+                                elem_order, forder, coord, radius, orient);
+    if (out_termC) *out_termC = endC;
+    if (out_termU) *out_termU = uA;
+    return;
   }
-  if (2*(lp+cp) >= n) { lp = std::max<Integer>(1, n/6); cp = lp; }        // keep a straight run in the middle
 
-  // LEAD-CORNER-STRAIGHT racetrack, robust at ANY seam-axis/chord angle -- EVERY interior arm bends (no
-  // straight fallback).  It leaves junction A along A's arm-exit axis seamA.u for a SHORT lead, corners
-  // onto the straight run, then corners into junction B's arm-exit axis (-endTang) for a short lead, so
-  // both terminal rings conform to the junctions' dictated arm directions (the bifurcation bend).
-  //
-  //   * Lead LENGTH = lead_frac * (junction-to-junction distance L)  -- so it SCALES with the arm and the
-  //     turn stays LOCALIZED near the junction instead of stretching across the whole arm.
-  //   * Lead length is DECOUPLED from the panel count: raising lead_panels only refines the (still short)
-  //     lead to RESOLVE the turn, it does NOT elongate it.  (The old code tied the lead reach to the panel
-  //     fraction, L_reach = t1*L/(1-t1) ~ L/3, which both over-stretched the turn and, via a steep-arm
-  //     guard, dropped most arms to a plain straight tube -- the "most arms look straight" symptom.)
-  const Real Llead = lead_frac_eff * L;
-  const Vec3<Real> QA = add(A0,   scal(Llead, uA));                      // end of lead A
-  const Vec3<Real> QB = add(endC, scal(Llead, uB));                      // end of lead B
-  // Stable lead-corner-straight base: straight lead A0->QA coaxial with seamA.u, straight run QA->QB,
-  // straight lead QB->endC coaxial with -endTang, smootherstep corners. Geometrically clean (watertight
-  // ~228, no near-folds). A gentle single-midpoint sin^2 tilt toward the vmtk arc midpoint gives a light
-  // centerline lean without the overshoot/fold of a full spline. (Full vmtk-tracing splines -- windowed
-  // offset and clamped Catmull-Rom -- were tried and BOTH worsened the geometry: kinks -> 669, CR
-  // overshoot -> 2597. Left out pending targeted per-junction feedback.)
-  //
-  // NB the breakpoints are recomputed from the LIVE lp/cp/n each call, so the corner-curvature guard below
-  // can widen the corner window (cp) in place and have `base` reflect it immediately.
-  //
-  // ---- Corner Hermite handle for the blend coaxial-lead corners (QJ_ARM_CORNER_KR). ----
-  const char* ck = std::getenv("QJ_ARM_CORNER_KR");
-  const Real corner_kr = ck ? (Real)std::atof(ck) : (Real)0.4;   // blend-corner Hermite handle = kr*|corner chord|
-  // corner scheme: fixed to the seam-settle piecewise lead+Hermite path (straight coaxial lead + separate hermite5
-  // corner + centripetal-CR run); merge/smooth alternatives and the QJ_ARM_LC_HANDLE knob removed 2026-10-07 --
-  // backfired, see gen_network_geom.hpp network notes / network-corner-scheme-comparison memory.
-  // ---- FERGUSON tangent-magnitude clamp (QJ_ARM_FERGUSON, default off) ----
-  // The corner Hermite rotates the fixed junction axis onto the vmtk tangent over the chord Q<->P. With a
-  // FIXED handle h=corner_kr*|chord| for BOTH ends (the default), an endpoint tangent that points AWAY from
-  // that chord (dot<0, the sharp-swing case) drives the quintic to bulge backward -> the meshed centerline
-  // doubles back and the tube contacts itself (the mid-arm HAIRPIN self-contact, e.g. edge 271-277, which is
-  // the largest DL-identity error and is INVISIBLE to rho/r since the centerline stays gently curved). Ferguson's
-  // rule scales each end's tangent magnitude to the chord AND to that end's forward projection on the chord, so
-  // a backward-pointing tangent gets a SHORT handle (no backward overshoot) while an aligned tangent keeps the
-  // full corner_kr*|chord|. Per-end: h_i = corner_kr*|chord|*clamp(t_i.chordhat, floor, cap). floor keeps the
-  // handle from collapsing to a kink; cap (Ferguson =1) keeps it from exceeding the chord. Default-off => the
-  // two h's stay = corner_kr*|chord| (byte-identical to before).
-  //   MEASURED 2026-09-28 (default OFF): NEUTRAL on the reported "hairpin" (edge 271-277 dist/r -0.18 unchanged;
-  //   rho/r 2.60 unchanged). corner_kr=0.4 already keeps the handle well under the chord, so the overshoot the
-  //   clamp targets was not the cause of that self-contact. Harmless; kept for the genuine sharp-swing corners.
-  const bool ferguson = (std::getenv("QJ_ARM_FERGUSON") != nullptr);
-  const Real ferg_floor = std::getenv("QJ_ARM_FERGUSON_FLOOR") ? (Real)std::atof(std::getenv("QJ_ARM_FERGUSON_FLOOR")) : (Real)0.10;
-  const Real ferg_cap   = std::getenv("QJ_ARM_FERGUSON_CAP")   ? (Real)std::atof(std::getenv("QJ_ARM_FERGUSON_CAP"))   : (Real)1.00;
-  // ---- DISPLACEMENT-BLEND precompute (QJ_ARM_BLEND): keep the raw vmtk centerline v(l) everywhere and
-  // correct only near the two seams via a SHORT coaxial lead + Hermite corner onto v. A short straight lead
-  // A0->QA along the junction axis u makes the mouth ring axis == u (AXIS-conforming / watertight seam); a
-  // quintic-Hermite corner rotates u onto the vmtk tangent; then the RAW vmtk run v(l) (zero displacement in
-  // the middle), mirrored at the far mouth. Lead length QJ_ARM_BLEND_LEAD (default 1 arm radius, floored
-  // positive), capped to a fraction of the chord; entry/exit pinned to the nearest vmtk arclength inside QA/QB.
-  ArcPolyline<Real> bcl;
-  const char* blk = std::getenv("QJ_ARM_BLEND_LEAD");   // coaxial-lead length; default 1 arm radius (scale-inv stub)
-  const Real blead_len = std::max<Real>((Real)1e-6*L, blk ? (Real)std::atof(blk) : std::max(rA, rB));
-  Vec3<Real> bQA{0,0,0}, bQB{0,0,0}; Real bse = 0, bsx = 1, bLl = (Real)0;   // lead ends + vmtk entry/exit arclength + lead length
-  // ---- Curvature-limited centerline SMOOTHING (QJ_ARM_CL_SMOOTH, default off => bcl.init(cl_in) unchanged).
-  // Where the raw vmtk polyline kinks tighter than the tube can wrap (local curvature radius rho < r*target),
-  // the meshed tube self-folds (inner wall crosses its own axis => DL near-quad garbage). A lumen of radius r
-  // physically cannot bend at rho<r, so a deep kink is a centerline artifact; relax ONLY those points toward
-  // their neighbour midpoint, by an amount that vanishes as rho -> target (a curvature limiter, not a global
-  // smoother: any point already at rho>=target does not move, so the vmtk path is kept everywhere except the
-  // kinks). Endpoints are fixed (the seam pins bse/bsx are taken from the smoothed curve just below, so they
-  // stay consistent). Radius is untouched => closure-neutral. Residual folds (if any) are cleaned by the
-  // seam-safe radius taper QJ_ARM_RADIUS_DIP downstream ("smooth then taper").
-  //
-  // CURVATURE METRIC (2026-09-25 fix): the limiter must measure the curvature of the CURVE CSBQ ACTUALLY
-  // MESHES -- the centripetal Catmull-Rom spline through the control points (bcl, below), NOT the control
-  // polygon. The 3-point circumradius of consecutive CONTROL points over-estimates rho: the centripetal
-  // spline bends ~2x tighter BETWEEN knots, so "control rho>=1.6r" left the meshed spline at rho~0.88r --
-  // still self-folding (the j169 leaf-cap bend near (-504,243,-187): control 1.6 vs spline 0.88). We instead
-  // estimate rho at node k from the SPLINE, sampled at three knot-bracketing pairs of the two adjacent
-  // segments (min over them = the tightest osculating radius the tube must survive). Search-free (segment
-  // known) => O(npt)/sweep, same cost as before. Same lesson as diag2.py's "resample, don't trust cheb-node
-  // spacing", now applied to the smoother's own convergence test. See [[network-greens-arm-selfintersect]].
-  std::vector<Vec3<Real>> cl_s = cl_in;
-  // ---- Shared centerline-curvature model for the two smoothers below (QJ_ARM_CL_SMOOTH curvature limiter and
-  // QJ_ARM_CL_BRIDGE near-seam bend bypass). Both must measure the curvature of the CENTRIPETAL Catmull-Rom
-  // spline CSBQ actually meshes (bcl), NOT the control polygon. cl_rho3 = 3-point circumradius; cl_seg_pt = CR
-  // spline point in segment [i,i+1] at fractional w (mirrors ArcPolyline::eval EXACTLY -- same Barry-Goldman
-  // knot/mix -- but for a KNOWN segment, no arclength search); cl_rho_spline = min osculating radius at node k
-  // over three knot-bracketing sample pairs of the two adjacent segments (samples pulled toward the knot where
-  // a control turn bends the spline tightest; the MIN is the conservative radius the tube must clear).
-  auto cl_rho3 = [&](const Vec3<Real>& a, const Vec3<Real>& b, const Vec3<Real>& c) -> Real {
-    const Vec3<Real> cr = cross(sub(b, a), sub(b, c)); const Real a2 = nrm(cr);
-    if ((double)a2 < 1e-30) return (Real)1e30;
-    return nrm(sub(b, a)) * nrm(sub(b, c)) * nrm(sub(c, a)) / (2 * a2);
-  };
-  auto cl_seg_pt = [&](const std::vector<Vec3<Real>>& P, size_t i, Real w) -> Vec3<Real> {
-    const size_t np = P.size();
-    const Vec3<Real>& p1 = P[i]; const Vec3<Real>& p2 = P[i+1];
-    const Vec3<Real>& p0 = P[i > 0 ? i-1 : i]; const Vec3<Real>& p3 = P[i+2 < np ? i+2 : i+1];
-    auto knot = [&](const Vec3<Real>& a, const Vec3<Real>& b, Real t0) -> Real {
-      const Real dt = (Real)std::pow(std::max(1e-300, (double)nrm(sub(b, a))), 0.5);   // alpha=0.5
-      return t0 + std::max((Real)1e-9, dt);
+  // ---- SMOOTH the FULL vmtk centerline up front (simple moving average, global ends fixed). The vmtk
+  // skeleton is already smooth; only its *discrete* curvature is noisy, and a few averaging passes open the
+  // tightest bends (here raw rho 0.73r -> 2.1r) without moving the path at figure scale. Doing it on the WHOLE
+  // curve -- not on the later extracted window -- is essential: a tight bend often sits right next to a mouth,
+  // and a window-local average that pins its endpoints would leave exactly that bend unsmoothed. ----
+  const Integer sm_passes = std::getenv("QJ_DS_SMOOTH") ? std::max<Integer>(0,(Integer)std::atoi(std::getenv("QJ_DS_SMOOTH"))) : (Integer)8;
+  std::vector<Vec3<Real>> clS = cl_in;
+  for (Integer it = 0; it < sm_passes && clS.size() >= 3; it++) {
+    std::vector<Vec3<Real>> sm = clS;
+    for (size_t k = 1; k+1 < clS.size(); k++)
+      sm[k] = scal((Real)0.25, add(add(clS[k-1], clS[k+1]), scal((Real)2, clS[k])));
+    clS.swap(sm);
+  }
+  // ---- Taubin lambda|mu low-pass (DEFAULT ON, QJ_DS_LOWPASS passes, default 64; QJ_DS_LOWPASS=0 opts out =>
+  // byte-identical to the moving-average-only path). Applied to INTERIOR arms only (NOT caps -- see below), on
+  // the full SMOOTHED centerline BEFORE the window extraction / uniform downsample, so the sparse knots are
+  // sampled from the denoised curve. The 3-point average above is a pure Laplacian SHRINK step (equivalent to
+  // one Taubin lambda=0.5 half-pass with no anti-shrink): a weak low-pass that, on a tortuous interior arm,
+  // leaves residual dkappa/ds curvature noise the toroidal special quadrature cannot resolve -> a ~0.5 DL
+  // free-edge MID-ARM (see [[network-interior-arm-lowpass]]; measured on interior j120->133: DL arm 0.545 ->
+  // 0.00424, 128x, with 64 Taubin passes). Taubin interleaves an anti-shrink mu step (mu<-lambda<0) so it
+  // removes the high-frequency curvature band WITHOUT shrinking the bend (tortuosity preserved) -- the
+  // production CL_LOWPASS fix (lambda 0.5 / mu -0.53). Global ends held fixed each half-step => mouth rings
+  // untouched, watertightness-neutral.
+  //   !is_cap: CAP (leaf) arms are EXCLUDED. A cap's far end is a free tip with a dome seated on the tube's
+  // terminal; caps are already clean without the low-pass (DL ~0.006), and applying Taubin reshapes the near-
+  // tip body curvature (rho/r 1.77->1.41 under the dome) and drives a ~0.9 DL free-edge there (measured on cap
+  // j286->289: 0.006 -> 0.915). Re-deriving the cap axis from the smoothed centerline does NOT help (Taubin
+  // barely moves the near-fixed-endpoint tangent); the only noisy arms that NEED the low-pass are the long
+  // tortuous interior ones. So the low-pass is interior-only. (QJ_CAP_LOWPASS, which opted caps back in after a
+  // tip trim, was reverted 2026-10-15: at full-net scale Taubin un-pins the cap's JUNCTION-SEAM endpoint and
+  // spawns worse cross-list blowups -- the dominant cap error is the seam, not the tip. See s11 memory.) ----
+  const Integer lp_passes = std::getenv("QJ_DS_LOWPASS") ? std::max<Integer>(0,(Integer)std::atoi(std::getenv("QJ_DS_LOWPASS"))) : (Integer)64;
+  if (lp_passes > 0 && !is_cap && clS.size() >= 3) {
+    const Real lp_lam = std::getenv("QJ_DS_LOWPASS_LAMBDA") ? (Real)std::atof(std::getenv("QJ_DS_LOWPASS_LAMBDA")) : (Real)0.5;
+    const Real lp_mu  = std::getenv("QJ_DS_LOWPASS_MU")     ? (Real)std::atof(std::getenv("QJ_DS_LOWPASS_MU"))     : (Real)-0.53;
+    auto lap_step = [&](Real w){                              // one uniform-weight Laplacian smoothing half-step, ends fixed
+      std::vector<Vec3<Real>> sm = clS;
+      for (size_t k = 1; k+1 < clS.size(); k++) {
+        const Vec3<Real> lapk = sub(scal((Real)0.5, add(clS[k-1], clS[k+1])), clS[k]);
+        sm[k] = add(clS[k], scal(w, lapk));
+      }
+      clS.swap(sm);
     };
-    const Real t0 = 0, t1 = knot(p0,p1,t0), t2 = knot(p1,p2,t1), t3 = knot(p2,p3,t2);
-    const Real t = t1 + w*(t2 - t1);
-    auto mix = [&](const Vec3<Real>& a, const Vec3<Real>& b, Real ta, Real tb) -> Vec3<Real> {
-      const Real d = (double)(tb-ta) > 1e-30 ? (tb - t)/(tb - ta) : (Real)0.5;
-      return add(scal(d, a), scal((Real)1 - d, b));
-    };
-    const Vec3<Real> A1 = mix(p0,p1,t0,t1), A2 = mix(p1,p2,t1,t2), A3 = mix(p2,p3,t2,t3);
-    const Vec3<Real> B1 = mix(A1,A2,t0,t2), B2 = mix(A2,A3,t1,t3);
-    return mix(B1,B2,t1,t2);
+    for (Integer it = 0; it < lp_passes; it++) { lap_step(lp_lam); lap_step(lp_mu); }
+  }
+  std::vector<Real> cs(clS.size(), (Real)0);
+  for (size_t k = 1; k < clS.size(); k++) cs[k] = cs[k-1] + nrm(sub(clS[k], clS[k-1]));
+  const Real total = cs.back();
+
+  // ---- SEAM-CORNER mode (DEFAULT; the production seam-settle recipe). The
+  // clamp_mode below forced the body-spline END knots QA/QB exactly onto the junction axis AND clamped the
+  // end tangent -- a double constraint that bent the ~0.1r-off-axis vessel back onto the axis over the one
+  // segment next to the clamp, the residual ~12x gap to the production seamsettle_tr6 baseline. Production
+  // keeps the body on the TRUE centerline and bridges each mouth with ONE gentle quintic Hermite "seam
+  // corner" that leaves the on-axis mouth ring coaxial (tangent = seam axis, zero endpoint acceleration) and
+  // ARRIVES on the vessel with the vessel's own tangent -- re-seating the terminal ring flush under the seam
+  // without straightening the vessel. Reproduced here: 1-panel straight coaxial lead (watertight mouth ring)
+  // -> cp-panel quintic Hermite corner QA->P_hA -> downsampled C2 body spline over the real (un-forced)
+  // window knots -> mirror corner -> lead. Opt out with QJ_DS_NO_SEAM_CORNER (=> old clamp/natural bridge).
+  const bool seam_corner = (std::getenv("QJ_DS_NO_SEAM_CORNER") == nullptr);
+  // ---- coaxial lead length: one scale-invariant stub, capped to a fraction of the arm. Seam-corner and the
+  // legacy CLAMPED mode both use a SHORTER half-radius stub: the stub end QA/QB carries the on-axis mouth
+  // ring, and the quintic corner (resp. clamped spline) curves onto the off-axis vessel over its own run; a
+  // long stub would instead cram the turn into the one segment next to the stub and fold. The glued stub is
+  // straight+coaxial so the mouth ring conforms either way. ----
+  const bool clamp_mode = std::getenv("QJ_DS_CLAMP") != nullptr;
+  Real Llead = (clamp_mode || seam_corner) ? (Real)0.5 * std::max(rA, rB) : std::max(rA, rB);
+  if (const char* e = std::getenv("QJ_DS_LEAD")) Llead = std::max((Real)1e-9, (Real)std::atof(e));
+  Llead = std::min(Llead, (Real)0.35 * total);           // leave room for a non-degenerate interior
+  const Vec3<Real> QA = add(A0,   scal(Llead, uA));
+  const Vec3<Real> QB = add(endC, scal(Llead, uB));      // QB = endC - Llead*endTang (so endC = QB + Llead*fwdB)
+
+  // ---- point on the SMOOTHED centerline at arclength s (linear-interp) ----
+  auto cl_at = [&](Real s) -> Vec3<Real> {
+    if ((double)s <= 0) return clS.front();
+    if ((double)s >= (double)total) return clS.back();
+    size_t i = 0; while (i+1 < cs.size() && (double)cs[i+1] < (double)s) i++;
+    const Real h = std::max((Real)1e-30, cs[i+1]-cs[i]); const Real w = (s-cs[i])/h;
+    return add(scal((Real)1-w, clS[i]), scal(w, clS[i+1]));
   };
-  auto cl_rho_spline = [&](const std::vector<Vec3<Real>>& P, size_t k) -> Real {
-    static const Real wl[3] = {(Real)0.5, (Real)(2.0/3.0), (Real)(5.0/6.0)};
-    static const Real wr[3] = {(Real)0.5, (Real)(1.0/3.0), (Real)(1.0/6.0)};
-    Real best = (Real)1e30;
-    for (int m = 0; m < 3; m++)
-      best = std::min(best, cl_rho3(cl_seg_pt(P, k-1, wl[m]), P[k], cl_seg_pt(P, k, wr[m])));
-    return best;
-  };
-  {
-    // QJ_ARM_CL_SMOOTH: fixed to production 2.5 (was env; baked 2026-10-07 as the seamsettle_tr6 baseline)
-    const Real cse_val = (Real)2.5;
-    if (blend && cl_s.size() >= 3) {
-      const Real r_arm = std::max(rA, rB);
-      const Real m_loc = std::getenv("QJ_CORNER_MARGIN") ? (Real)std::atof(std::getenv("QJ_CORNER_MARGIN")) : (Real)0.25;
-      const Real smf = cse_val;
-      const Real target = (smf > (Real)1 ? smf : ((Real)1 + m_loc)) * r_arm;   // want rho >= target everywhere
-      // QJ_ARM_CL_SMOOTH_ITERS: fixed to production 1500 (was env; baked 2026-10-07 as the seamsettle_tr6 baseline)
-      const Integer iters = (Integer)1500;
-      const Real wmax = std::getenv("QJ_ARM_CL_SMOOTH_W") ? (Real)std::atof(std::getenv("QJ_ARM_CL_SMOOTH_W")) : (Real)0.6;
-      // END BOOST: the sharp APPROACH BENDS live in the outer ~15% of the arm (the vessel's final curve into the
-      // neighbour junction), right where the fixed endpoint stiffens the last CR segment so the uniform target
-      // under-relaxes. Raise the target toward the ends (target*(1+endboost) at the very end, ramping to plain
-      // target by end_span) so those points relax harder -- closure-neutral (radius untouched), and consistent
-      // with the mouth already deviating from vmtk via the coaxial lead. QJ_ARM_CL_SMOOTH_ENDBOOST(0=off).
-      // QJ_ARM_CL_SMOOTH_ENDBOOST: fixed to production 1.5 (was env; baked 2026-10-07 as the seamsettle_tr6 baseline)
-      const Real endboost = (Real)1.5;
-      // QJ_ARM_CL_SMOOTH_ENDSPAN: fixed to production 0.15 (was env; baked 2026-10-07 as the seamsettle_tr6 baseline)
-      const Real end_span = (Real)0.15;
-      const size_t npt = cl_s.size();
-      Integer moved_total = 0;
-      for (Integer it = 0; it < iters; it++) {
-        Real worst = (Real)1e30; Integer moved = 0;
-        std::vector<Vec3<Real>> up = cl_s;
-        for (size_t k = 1; k + 1 < cl_s.size(); k++) {
-          const Real rho = cl_rho_spline(cl_s, k);
-          Real tgt_k = target;
-          if ((double)endboost > 0) {
-            const Real fend = (Real)std::min(k, npt-1-k) / (Real)std::max<size_t>(1, npt-1);   // 0 at ends -> ~0.5 mid
-            const Real ew = (double)fend < (double)end_span ? ((Real)1 - fend/end_span) : (Real)0; // 1 at end -> 0 by end_span
-            tgt_k = target * ((Real)1 + endboost * ew);
-          }
-          if ((double)rho < (double)tgt_k) {
-            const Vec3<Real> mid = scal((Real)0.5, add(cl_s[k-1], cl_s[k+1]));
-            Real def = (Real)1 - rho / tgt_k; if ((double)def < 0) def = 0; if ((double)def > 1) def = 1;
-            const Real w = wmax * def;                                    // drive vanishes at rho==target
-            up[k] = add(scal((Real)1 - w, cl_s[k]), scal(w, mid));
-            worst = std::min(worst, rho); moved++;
-          }
-        }
-        cl_s.swap(up); moved_total += moved;
-        (void)worst;
-        if (moved == 0) break;                                            // every point at/above its (boosted) target
-      }
-      if (std::getenv("QJ_CORNER"))
-        std::cout << "  [cl-smooth] target rho>=" << (double)target << " (r_arm=" << (double)r_arm
-                  << ") : " << (long)moved_total << " point-relaxations over <=" << (long)iters << " iters\n";
-    }
+  // ---- interior knots: the raw vmtk centerline between the two lead ends [Llead, total-Llead], SMOOTHED by
+  // a simple moving average and then DOWNSAMPLED to a sparse UNIFORM-arclength set of representative knots.
+  // The vmtk centerline is already smooth (see vis/network_pipeline_pair*): only its *discrete* curvature
+  // estimate is noisy, and that noise is removed by plain averaging -- no curvature limiter needed. Uniform
+  // (not data-adaptive/RDP) knot spacing is what lets a global NATURAL C2 cubic interpolate them WITHOUT the
+  // non-uniform-knot Runge overshoot that previously forced a fallback to the mere-C1 centripetal curve. ----
+  // The coaxial straight entry occupies two collinear stretches at each mouth: the glued lead A0->QA (length
+  // Llead) plus a ghost run QA->QA+gspan*uA that the spline reproduces straight. The interior window must
+  // therefore begin at axial depth (Llead+gspan) past A0 and end that far back from endC. Pin it by
+  // PROJECTION onto the junction axis, NOT by arclength-from-cl[0]: the vmtk centerline can start/end a short
+  // way BEHIND the seam center (it runs into the junction body -- here cl[0] is ~2r behind A0), so arclength
+  // Llead from cl[0] lands behind QA and the collinear lead then doubles back over it (a 180 deg control
+  // reversal => the tube self-folds). bse = first arclength whose forward projection past A0 reaches the ghost
+  // depth; bsx = last arclength whose projection back from endC reaches it. ----
+  Real gspan = std::getenv("QJ_DS_GHOST_LEN") ? (Real)std::atof(std::getenv("QJ_DS_GHOST_LEN")) : (Real)2 * r_arm;
+  gspan = std::max((Real)0, std::min(gspan, (Real)0.25 * total));
+  // TURN-ADAPTIVE corner room: the mouth RING axis is dictated by the junction (uA / uB) and generally differs
+  // from the centerline's local tangent by some swing angle theta (here the far junction's arc-window axis is
+  // ~64 deg off the centerline). A radius-r tube physically cannot turn theta in less than r*theta of
+  // arclength, so the spline MUST be given >= target*r*theta of run to swing the axis onto the tangent or it
+  // folds (rho = run/theta < r). Begin the interior that much deeper at the misaligned mouth: the spline then
+  // rounds the swing as ONE gentle C2 corner (rho ~ run/theta ~ Kturn*r). theta is measured from each mouth
+  // axis to the arm's general direction over the near third (robust to the tight vmtk kink at the very seam).
+  auto ang_rad = [](const Vec3<Real>& p, const Vec3<Real>& q){ double d=(double)dot(unit(p),unit(q)); d=std::max(-1.0,std::min(1.0,d)); return (Real)std::acos(d); };
+  // Mouth swing = the TOTAL angle the spline must bend from the junction-dictated mouth axis onto the
+  // centerline. The centerline keeps turning through the near-mouth zone (its tangent can match the axis right
+  // at the seam yet swing away a few radii in -- exactly the far mouth of this interior arm, where the raw
+  // rho dips to 0.73r before the smoothing opens it), so measure the MAX angular deviation of the (lightly
+  // smoothed) tangent from the mouth axis over the near-mouth ~45%% -- not a single end tangent. The corner
+  // room below then grants that bend r*theta of run so rho stays >= Kturn*r.
+  auto cl_tan = [&](Real s)->Vec3<Real>{ const Real hh=(Real)0.03*total+(Real)1e-9; return unit(sub(cl_at(std::min(total,s+hh)), cl_at(std::max((Real)0,s-hh)))); };
+  Real thA = 0, thB = 0; { const Integer NS = 40; const Real span = (Real)0.45*total;
+    for (Integer i = 0; i <= NS; i++) { const Real s=(Real)i/(Real)NS*span;        thA = std::max(thA, ang_rad(uA, cl_tan(s))); }
+    for (Integer i = 0; i <= NS; i++) { const Real s=total-(Real)i/(Real)NS*span;  thB = std::max(thB, ang_rad(uB, scal((Real)-1, cl_tan(s)))); }
   }
-  // ---- NEAR-SEAM BEND BYPASS (QJ_ARM_CL_BRIDGE, default off). The curvature limiter above relaxes each
-  // kinked node toward its neighbour midpoint, but near the SEAM the fixed endpoint stiffens the last CR
-  // segments and a tight APPROACH BEND that sits in the first ~2 panels (right where the vessel dives into
-  // the junction) cannot be relaxed enough -- it is too close to the coaxial-lead/corner region for either
-  // the limiter or the PIN_CURV run-pin to reach. Remedy (per request): EXCISE the high-curvature section
-  // near each end and REPLACE it with a smooth low-curvature interpolation that BYPASSES those panels, then
-  // continue with the ORIGINAL vmtk centerline. MEASURED HARMFUL / INERT 2026-09-26 (default OFF): on n298 the
-  // tight far bends are NOT in the vmtk run at all -- they sit in the synthesized far-CORNER panels (the u->v
-  // swing onto the junction axis), which coax() builds from the junction axis, not from cl_s. So this bridge
-  // left the far-half rho/r distribution byte-identical (min 0.869, 5 arms <1.0) AND raised closure 1.19->1.60.
-  // Kept env-gated for the record; the actual tight bends are a CORNER property (see QJ_ARM_CORNER_RELAX note).
-  // Concretely: locate the tightest spline node within a search
-  // window of each end; grow the contiguous sub-target cluster; pad it outward by ~QJ_ARM_CL_BRIDGE_PAN
-  // axial-panel-lengths to two ANCHOR nodes (kept, one on each side, in the gentle vessel); rebuild every
-  // control node strictly between the anchors onto a quintic Hermite bridge whose endpoint tangents are the
-  // KEPT vmtk tangents just outside the window. The bridge spreads the same net turn over the full
-  // window chord => curvature ~ turn/chord, far below the vmtk spike, and is C1 with the retained vmtk on
-  // both sides (no slit). Endpoints (seam centers) are NEVER moved => watertightness-neutral. Runs on cl_s
-  // BEFORE bcl.init, so the corner Hermite anchor (bcl.eval(bse)), the raw run, and the RMF frame all see
-  // the de-kinked centerline. Only the two ends are touched (search window), never the mid-arm.
-  {
-    const char* bre = std::getenv("QJ_ARM_CL_BRIDGE");
-    if (blend && bre && cl_s.size() >= 5) {
-      const Real r_arm = std::max(rA, rB);
-      const Real m_loc = std::getenv("QJ_CORNER_MARGIN") ? (Real)std::atof(std::getenv("QJ_CORNER_MARGIN")) : (Real)0.25;
-      const Real brf = (Real)std::atof(bre);
-      const Real target = (brf > (Real)1 ? brf : ((Real)1 + m_loc)) * r_arm;    // bridge any node with rho < target
-      const Real bpan = std::getenv("QJ_ARM_CL_BRIDGE_PAN") ? std::max<Real>((Real)0.25, (Real)std::atof(std::getenv("QJ_ARM_CL_BRIDGE_PAN"))) : (Real)2;
-      const Real bkr  = std::getenv("QJ_ARM_CL_BRIDGE_KR")  ? (Real)std::atof(std::getenv("QJ_ARM_CL_BRIDGE_KR"))  : corner_kr;
-      const Real search_frac = std::getenv("QJ_ARM_CL_BRIDGE_SEARCH") ? (Real)std::atof(std::getenv("QJ_ARM_CL_BRIDGE_SEARCH")) : (Real)0.40;
-      auto arclen_of = [&](const std::vector<Vec3<Real>>& P) {                  // cumulative chord arclength
-        std::vector<Real> s(P.size(), (Real)0);
-        for (size_t k = 1; k < P.size(); k++) s[k] = s[k-1] + nrm(sub(P[k], P[k-1]));
-        return s;
-      };
-      // Bridge the tightest sub-target node found in the search window at ONE end. `front` picks which end.
-      auto bridge_end = [&](bool front) -> bool {
-        const size_t npt = cl_s.size();
-        std::vector<Real> sarr = arclen_of(cl_s);
-        const Real Ltot = sarr.back();
-        if ((double)Ltot < 1e-12) return false;
-        const Real Whalf = bpan * (Ltot / (Real)std::max<Integer>(1, n)) * (Real)0.5;   // pad each side (panels/2)
-        const Real searchL = search_frac * Ltot;
-        // tightest interior node within searchL of the chosen end
-        size_t kstar = 0; Real rmin = (Real)1e30;
-        for (size_t k = 1; k + 1 < npt; k++) {
-          const Real send = front ? sarr[k] : (Ltot - sarr[k]);
-          if ((double)send > (double)searchL) continue;
-          const Real rho = cl_rho_spline(cl_s, k);
-          if ((double)rho < (double)rmin) { rmin = rho; kstar = k; }
-        }
-        if (kstar == 0 || (double)rmin >= (double)target) return false;           // no tight approach bend this end
-        // grow the contiguous sub-target cluster around kstar
-        size_t klo = kstar, khi = kstar;
-        while (klo > 1 && (double)cl_rho_spline(cl_s, klo-1) < (double)target) klo--;
-        while (khi + 2 < npt && (double)cl_rho_spline(cl_s, khi+1) < (double)target) khi++;
-        // pad outward to the two kept anchor nodes (>=1 and <=npt-2 so a kept neighbour exists for the tangent)
-        size_t ka = klo, kb = khi;
-        while (ka > 1 && (double)(sarr[klo] - sarr[ka-1]) < (double)Whalf) ka--;
-        while (kb + 2 < npt && (double)(sarr[kb+1] - sarr[khi]) < (double)Whalf) kb++;
-        if (kb < ka + 2) return false;                                            // no interior node to replace
-        // anchor tangents from KEPT vmtk just OUTSIDE the window (one-sided; unaffected by the rebuild)
-        const Vec3<Real> tA = unit(sub(cl_s[ka], cl_s[ka-1]));
-        const Vec3<Real> tB = unit(sub(cl_s[kb+1], cl_s[kb]));
-        const Real h = bkr * nrm(sub(cl_s[kb], cl_s[ka]));
-        const Real sden = sarr[kb] - sarr[ka];
-        if ((double)sden < 1e-30) return false;
-        for (size_t k = ka + 1; k < kb; k++) {
-          const Real u = (sarr[k] - sarr[ka]) / sden;                             // chord-arclength fraction in window
-          cl_s[k] = HybridAssembly<Real>::hermite5(cl_s[ka], tA, h, cl_s[kb], tB, h, u);
-        }
-        if (std::getenv("QJ_CORNER")) {
-          Real rnew = (Real)1e30;
-          for (size_t k = ka + 1; k < kb; k++) rnew = std::min(rnew, cl_rho_spline(cl_s, k));
-          std::cout << "  [cl-bridge] end=" << (front ? "front" : "back ")
-                    << " kstar=" << (long)kstar << " rho/r=" << (double)(rmin/r_arm)
-                    << " -> bridged nodes [" << (long)(ka+1) << ".." << (long)(kb-1) << "]"
-                    << " span=" << (double)((sarr[kb]-sarr[ka])/(Ltot/(Real)std::max<Integer>(1,n))) << " panels"
-                    << "  new min rho/r=" << (double)(rnew/r_arm) << "\n";
-        }
-        return true;
-      };
-      bridge_end(true);
-      bridge_end(false);   // recomputes arclength internally, so the far end sees the de-kinked front
-    }
+  thA = std::min(thA, (Real)(0.5*M_PI)); thB = std::min(thB, (Real)(0.5*M_PI));     // cap the room at a right angle
+  const Real Kturn = std::getenv("QJ_DS_KTURN") ? (Real)std::atof(std::getenv("QJ_DS_KTURN")) : (Real)1.6;
+  Real depthA = Llead + gspan + Kturn * r_arm * thA;     // axial depth (past A0 along uA) where the interior begins
+  Real depthB = Llead + gspan + Kturn * r_arm * thB;     // axial depth (back from endC along uB) where it ends
+  depthA = std::min(depthA, (Real)0.45*total);           // keep a non-degenerate interior window
+  depthB = std::min(depthB, (Real)0.45*total);
+  // CLAMPED mode (QJ_DS_CLAMP): decouple ring-conformance from inward straightness. The natural-cubic-through-
+  // collinear-lead design pins the mouth tangent to uA/uB by forcing the spline STRAIGHT over Llead+gspan+room
+  // -- but where the vessel bends within a few radii of a mouth (the interior far mouth here) that forced-
+  // straight run OVERRUNS the bend and compresses the vessel's own gentle ~2.9r turn into a ~0.48r fold. A
+  // clamped C2 spline pins the END TANGENT to the junction axis (ring still conforms, straight coaxial stub
+  // still joins C1 on the lead panel boundary) while leaving end CURVATURE free, so the spline curves onto the
+  // centerline immediately instead of straightening it. No ghost run: the body starts at the coaxial-stub
+  // depth Llead itself.
+  if (clamp_mode && !seam_corner) { depthA = Llead; depthB = Llead; }
+  // arclength at a given projection depth past A0 (forward) / back from endC (backward).
+  auto sdepth_fwd = [&](Real depth)->Real{ const Integer NS=2000;
+    for (Integer i=0;i<=NS;i++){ const Real s=(Real)i/(Real)NS*total; if ((double)dot(sub(cl_at(s),A0),uA)>=(double)depth) return s; } return (Real)0.45*total; };
+  auto sdepth_bwd = [&](Real depth)->Real{ const Integer NS=2000;
+    for (Integer i=NS;i>=0;i--){ const Real s=(Real)i/(Real)NS*total; if ((double)dot(sub(cl_at(s),endC),uB)>=(double)depth) return s; } return (Real)0.55*total; };
+
+  Real bse = 0, bsx = total;
+  if (seam_corner) {
+    // ADAPTIVE per-corner chord extension -- the downsample analog of the production CORNER_RELAX + mutual-
+    // borrow. Instead of a fixed room, hand the body off to each corner as SHALLOW
+    // as possible and deepen ONLY the corner that folds: while a corner's continuous quintic rho_min < tgt*r,
+    // push its handoff pin deeper (bse up / bsx down), which lengthens the Hermite chord |Q-Ph| and its handle
+    // h=kr*|chord|, so the same axis->vessel swing spreads over more arclength => rho rises. MUTUAL-BORROW cap:
+    // a pin may push toward mid-arm as long as >= min_run of body remains between the pins (bse+min_run<=bsx),
+    // so a tight corner borrows the slack corner's room. This extends the chord ONLY at tight turns, keeping
+    // every other corner shallow (minimal deviation from the real vessel => best fidelity + closure), exactly
+    // the production lever. QJ_DS_CORNER_TGT (default 1.6*r) is the fold-clear target; QJ_DS_CORNER_ROOM the
+    // shallow START depth (units of r); QJ_DS_CORNER_RUN the min body run kept between pins (fraction of total).
+    const Vec3<Real>& fwd = fwdB;
+    auto h5min_rho = [&](const Vec3<Real>& P0,const Vec3<Real>& T0,Real h0,const Vec3<Real>& P1,const Vec3<Real>& T1,Real h1)->Real{
+      const Integer M=100; const Real hh=(Real)1/(M+2); Real km=0;
+      for (Integer i=1;i<M;i++){ const Real s=(Real)i/M;
+        const Vec3<Real> xm=HybridAssembly<Real>::hermite5(P0,T0,h0,P1,T1,h1,s-hh);
+        const Vec3<Real> x0=HybridAssembly<Real>::hermite5(P0,T0,h0,P1,T1,h1,s);
+        const Vec3<Real> xp=HybridAssembly<Real>::hermite5(P0,T0,h0,P1,T1,h1,s+hh);
+        const Vec3<Real> d1=scal((Real)1/(2*hh),sub(xp,xm)); const Vec3<Real> d2=scal((Real)1/(hh*hh),sub(add(xp,xm),scal((Real)2,x0)));
+        const Real sp=nrm(d1),cn2=nrm(cross(d1,d2)); if ((double)sp>1e-30){ const Real k=cn2/(sp*sp*sp); if ((double)k>(double)km) km=k; } }
+      return (double)km>1e-30 ? (Real)1/km : (Real)1e30; };
+    const Real ckr = std::getenv("QJ_DS_CORNER_KR") ? (Real)std::atof(std::getenv("QJ_DS_CORNER_KR")) : (Real)0.8;
+    const Real cfl = std::getenv("QJ_DS_CORNER_FLOOR") ? (Real)std::atof(std::getenv("QJ_DS_CORNER_FLOOR")) : (Real)1.00;
+    const Real cca = std::getenv("QJ_DS_CORNER_CAP")   ? (Real)std::atof(std::getenv("QJ_DS_CORNER_CAP"))   : (Real)1.00;
+    auto fh = [&](const Vec3<Real>& T,const Vec3<Real>& chord)->Real{ const Real L=nrm(chord); if ((double)L<1e-30) return (Real)0;
+      return ckr*L*std::min(cca,std::max(cfl,dot(T,unit(chord)))); };
+    auto rhoA_at = [&](Real s)->Real{ const Vec3<Real> Ph=cl_at(s),tn=cl_tan(s),ch=sub(Ph,QA);
+      return h5min_rho(QA,uA,fh(uA,ch),Ph,tn,fh(tn,ch)); };
+    auto rhoB_at = [&](Real s)->Real{ const Vec3<Real> Ph=cl_at(s),tn=cl_tan(s),ch=sub(QB,Ph);
+      return h5min_rho(Ph,tn,fh(tn,ch),QB,fwd,fh(fwd,ch)); };
+    // room0 = the START corner depth (units of r) before adaptive deepening. 2*r is the measured full-n298
+    // closure sweet spot: the near-seam swing is already gentle there, and the adaptive loop then deepens ONLY
+    // the still-folding corners further. A shallow start (0.75r) clears folds too but PUTS the swing in a short
+    // near-seam chord -> more curved near-seam panels -> worse whole-net closure (0.171 vs 0.085 at 2r), the
+    // opposite of what the sub8 subset suggests. See [[network-downsample-arm-pipeline]].
+    const Real room0 = (std::getenv("QJ_DS_CORNER_ROOM") ? (Real)std::atof(std::getenv("QJ_DS_CORNER_ROOM")) : (Real)2) * r_arm;
+    const Real tgt   = (std::getenv("QJ_DS_CORNER_TGT")  ? (Real)std::atof(std::getenv("QJ_DS_CORNER_TGT"))  : (Real)1.6) * r_arm;
+    const Real min_run = (std::getenv("QJ_DS_CORNER_RUN") ? (Real)std::atof(std::getenv("QJ_DS_CORNER_RUN")) : (Real)0.12) * total;
+    const Real step = (Real)0.01*total; const Integer gmax = (Integer)130;
+    bse = sdepth_fwd(Llead + room0); bsx = sdepth_bwd(Llead + room0);
+    const Real bse0 = bse, bsx0 = bsx;
+    { Integer g=0; while ((double)rhoA_at(bse)<(double)tgt && (double)(bse+min_run)<(double)bsx && g++<gmax) bse+=step; }  // near first
+    { Integer g=0; while ((double)rhoB_at(bsx)<(double)tgt && (double)(bsx-min_run)>(double)bse && g++<gmax) bsx-=step; }  // far
+    { Integer g=0; while ((double)rhoA_at(bse)<(double)tgt && (double)(bse+min_run)<(double)bsx && g++<gmax) bse+=step; }  // near borrows
+    if (diag)
+      std::cout << "  [ds-corner-relax] " << (dump_tag?dump_tag:"") << " near rho/r=" << (double)(rhoA_at(bse)/r_arm)
+                << " far rho/r=" << (double)(rhoB_at(bsx)/r_arm) << "  bse/tot " << (double)(bse0/total) << "->" << (double)(bse/total)
+                << "  bsx/tot " << (double)(bsx0/total) << "->" << (double)(bsx/total) << " (tgt " << (double)(tgt/r_arm) << ")\n";
+  } else {
+    bse = sdepth_fwd(depthA); bsx = sdepth_bwd(depthB);
   }
-  if (dbg) dbg_curv = cl_s;   // snapshot after curvature-limiting (+bridge, default off), before low-pass
-  if (blend) {
-    // ---- Curvature-noise LOW-PASS (QJ_ARM_CL_LOWPASS, default off => cl_s unchanged). The rho-FLOOR limiter
-    // (QJ_ARM_CL_SMOOTH) only pulls points where rho<target, so it cannot touch the high-frequency curvature
-    // WIGGLE the raw vmtk knots carry: after the C2 spline the curvature is continuous but dkappa/ds still
-    // oscillates (rho/r swinging 3<->200 along a cap), and CSBQ's per-panel TOROIDAL special-quad rule -- built
-    // for near-CONSTANT panel curvature -- cannot resolve that, giving a tol-INVARIANT DL residual concentrated
-    // on the most-curved caps (verified: the smooth analytic spiral at the SAME tortuosity hits the ~3e-8 floor;
-    // raising the rho-floor target instead STRAIGHTENS/kinks the tortuous caps). A Taubin lambda|mu filter is a
-    // genuine low-pass: a lambda>0 shrink step then a mu<-lambda inflation step removes only the high-frequency
-    // band, so it denoises curvature while PRESERVING the overall bend (tortuosity) -- the "keep arms curved"
-    // directive. Endpoints (seam center + cap tip) fixed; radius untouched => closure-neutral. Scoped to caps
-    // (is_cap) unless =all. Runs BEFORE the C2 fit so the spline interpolates the denoised knots.
-    // QJ_ARM_CL_LOWPASS: fixed to production "all" (was env; baked 2026-10-07 as the seamsettle_tr6 baseline)
-    {
-      const char* lpe = "all";
-      const std::string lps(lpe);
-      const bool allarms = (lps == "all");
-      const bool on = allarms ? true : is_cap;
-      Integer passes = allarms ? (Integer)12 : (Integer)std::atoi(lpe);
-      passes = (Integer)64;   // QJ_ARM_CL_LOWPASS_PASSES: fixed to production 64 (was env; baked 2026-10-07 as the seamsettle_tr6 baseline)
-      if (on && passes > 0 && cl_s.size() >= 5) {
-        const Real lam = std::getenv("QJ_ARM_CL_LOWPASS_LAMBDA") ? (Real)std::atof(std::getenv("QJ_ARM_CL_LOWPASS_LAMBDA")) : (Real)0.5;
-        const Real mu  = std::getenv("QJ_ARM_CL_LOWPASS_MU")     ? (Real)std::atof(std::getenv("QJ_ARM_CL_LOWPASS_MU"))     : (Real)-0.53;
-        const size_t n = cl_s.size();
-        auto lap = [&](const std::vector<Vec3<Real>>& X, size_t k) {   // uniform-weight discrete Laplacian
-          return sub(scal((Real)0.5, add(X[k-1], X[k+1])), X[k]); };
-        for (Integer it = 0; it < passes; it++) {
-          std::vector<Vec3<Real>> up = cl_s;                           // lambda (shrink) step
-          for (size_t k = 1; k + 1 < n; k++) up[k] = add(cl_s[k], scal(lam, lap(cl_s, k)));
-          cl_s.swap(up);
-          up = cl_s;                                                   // mu (anti-shrink) step
-          for (size_t k = 1; k + 1 < n; k++) up[k] = add(cl_s[k], scal(mu, lap(cl_s, k)));
-          cl_s.swap(up);
-        }
-        if (std::getenv("QJ_CORNER"))
-          std::cout << "  [cl-lowpass] Taubin lambda=" << (double)lam << " mu=" << (double)mu
-                    << " x" << (long)passes << " passes on " << (long)n << " knots\n";
-      }
-    }
-    if (dbg) dbg_lowpass = cl_s;   // snapshot after Taubin low-pass, i.e. the knots the C2 spline interpolates
-    // C2 centerline (QJ_ARM_C2_SPLINE, default off => byte-identical C1 centripetal CR). For caps the flag is
-    // scoped to CAP arms only unless QJ_ARM_C2_SPLINE=all (interior arms are near-straight; their C1 knots are
-    // absorbed). Removes the per-panel curvature-jump straddle on the curved cap body (the M8 hard rule).
-    // QJ_ARM_C2_SPLINE: fixed to production "all" (was env; baked 2026-10-07 as the seamsettle_tr6 baseline)
-    bcl.c2 = true;
-    bcl.init(cl_s);
-    const Real S = bcl.total;
-    if ((double)S > 1e-12) {
-      auto eval_s = [&](Real s) { return bcl.eval(s/S); };
-      auto nearest_s = [&](const Vec3<Real>& Q, Real lo, Real hi) -> Real {   // arclength of v closest to Q
-        const Integer NS = 800; Real best = lo, bd = (Real)1e30;
-        for (Integer k = 0; k <= NS; k++) { const Real s = lo + (hi-lo)*(Real)k/NS;
-          const Real d = nrm(sub(eval_s(s), Q)); if ((double)d < (double)bd) { bd = d; best = s; } }
-        return best;
-      };
-      // Coaxial lead: keep it SHORT (few arm radii, capped to a fraction of the chord). QA/QB are the lead
-      // ends on the junction axes; entry/exit pin the raw vmtk run to the nearest arclength just inside.
-      {
-        bLl = std::min<Real>(blead_len, (Real)0.20*L);
-        const Real Ll = bLl;
-        bQA = add(A0,   scal(Ll, uA));
-        bQB = add(endC, scal(Ll, uB));
-        bse = nearest_s(bQA, (Real)0,      (Real)0.45*S);
-        bsx = nearest_s(bQB, (Real)0.55*S, S);
-        if ((double)bsx <= (double)bse) { bse = (Real)0.05*S; bsx = (Real)0.95*S; }
-        // GENTLE-CORNER guard (QJ_ARM_BLEND_TURN, degrees of tangent turn allowed per corner panel; default
-        // 12). After the straight lead the corner rotates the junction seam axis u onto the vmtk tangent v at
-        // the projected mouth. If u is far off v the base corner (short chord Q0->Pen, few panels) is a SHARP
-        // turn. Two coupled remedies, both keyed to the turn angle so the arm is only a SMALL deviation off the
-        // centerline per step yet still fully realigns to v (watertight interior):
-        //   (a) LENGTHEN the transition -- push the vmtk entry/exit points DOWN the vessel by an arclength
-        //       proportional to the turn angle, so the Hermite chord is long and the bend gentle;
-        //   (b) add corner panels so the per-panel tangent change stays <= the cap (run panels preserved by
-        //       inflating n, exactly like the non-blend turn-adaptive branch: cp+=extra, n+=2*extra).
-        auto vtan = [&](Real s, Real toward) -> Vec3<Real> {              // unit vmtk tangent at s, pointing toward `toward`
-          const Real d = std::max<Real>((Real)1e-3*S, (Real)1e-6);
-          const Vec3<Real> tg = unit(sub(eval_s(std::min<Real>(S,s+d)), eval_s(std::max<Real>((Real)0,s-d))));
-          return (double)toward >= (double)s ? tg : scal((Real)-1, tg);
-        };
-        auto angd = [&](const Vec3<Real>& p, const Vec3<Real>& q){ double c=(double)dot(p,q);
-          c=std::max(-1.0,std::min(1.0,c)); return std::acos(c)*180.0/M_PI; };
-        const double thA = angd(uA, vtan(bse, S));                        // u_A vs vmtk tangent leaving mouth A
-        const double thB = angd(uB, vtan(bsx, (Real)0));                  // u_B vs vmtk tangent leaving mouth B
-        // QJ_ARM_BLEND_TURN: fixed to production 6 (was env; baked 2026-10-07 as the seamsettle_tr6 baseline)
-        const double turn_cap = 6.0; // target tangent turn per panel (deg)
-        // (a) LENGTHEN: push the vmtk entry/exit down the vessel by an arclength proportional to the turn
-        // angle, so the corner Hermite chord is long and the bend gentle (a genuine u->v swing turns slowly).
-        const Real hpan = S/(Real)std::max<Integer>(1, n);                // vmtk arclength per panel
-        const Real LtA  = std::min<Real>((Real)(thA/turn_cap)*hpan, (Real)0.35*S);
-        const Real LtB  = std::min<Real>((Real)(thB/turn_cap)*hpan, (Real)0.35*S);
-        bse = std::min<Real>(bse + LtA, (Real)0.45*S);                    // push vmtk entry down the vessel
-        bsx = std::max<Real>(bsx - LtB, (Real)0.55*S);                    // push vmtk exit  up   the vessel
-        // (a') CURVATURE pin push (QJ_ARM_PIN_CURV, default off). The turn-lengthen keys on the tangent ANGLE
-        // u vs v, which misses a sharp APPROACH BEND right at the mouth: the vmtk can enter the junction with
-        // an aligned tangent yet high curvature (rho<r) in the last ~2% of arclength -> the raw run just inside
-        // the pin self-folds, and neither the mouth-windowed radius dip nor the endpoint-pinned centerline
-        // smoothing can touch it. Remedy: walk each run pin FURTHER into the vessel until the CR-spline
-        // curvature radius there clears target*r, so the smooth corner Hermite (Pex..Q1) spans the bend and
-        // the raw run starts/ends only where the vessel is gentle. Capped at 0.45S/0.55S (the run never
-        // vanishes; the reset below still guards bsx<=bse).
-        if (const char* pce = std::getenv("QJ_ARM_PIN_CURV")) {
-          const Real r_arm = std::max(rA, rB);
-          const Real pin_tgt = ((Real)std::atof(pce) > (Real)1 ? (Real)std::atof(pce) : (Real)1.25) * r_arm;
-          auto rho_s = [&](Real s) -> Real {                              // CR-spline curvature radius at arclength s
-            const Real d = std::max<Real>((Real)2e-3*S, (Real)1e-6);
-            const Vec3<Real> xm = eval_s(std::max<Real>((Real)0, s-d)), x0 = eval_s(s), xp = eval_s(std::min<Real>(S, s+d));
-            const Vec3<Real> d1 = scal((Real)1/(2*d), sub(xp, xm));
-            const Vec3<Real> d2 = scal((Real)1/(d*d), sub(add(xp, xm), scal((Real)2, x0)));
-            const Real sp = nrm(d1), cn2 = nrm(cross(d1, d2));
-            return ((double)sp > 1e-30 && (double)cn2 > 1e-30) ? (Real)(sp*sp*sp/cn2) : (Real)1e30;
-          };
-          const Real step = (Real)0.01*S; Integer guard = 0;
-          while ((double)rho_s(bse) < (double)pin_tgt && (double)bse < (double)((Real)0.45*S) && guard++ < 60) bse += step;
-          guard = 0;
-          while ((double)rho_s(bsx) < (double)pin_tgt && (double)bsx > (double)((Real)0.55*S) && guard++ < 60) bsx -= step;
-        }
-        if ((double)bsx <= (double)bse) { bse = (Real)0.05*S; bsx = (Real)0.95*S; }
-        if (std::getenv("QJ_CORNER"))
-          std::cout << "  [blend-turn] thA=" << thA << " thB=" << thB << " cap=" << turn_cap
-                    << "  Ltrans " << (double)LtA << "/" << (double)LtB << " (panel-count guard follows)\n";
-      }
-    }
-  }
-  // DEGENERATE-CORNER MERGE (QJ_ARM_CORNER_MERGE=lead|vmtk). When the coaxial-lead endpoint ~= the vmtk
-  // entry (the common well-aligned case), the Hermite corner OVERSHOOTS (bulges out and back) between two
-  // near-coincident points => the meshed centerline reverses inside the corner panel, the RMF flips ~180
-  // deg, and CSBQ meshes a self-crossing tube (DL near-quad garbage). Fix in TWO coupled steps, both gated
-  // on the per-corner flags decided just after the corner guard (once the corner arclength is known):
-  //   (1) base() straightens the degenerate corner (linear between its endpoints -- monotone, since the
-  //       vmtk entry is pushed downstream of the lead end, so the straight join never doubles back); the
-  //       flags are captured by REFERENCE so the RMF built below sees the straightened curve (no flip);
-  //   (2) the panel knot vector drops the (now short, straight) corner panel by merging it into the LEAD
-  //       (=lead) or the first vmtk-RUN (=vmtk) panel, so its aspect is healthy (CSBQ in-range).
-  // QJ_ARM_CORNER_MERGE: fixed to production "lead" (was env; baked 2026-10-07 as the seamsettle_tr6 baseline)
-  const char* cmerge_env = "lead";
-  const bool merge_lead = cmerge_env && std::string(cmerge_env) == "lead";
-  const bool merge_vmtk = cmerge_env && std::string(cmerge_env) == "vmtk";
-  const bool do_merge = blend && (merge_lead || merge_vmtk);
-  const Real merge_frac = std::getenv("QJ_ARM_CORNER_MERGE_FRAC") ? (Real)std::atof(std::getenv("QJ_ARM_CORNER_MERGE_FRAC")) : (Real)0.5;
-  bool cmerge0 = false, cmerge1 = false;                                  // set after the corner guard (below)
-  // QJ_CAP_SETTLE (default off => byte-identical). Curved-arm-preserving alternative to QJ_CAP_STRAIGHT for
-  // the far-corner MERGE case on CAP arms: QJ_CAP_STRAIGHT forces the WHOLE arm onto the single-Hermite
-  // rescue (interior discarded); QJ_CAP_SETTLE only replaces the already-straight merged terminal
-  // [e2L,1] (corner1+lead1 collapsed by cmerge1 into one chord Pex->C1 tilted off the cap axis, which is
-  // the root cause of the cap free-edge hotspot: the meshed terminal ring lands tilted under the dome) with
-  // ONE smooth quintic Hermite that still starts at Pex along the vmtk exit tangent but ARRIVES at the cap
-  // tip C1 coaxial with the cap axis (tangent -U1), so the terminal ring sits flush under the dome equator
-  // (QJ_CAP_TERM_REG then has nothing to correct). The raw vmtk run [e1R,e2L] and corner0 are UNTOUCHED, so
-  // the arm stays genuinely curved. Only takes effect when is_cap && cmerge1; captured here (before the
-  // coax lambda below) so it can be read by reference, same pattern as cmerge0/cmerge1.
-  const bool cap_settle = is_cap && (std::getenv("QJ_CAP_SETTLE") != nullptr);
-  // QJ_SEAM_SETTLE (default off => byte-identical). Generalizes QJ_CAP_SETTLE to BOTH merged terminals
-  // (cmerge0 home-end AND cmerge1 far-end) and to EVERY arm (cap + interior junction seams), not just caps.
-  // Diagnosis: the junction-seam ~0.5 cross-list free-edge defect at interior arms is the SAME mechanism as
-  // the cap hotspot -- a straight merged terminal chord lands tilted off the seam axis -- but on the HOME
-  // (cmerge0) end too. Replacing the straight chord with a quintic Hermite that starts (resp. ends) coaxial
-  // with the owner's seam axis U0 (resp. U1) re-seats the terminal ring flush under the seam, exactly as
-  // QJ_CAP_SETTLE already does for the far/cap end; it is the curved-arm-preserving fix (the raw vmtk run and
-  // the opposite corner are untouched, so interior arms stay genuinely curved) and is closure-neutral (the
-  // terminal ring stays exactly on the seam circle C/axis/R0). QJ_CAP_SETTLE remains a subset (cap-only, far-
-  // end-only) of this flag and keeps working unchanged; when QJ_SEAM_SETTLE is unset, behavior is byte-identical.
-  // QJ_SEAM_SETTLE: fixed to production ON (was env; baked 2026-10-07 as the seamsettle_tr6 baseline)
-  const bool seam_settle = true;
-  // ---- CURVATURE-BOUNDED SINGLE-HERMITE RESCUE (QJ_ARM_SMOOTH_CORNER, default off). Decided far below
-  // (after the corner guard + relax + merge, once lp/cp/n/bse/bsx are final) but the flag+handle are
-  // declared here so `base()` can override to it by reference. When `rescue` is set, the arm's interior is
-  // ONE gentle quintic Hermite between the two coaxial-lead ends Q0/Q1 (tangents = the junction seam axes
-  // uA/-uB), replacing the corner->vmtk-run->corner middle that folds on short arms. The mouth rings and
-  // the 1-panel coaxial leads are UNCHANGED (tangent(0)=uA, tangent(1)=-uB) => the seam stays
-  // axis-conforming / watertight (closure-neutral); the raw vmtk interior shape is discarded (fit relaxed,
-  // per the user directive to value a closed well-formed surface over representational accuracy). This is
-  // the root-cause fix for the far-/near-mouth corner folds (rho/r<1) and self-approach overlaps (dist/r<0)
-  // that the census localizes to loc~0.85 on short arms, which QJ_ARM_CL_SMOOTH cannot touch (it relaxes
-  // only the vmtk run, not the synthesized corner). See [[network-hotspot-fix-todo]].
-  bool rescue = false; Real rescue_h = 0;
-  auto base = [&](Real t) -> Vec3<Real> {
-    if (rescue) {
-      const Real e1L = (Real)lp/n, e2R = (Real)(n-lp)/n;
-      const Vec3<Real> Q0 = add(A0, scal(bLl, uA)), Q1 = add(endC, scal(bLl, uB));
-      if (t <= e1L) return add(A0, scal(t/e1L, sub(Q0, A0)));                       // lead A (coaxial, uA)
-      if (t <  e2R) { const Real s = (t-e1L)/(e2R-e1L);
-        const Vec3<Real> tB = unit(sub(endC, Q1));                                  // exit toward C1 (== -uB)
-        return HybridAssembly<Real>::hermite5(Q0, uA, rescue_h, Q1, tB, rescue_h, s); }
-      return add(Q1, scal((t-e2R)/((Real)1-e2R), sub(endC, Q1)));                   // lead B (coaxial, -uB)
-    }
-    if (blend && (double)bcl.total > 1e-12) {
-      const Real S = bcl.total;
-      auto btan = [&](Real s) -> Vec3<Real> {                          // unit vmtk tangent at arclength s
-        const Real d = std::max<Real>((Real)1e-4*S, (Real)1e-6);
-        const Real lo = std::max<Real>((Real)0, s-d), hi = std::min<Real>(S, s+d);
-        return unit(sub(bcl.eval(hi/S), bcl.eval(lo/S)));
-      };
-      // Coaxial lead + Hermite corner + raw vmtk run (axis-conforming, watertight seam), as a curve LED
-      // from mouth (C0,U0,s0): lead C0->Q0 along U0, corner U0->vmtk-tangent, raw vmtk run s0->s1, corner
-      // vmtk-tangent->-U1, lead Q1->C1. The run tangent is signed by traversal direction (s1</>s0) so the
-      // corner joins stay C1 whether arclength increases or decreases.
-      {
-        const bool corner_c2 = (std::getenv("QJ_ARM_CORNER_C2") != nullptr);
-        // Run 2nd-derivative wrt ARCLENGTH at bcl arclength s (== curvature vector; traversal-direction
-        // independent). Scaled by the corner-end handle^2 below to convert to the corner's own parameter,
-        // so the C2 quintic corner meets the vmtk RUN with MATCHING curvature (no M8 curvature-jump straddle).
-        auto kvec = [&](Real s) -> Vec3<Real> {
-          const Real S2 = bcl.total; const Real d = std::max<Real>((Real)2e-3*S2, (Real)1e-6);
-          const Vec3<Real> xm = bcl.eval(std::max<Real>((Real)0,s-d)/S2), x0 = bcl.eval(s/S2), xp = bcl.eval(std::min<Real>(S2,s+d)/S2);
-          return scal((Real)1/(d*d), sub(add(xm, xp), scal((Real)2, x0)));
-        };
-        auto coax = [&](Real tt, const Vec3<Real>& C0, const Vec3<Real>& U0, Real s0,
-                                 const Vec3<Real>& C1, const Vec3<Real>& U1, Real s1) -> Vec3<Real> {
-          const Real e1L=(Real)lp/n, e1R=(Real)(lp+cp)/n, e2L=(Real)(n-lp-cp)/n, e2R=(Real)(n-lp)/n;
-          const Vec3<Real> Q0 = add(C0, scal(bLl, U0)), Q1 = add(C1, scal(bLl, U1));
-          const Vec3<Real> Pen = bcl.eval(s0/S), Pex = bcl.eval(s1/S);
-          const Real dir = (double)s1 >= (double)s0 ? (Real)1 : (Real)-1;   // vmtk tangent aligned with traversal
-          // DEGENERATE corner0 (cmerge0): the coaxial lead OVERSHOOTS the vmtk entry (Q0 lands past Pen along
-          // U0), so both the straight and the Hermite u->v corner double back -> the meshed centerline reverses
-          // (and, once clamped to a point, leaves COINCIDENT Chebyshev nodes). Route the whole lead+corner
-          // interval [0,e1R] STRAIGHT from the mouth C0 to the vmtk entry Pen: monotone, nodes well spread (no
-          // coincidence), and base(e1R)=Pen exactly matches the run start (no slit). tang(0)=(Pen-C0)/|.| is
-          // within a few deg of U0 for every merged corner (they are flagged BECAUSE Pen ~= C0+bLl*U0), so the
-          // mouth-ring conformity / watertightness is preserved (measured mouth tilt <=5 deg, ~0 for almost all).
-          if (cmerge0 && tt < e1R) {
-            if (seam_settle) {                                  // SETTLE: smooth Hermite, starts coaxial with U0
-              const Real s = tt/e1R;
-              const Vec3<Real> te0 = scal(dir, btan(s0));                    // end tangent: vmtk entry (as corner0 uses)
-              Real h0 = corner_kr*nrm(sub(Pen, C0)), h1 = h0;                // default: equal Ferguson-chord handles
-              if (ferguson) { const Real Lc = nrm(sub(Pen, C0)); const Vec3<Real> ch = unit(sub(Pen, C0));
-                h0 = corner_kr*Lc*std::min(ferg_cap, std::max(ferg_floor, dot(U0, ch)));
-                h1 = corner_kr*Lc*std::min(ferg_cap, std::max(ferg_floor, dot(te0, ch))); }
-              return HybridAssembly<Real>::hermite5(C0, U0, h0, Pen, te0, h1, s);
-            }
-            return add(C0, scal(tt/e1R, sub(Pen, C0)));                    // merged: C0 -> Pen (straight)
-          }
-          if (tt <= e1L) return add(C0, scal(tt/e1L, sub(Q0, C0)));                              // lead 0, coaxial U0
-          if (tt <  e1R) { const Real s=(tt-e1L)/(e1R-e1L);
-            const Vec3<Real> te0 = scal(dir, btan(s0));                    // vmtk tangent at the corner-0 exit
-            Real h0=corner_kr*nrm(sub(Pen, Q0)), h1=h0;                    // default: equal Ferguson-chord handles
-            if (ferguson) { const Real Lc=nrm(sub(Pen,Q0)); const Vec3<Real> ch=unit(sub(Pen,Q0));
-              h0 = corner_kr*Lc*std::min(ferg_cap, std::max(ferg_floor, dot(U0, ch)));
-              h1 = corner_kr*Lc*std::min(ferg_cap, std::max(ferg_floor, dot(te0, ch))); }
-            if (corner_c2)                                                          // C2: match run curvature at Pen, 0 at lead Q0
-              return HybridAssembly<Real>::hermite5_c2(Q0, scal(h0,U0), Vec3<Real>{0,0,0},
-                                                       Pen, scal(h1,te0), scal(h1*h1, kvec(s0)), s);
-            return HybridAssembly<Real>::hermite5(Q0, U0, h0, Pen, te0, h1, s); }  // corner 0: U0 -> vmtk
-          if (tt <= e2L) { const Real q=(tt-e1R)/(e2L-e1R); return bcl.eval((s0+q*(s1-s0))/S); } // raw vmtk run s0->s1
-          if (cmerge1 && tt >= e2L) {
-            if (cap_settle || seam_settle) {                       // SETTLE: smooth Hermite, arrives coaxial with U1
-              const Real s = (tt-e2L)/((Real)1-e2L);
-              const Vec3<Real> ts1 = scal(dir, btan(s1));                      // start tangent: vmtk exit (as corner1 uses)
-              const Vec3<Real> te1 = scal((Real)-1, U1);                       // end tangent: cap axis, pointing out of the dome
-              Real h0 = corner_kr*nrm(sub(C1, Pex)), h1 = h0;                  // default: equal Ferguson-chord handles
-              if (ferguson) { const Real Lc = nrm(sub(C1, Pex)); const Vec3<Real> ch = unit(sub(C1, Pex));
-                h0 = corner_kr*Lc*std::min(ferg_cap, std::max(ferg_floor, dot(ts1, ch)));
-                h1 = corner_kr*Lc*std::min(ferg_cap, std::max(ferg_floor, dot(te1, ch))); }
-              return HybridAssembly<Real>::hermite5(Pex, ts1, h0, C1, te1, h1, s);
-            }
-            return add(Pex, scal((tt-e2L)/((Real)1-e2L), sub(C1, Pex)));  // merged: Pex -> C1 (straight)
-          }
-          if (tt <  e2R) { const Real s=(tt-e2L)/(e2R-e2L);
-            const Vec3<Real> ts1 = scal(dir, btan(s1)), te1 = scal((Real)-1, U1);  // vmtk tangent in / -axis out
-            Real h0=corner_kr*nrm(sub(Q1, Pex)), h1=h0;
-            if (ferguson) { const Real Lc=nrm(sub(Q1,Pex)); const Vec3<Real> ch=unit(sub(Q1,Pex));
-              h0 = corner_kr*Lc*std::min(ferg_cap, std::max(ferg_floor, dot(ts1, ch)));
-              h1 = corner_kr*Lc*std::min(ferg_cap, std::max(ferg_floor, dot(te1, ch))); }
-            if (corner_c2)                                                          // C2: match run curvature at Pex, 0 at lead Q1
-              return HybridAssembly<Real>::hermite5_c2(Pex, scal(h0,ts1), scal(h0*h0, kvec(s1)),
-                                                       Q1, scal(h1,te1), Vec3<Real>{0,0,0}, s);
-            return HybridAssembly<Real>::hermite5(Pex, ts1, h0, Q1, te1, h1, s); } // corner 1
-          return add(Q1, scal((tt-e2R)/((Real)1-e2R), sub(C1, Q1)));                             // lead 1, coaxial -U1
-        };
-        return coax(t, A0, uA, bse, endC, uB, bsx);                   // one-sided coaxial-lead blend
-      }
-    }
-    const Real e1L=(Real)lp/n, e1R=(Real)(lp+cp)/n, e2L=(Real)(n-lp-cp)/n, e2R=(Real)(n-lp)/n;
-    // Non-blend fallback (QJ_ARM_BLEND unset): straight lead-corner-straight racetrack, smootherstep corners.
-    const Real t1 = (Real)(lp + cp*(Real)0.5)/n, t2 = (Real)1 - t1;
-    auto lerp = [&](const Vec3<Real>& p, const Vec3<Real>& q, Real w){ return add(scal((Real)1-w, p), scal(w, q)); };
-    auto lineA = [&](Real x){ return lerp(A0, QA, x/t1); };
-    auto lineR = [&](Real x){ return lerp(QA, QB, (x-t1)/(t2-t1)); };
-    auto lineB = [&](Real x){ return lerp(QB, endC, (x-t2)/((Real)1-t2)); };
-    if (t <= e1L) return lineA(t);
-    if (t <  e1R) return lerp(lineA(t), lineR(t), HybridAssembly<Real>::pou_ramp((t-e1L)/(e1R-e1L)));
-    if (t <= e2L) return lineR(t);
-    if (t <  e2R) return lerp(lineR(t), lineB(t), HybridAssembly<Real>::pou_ramp((t-e2L)/(e2R-e2L)));
-    return lineB(t);
+  if ((double)bsx <= (double)bse + 1e-9) { bse = (Real)0.4*total; bsx = (Real)0.6*total; }  // degenerate guard
+  std::vector<Vec3<Real>> dense; dense.push_back(cl_at(bse));   // already smoothed (clS); window endpoints opened too
+  for (size_t k = 0; k < clS.size(); k++)
+    if ((double)cs[k] > (double)bse + 1e-9 && (double)cs[k] < (double)bsx - 1e-9) dense.push_back(clS[k]);
+  dense.push_back(cl_at(bsx));
+  std::vector<Real> dcs(dense.size(), (Real)0);
+  for (size_t k = 1; k < dense.size(); k++) dcs[k] = dcs[k-1] + nrm(sub(dense[k], dense[k-1]));
+  const Real dtot = std::max((Real)1e-30, dcs.back());
+  auto dense_at = [&](Real s) -> Vec3<Real> {
+    if ((double)s <= 0) return dense.front();
+    if ((double)s >= (double)dtot) return dense.back();
+    size_t i = 0; while (i+1 < dcs.size() && (double)dcs[i+1] < (double)s) i++;
+    const Real h = std::max((Real)1e-30, dcs[i+1]-dcs[i]); const Real w = (s-dcs[i])/h;
+    return add(scal((Real)1-w, dense[i]), scal(w, dense[i+1]));
   };
 
-  // ---- Corner-curvature / self-overlap guard (mirrors HybridAssembly::min_corner_radius, ybifurc_assembly
-  // .hpp). A tube of radius R_arm bent to radius of curvature rho self-overlaps on its inner wall once
-  // rho <= R_arm; we aim for rho_min > R_arm*(1+margin) at every corner. REMEDY ORDER (per request):
-  //   1. STRETCH the corner -- trade straight RUN panels into the corner window (cp += 1 at FIXED n) so the
-  //      bend gets gentler / rho_min rises, without inflating DOF, while a >=4-panel straight run remains.
-  //      (Needs spare run panels: raise n_axial for arms that report STILL TIGHT.)
-  //   2. Reducing the arm radius is DEFAULT-OFF: rA is the arm MOUTH radius and MUST equal the owner
-  //      junction's seam-hole radius (and rB the neighbour's) for the coupled surface to stay watertight.
-  //      Silently shrinking it opens a mouth<->hole gap (the seam-mismatch leak). It is therefore opt-in
-  //      via QJ_CORNER_SHRINK=1 and only correct when the caller ALSO rescales the matching junction hole
-  //      (the "few junctions need their arm holes rescaled" path). Otherwise we keep the seam-conforming
-  //      radius and just WARN -- exactly the pre-guard behaviour, which was watertight despite tight bends.
-  const Real margin = std::getenv("QJ_CORNER_MARGIN") ? (Real)std::atof(std::getenv("QJ_CORNER_MARGIN")) : (Real)0.25;
-  const bool allow_shrink = (std::getenv("QJ_CORNER_SHRINK") != nullptr);
-  auto rho_min_of = [&]() -> Real {
-    const Integer M = std::max<Integer>((Integer)2000, (Integer)40*n);
-    const Real h = (Real)1/M; Real kmax = 0;
-    for (Integer i = 1; i < M; i++) {
-      const Vec3<Real> xm = base((i-1)*h), x0 = base(i*h), xp = base((i+1)*h);
-      const Vec3<Real> d1 = scal((Real)1/(2*h), sub(xp, xm));
-      const Vec3<Real> d2 = scal((Real)1/(h*h), sub(add(xp, xm), scal((Real)2, x0)));
-      const Real sp = nrm(d1), cn = nrm(cross(d1, d2));
-      if ((double)sp > 1e-30) { const Real kappa = cn/(sp*sp*sp); if ((double)kappa > (double)kmax) kmax = kappa; }
-    }
-    return (double)kmax > 1e-30 ? (Real)1/kmax : (Real)1e30;
+  // ---- control points at ONE UNIFORM arclength spacing hstep (the user's prescription): a mixed grid of
+  // coarse lead knots and fine body knots makes the natural cubic Runge-overshoot at the spacing jump (the
+  // 0.167 fold), so every knot -- on-axis lead runs AND the smoothed centerline body -- sits on the same
+  // spacing. Three pieces, each collinear/smooth: (1) home lead run ON THE uA AXIS from QA (depth Llead) out
+  // to depth depthA; (2) the smoothed centerline body over [bse,bsx]; (3) far lead run on the uB axis from
+  // depth depthB back to QB. The two lead runs are collinear, so the NATURAL cubic (zero end curvature)
+  // reproduces them EXACTLY straight (all 2nd-moments zero) and leaves QA along uA / arrives QB along uB with
+  // tangent exact and curvature zero -- the glued straight lead then joins fully C2. The lead runs reach the
+  // interior depth, so when the mouth axis is misaligned the spline rounds that swing over Kturn*r*theta of
+  // run (rho ~ Kturn*r), and when it is aligned the body simply continues straight. QJ_DS_H sets hstep. ----
+  const Real hstep = std::getenv("QJ_DS_H") ? std::max((Real)1e-6,(Real)std::atof(std::getenv("QJ_DS_H"))) : (Real)1.0 * r_arm;
+  const Integer Kmax = std::getenv("QJ_DS_NKNOT_MAX") ? std::max<Integer>(2,(Integer)std::atoi(std::getenv("QJ_DS_NKNOT_MAX"))) : (Integer)200;
+  auto n_of = [&](Real len)->Integer{ return std::max<Integer>(1, (Integer)std::llround((double)(len/hstep))); };
+  // QJ_DS_NO_PANEL_SNAP opts OUT of panel-snap (DEFAULT ON): align the body degree-10 panels to the
+  // C2 spline knots so NO panel straddles a knot's 3rd-derivative jump -- the [cheb interp err] body spike
+  // (~1e-4 vs ~1e-12 at the seam) that was the CSBQ formation error behind the full-net downsample DL hotspot.
+  // It coarsens the body spline to exactly nmid segments (one per body panel) and later SHIFTS the body panel
+  // boundaries onto those knots -- shift, not split, so panel count/size are unchanged (unlike knot-snap's
+  // slivers that broke the toroidal aspect range). Leads/corners untouched. Full-net gate (job 7250799): DL
+  // const-density max rel err 0.227 -> 9.63e-4, closure 0.1476 -> 5.995e-3, no aspect warnings.
+  const bool panel_snap = std::getenv("QJ_DS_NO_PANEL_SNAP") == nullptr;
+  // Vessel tangents at the body-window ends (used by the seam corner AND the clamped body-end tangents so the
+  // quintic corner joins the body C1). cl_tan is the lightly-smoothed centerline tangent.
+  const Vec3<Real> tanA = cl_tan(bse), tanB = cl_tan(bsx);
+  std::vector<Vec3<Real>> ctrl;
+  if (seam_corner) {
+    // Body = the REAL (un-forced, off-axis) smoothed-centerline window knots, uniform arclength. No axis
+    // overwrite and no on-axis lead run: the quintic Hermite corners (in curve() below) bridge the on-axis
+    // mouth stubs QA/QB to the true window ends P_hA=ctrl.front()/P_hB=ctrl.back(), matching the vessel
+    // tangent there. The body is a CLAMPED C2 cubic with end tangents = tanA/tanB so each corner meets it C1.
+    // panel_snap: coarsen to exactly nmid (= body-panel count) uniform-arclength knots so each body panel is one
+    // spline segment (boundaries land on knots below); otherwise the fine knot grid (~dtot/r) that the panels
+    // straddle. The sparse segments are smoother (low fidelity is intended here) and NEVER straddled.
+    // snap: K = nmid exactly (one segment per body panel) with NO Kmax cap -- Kmax bounds the FINE-knot spline
+    // (non-snap), but here K is just the body-panel count (already bounded by the assembler's n_arm), and
+    // capping it below nmid would break the knot<->panel 1:1 map so the shift guard skips the arm (the six
+    // ctrl=201 straddle holdouts). Floor 2 keeps >=3 ctrl points for the cubic.
+    const Integer K = panel_snap ? std::max<Integer>(2, n_axial)
+                                 : std::min(Kmax, n_of(dtot));
+    for (Integer k = 0; k <= K; k++) ctrl.push_back(dense_at((Real)k/(Real)K * dtot));
+  } else if (clamp_mode) {
+    // One UNIFORM knot list over the body window [depth Llead .. depth Llead] (depthA=depthB=Llead above), with
+    // the two END knots OVERWRITTEN by the exact on-axis QA/QB (they coincide with the window ends to within
+    // the coaxial-stub tolerance, so this only snaps them onto the axis -- it does not perturb spacing). End
+    // tangents are clamped to the junction axes below. NOTE: appending QA/QB on TOP of the window-end knots
+    // would place a near-coincident control point next to the clamped end => a curvature spike (Runge at the
+    // clamp); overwriting keeps the spacing uniform and the spline fold-free.
+    const Integer K = std::min(Kmax, n_of(dtot));
+    for (Integer k = 0; k <= K; k++) ctrl.push_back(dense_at((Real)k/(Real)K * dtot));
+    ctrl.front() = QA; ctrl.back() = QB;
+  } else {
+    { const Real runA = std::max((Real)0, depthA - Llead); const Integer nA = n_of(runA);        // home lead run on axis
+      for (Integer j = 0; j <= nA; j++) ctrl.push_back(add(A0, scal(Llead + runA*(Real)j/(Real)nA, uA))); }
+    { const Integer K = std::min(Kmax, n_of(dtot));                                              // centerline body
+      for (Integer k = 1; k <= K-1; k++) ctrl.push_back(dense_at((Real)k/(Real)K * dtot)); }     // interior only (ends added by lead runs)
+    { const Real runB = std::max((Real)0, depthB - Llead); const Integer nB = n_of(runB);        // far lead run on axis
+      for (Integer j = nB; j >= 0; j--) ctrl.push_back(add(endC, scal(Llead + runB*(Real)j/(Real)nB, uB))); }
+  }
+
+  // QJ_DS_NO_CORNER_C2 opts OUT (DEFAULT ON): make the body spline NATURAL (zero end curvature) instead of
+  // clamped-to-vessel-tangent, and let the hermite5 corner arrive at the body's own natural start tangent. A
+  // clamped body pins the end TANGENT, and the sparse cubic then develops a large end CURVATURE (a 16-25/r clamp
+  // spike) to honor it; the C1 corner (zero end curvature) meets that spike with a dkappa/ds STEP at the panel
+  // boundary ~s/L~0.13. A NATURAL body has zero end curvature, so the zero-curvature corner end meets it C2 (both
+  // kappa=0 at the join, ramping up smoothly into the body) with NO spike and NO fold risk -- fold-free keeper.
+  const bool corner_c2 = std::getenv("QJ_DS_NO_CORNER_C2") == nullptr;
+  ArcPolyline<Real> bcl; bcl.c2 = true;
+  if (seam_corner)       { bcl.clamped = !corner_c2; bcl.T0 = tanA; bcl.T1 = tanB; }  // clamp tangents=vessel (C1); C2=>natural
+  else if (clamp_mode)   { bcl.clamped = true; bcl.T0 = uA;   bcl.T1 = fwdB; }   // pin mouth tangents; curvature free
+  else bcl.clamped = false;                                            // NATURAL C2: straight leads = collinear knots
+  bcl.init(ctrl);
+  // Corner body-end tangents: vessel tangent (clamped body, C1 join) OR the natural body's OWN end tangent (C2
+  // join -- the corner then arrives exactly along the body, both ends at zero curvature).
+  Vec3<Real> teA = tanA, teB = tanB;
+  if (corner_c2) { const Real eps = (Real)1e-3;
+    teA = unit(sub(bcl.eval(eps), bcl.eval((Real)0)));
+    teB = unit(sub(bcl.eval((Real)1), bcl.eval((Real)1-eps))); }
+
+  // ---- panelization: one lead panel each side (per the assembler), plus (seam_corner) one quintic corner
+  // panel-block each side, the rest spread over the spline body.
+  const Integer lp = std::max<Integer>(1, lead_panels);
+  const Integer cp = seam_corner ? (std::getenv("QJ_DS_CORNER_PANELS")
+                     ? std::max<Integer>(1, (Integer)std::atoi(std::getenv("QJ_DS_CORNER_PANELS"))) : lp) : 0;
+  const Integer nmid = std::max<Integer>(1, n_axial);
+  const Integer n = nmid + 2*lp + 2*cp;                  // total panels before turn-refine
+  // panel-fraction boundaries (seam_corner): lead A [0,wLA] | corner A [wLA,wCA] | body [wCA,wCB] | corner B
+  // [wCB,wLB] | lead B [wLB,1]. For clamp/natural (cp=0) wCA=wLA and wCB=wLB collapse to the 3-piece layout.
+  const Real wLA = (Real)lp/(Real)n, wCA = (Real)(lp+cp)/(Real)n;
+  const Real wCB = (Real)(n-lp-cp)/(Real)n, wLB = (Real)(n-lp)/(Real)n;
+  // Quintic Hermite seam-corner geometry: unit end tangents (axis uA/fwdB at the stub, vessel tanA/tanB at the
+  // body) scaled by a PER-END Ferguson handle, zero endpoint acceleration (same hermite5 the production
+  // seam-settle uses). P_hA/P_hB are the true (off-axis) body-window ends. The handle is
+  // h = corner_kr*|chord|*clamp(dot(tangent, chordhat), floor, cap). The Ferguson projection (floor<1) SHRINKS
+  // a handle whose tangent points away from the chord -- the production QJ_ARM_FERGUSON overshoot fix. But the
+  // seam corner's failure is the OPPOSITE: it joins an on-axis stub to an off-axis vessel end and needs a LONG
+  // handle to swing gently, so shrinking the handle tightens the fold. Hence Ferguson is OFF by default here
+  // (floor=cap=1 => h=corner_kr*|chord|) and the handle is set generously (corner_kr=0.8); set QJ_DS_CORNER_FLOOR<1
+  // to re-enable the projection. corner_kr sweet spot is ~0.8-1.0 (0.6 whips, >1.2 overshoots).
+  const Real corner_kr = std::getenv("QJ_DS_CORNER_KR") ? (Real)std::atof(std::getenv("QJ_DS_CORNER_KR")) : (Real)0.8;
+  const Real cfloor = std::getenv("QJ_DS_CORNER_FLOOR") ? (Real)std::atof(std::getenv("QJ_DS_CORNER_FLOOR")) : (Real)1.00;
+  const Real ccap   = std::getenv("QJ_DS_CORNER_CAP")   ? (Real)std::atof(std::getenv("QJ_DS_CORNER_CAP"))   : (Real)1.00;
+  const Vec3<Real> PhA = ctrl.front(), PhB = ctrl.back();
+  auto ferg_h = [&](const Vec3<Real>& T, const Vec3<Real>& chord) -> Real {
+    const Real Lc = nrm(chord); if ((double)Lc < 1e-30) return (Real)0;
+    const Vec3<Real> ch = unit(chord);
+    return corner_kr * Lc * std::min(ccap, std::max(cfloor, dot(T, ch)));
   };
-  {
-    const Integer cp0 = cp; const Real rA0 = rA;
-    Real rho = rho_min_of();
-    if (blend) {
-      // BLEND coaxial-lead corner: guard the DISCRETE per-panel tangent turn against QJ_ARM_BLEND_TURN. The
-      // meshed centerline is n panels; measure the largest turn between consecutive panel-chord tangents and,
-      // while it exceeds the cap and a >=6-panel straight run remains, add a corner panel each side (cp+=1,
-      // n+=2 so the run is preserved). More panels resolve the same lead+corner bridge into gentler steps --
-      // this is what removes the "sharp turn" on the meshed arm (the continuous rho_min, a radius-vs-curvature
-      // property, is handled separately by the mid-arm radius dip; here we only bound the tangent change).
-      // QJ_ARM_BLEND_TURN: fixed to production 6 (was env; baked 2026-10-07 as the seamsettle_tr6 baseline)
-      const double turn_cap = 6.0;
-      auto max_panel_turn = [&]() -> double {                            // max deg between consecutive panel tangents
-        // Precompute panel-chord vectors + lengths; IGNORE degenerate (near-zero) panels -- the coaxial lead /
-        // Hermite corner can momentarily stall (two mesh nodes ~coincident), and the roundoff direction of a
-        // ~0-length chord reads as a spurious ~180 deg reversal. Skip any chord below 5% of the mean length.
-        std::vector<Vec3<Real>> ch((size_t)n); std::vector<Real> ln((size_t)n); Real mean = 0;
-        Vec3<Real> pprev = base((Real)0);
-        for (Integer i = 0; i < n; i++) { const Vec3<Real> p = base((Real)(i+1)/n);
-          ch[(size_t)i] = sub(p, pprev); ln[(size_t)i] = nrm(ch[(size_t)i]); mean += ln[(size_t)i]; pprev = p; }
-        mean /= (Real)std::max<Integer>(1, n); const Real thr = (Real)0.05*mean;
-        double mx = 0; Vec3<Real> tprev{0,0,0}; bool have = false;
-        for (Integer i = 0; i < n; i++) {
-          if ((double)ln[(size_t)i] <= (double)thr) continue;            // skip degenerate stall panels
-          const Vec3<Real> t = scal((Real)1/ln[(size_t)i], ch[(size_t)i]);
-          if (have) { double c = std::max(-1.0, std::min(1.0, (double)dot(t, tprev)));
-            mx = std::max(mx, std::acos(c)*180.0/M_PI); }
-          tprev = t; have = true;
-        }
-        return mx;
-      };
-      // Bound the extra corner panels (QJ_ARM_BLEND_MAXCP, default 6 added per side): on a well-placed arm a
-      // few panels + the arclength lengthening bring the turn under the cap; a j298-class arm whose seam CENTER
-      // sits far off the vessel is an intrinsically sharp jut (junction PLACEMENT, not the corner) that no sane
-      // panel budget can smooth -- widening there only inflates DOF, so we cap it and WARN rather than chase it.
-      // QJ_ARM_BLEND_MAXCP: fixed to production 16 (was env; baked 2026-10-07 as the seamsettle_tr6 baseline)
-      const Integer maxadd = (Integer)16;
-      const Integer cp_b0 = cp; double mpt = max_panel_turn(); const double mpt0 = mpt;
-      while ((double)mpt > turn_cap && (n - 2*(lp+cp)) >= 6 && (cp - cp_b0) < maxadd) {
-        cp += 1; n += 2; const double m2 = max_panel_turn();           // widen corner, run preserved
-        if (m2 >= mpt - 0.5) { cp -= 1; n -= 2; break; }               // no progress (turn is in the RUN, not the
-        mpt = m2;                                                       // corner) -> revert this add and stop
-      }
-      if (std::getenv("QJ_CORNER"))
-        std::cout << "  [blend-guard] max panel turn " << mpt0 << " -> " << mpt << " deg (cap " << turn_cap
-                  << ")  cp " << (long)cp_b0 << "->" << (long)cp << " n=" << (long)n
-                  << ((double)mpt > turn_cap ? "  STILL OVER (seam-center off vessel = junction placement)" : "  OK") << "\n";
-    } else {
-      // Non-blend fallback: widen the corner window (cp) into the straight run until the continuous rho_min
-      // clears R_arm*(1+margin), or the run bottoms out at 6 panels.
-      while ((double)rho <= (double)(std::max(rA,rB)*((Real)1+margin)) && (n - 2*(lp+cp)) >= 6) {
-        cp += 1; rho = rho_min_of();                                     // widen corner, run -> corner
-      }
-    }
-    if (allow_shrink && (double)rho <= (double)(std::max(rA,rB)*((Real)1+margin))) {  // opt-in only (breaks seams)
-      const Real fac = std::max<Real>((Real)0.4, std::min<Real>((Real)1, (rho/((Real)1+margin))/std::max(rA,rB)));
-      rA *= fac; rB *= fac;
-    }
-    if (std::getenv("QJ_CORNER") && (cp != cp0 || (double)rA != (double)rA0 ||
-                                     (double)rho <= (double)(std::max(rA,rB)*((Real)1+margin))))
-      std::cout << "  [corner] rho_min=" << (double)rho << " vs R_arm=" << (double)std::max(rA,rB)
-                << (blend ? "  mode BLEND (vmtk + localized mouth correction)"
-                          : ("  corner " + std::to_string((long)cp0) + "->" + std::to_string((long)cp) + " panels"))
-                << ((double)rA != (double)rA0 ? ("  radius x" + std::to_string((double)(rA/rA0))) : "")
-                << (((double)rho > (double)(std::max(rA,rB)*((Real)1+margin))) ? "  OK" : "  STILL TIGHT (raise n_axial)") << "\n";
-  }
-  // ---- CONTINUOUS CORNER RELAX (QJ_ARM_CORNER_RELAX, default off). The blend panel-turn guard above only
-  // bounds the DISCRETE per-panel tangent step; the far/near corner Hermite can still be CONTINUOUSLY tight
-  // (rho<r => tube self-touch) because it swings the FIXED junction axis u onto the vmtk tangent over a SHORT
-  // chord, and the mid-arm radius dip that used to absorb that is off in the production geometry. MEASURED
-  // 2026-09-26: on n298 every tight far bend (rho/r->0.87, self-touch at scale 0.5) sits in the corner panels,
-  // NOT the vmtk run -- so a centerline-run bypass (QJ_ARM_CL_BRIDGE) cannot touch it. Remedy = the requested
-  // "swap the high-curvature section for a longer smooth bypass", applied where the tightness actually is: the
-  // corner. While a corner's continuous rho_min is below target*r_arm, pull THAT corner's vmtk pin further
-  // inside the vessel (bse up / bsx down). Q1/Q0 (mouth + coaxial lead) are fixed, so a pin moved inward
-  // lengthens the corner-Hermite chord |Q-Pex|, and its handle h=corner_kr*|Q-Pex| grows with it => the same
-  // u->v turn spreads over more arclength => lower curvature. Radius is untouched and the mouth ring is
-  // unchanged (still C1 + lead along u), so this is closure-neutral BY CONSTRUCTION; it only makes the arm
-  // deviate a little further from the raw vmtk path near the seam (the run shrinks). Capped so a >=~4-panel
-  // straight run always remains.
-  //   MEASURED HARMFUL 2026-09-26 (default OFF): the "closure-neutral" claim is WRONG in practice. Relaxing the
-  //   corner DID clear the self-touch far bends (far-half min rho/r 0.869->1.297, #<1.0 5->0 at tgt=1.4) but
-  //   monotonically WORSENED watertightness: tgt1.4 1.19->2.59, clean-cap tgt1.25 1.19->3.18. The tight far
-  //   corner is the geometric COST of a watertight axis-conforming mouth: any deviation of the mouth approach
-  //   from the vmtk path (to spread the u->v turn) opens the arm-mouth/junction-hole flux match. Same failure
-  //   class as the radius dip and turn-refine (all near-seam geometry perturbations trade closure). The
-  //   self-touch bends are better cleared by the RADIUS route (QJ_RADIUS_SCALE=0.1, rho/r rises 5x, mouth
-  //   geometry untouched => closure stays ~1e-6) -- see [[network-arm-frame-closure]] / [[network-greens-arm-selfintersect]].
-  // QJ_ARM_CORNER_RELAX: fixed to production 1.6 (was env; baked 2026-10-07 as the seamsettle_tr6 baseline)
-  {
-    const char* cr = "1.6";
-    if (blend && (double)bcl.total > 1e-12) {
-      const Real S = bcl.total;
-      const Real r_arm = std::max(rA, rB);
-      const Real tgt = ((Real)std::atof(cr) > (Real)1 ? (Real)std::atof(cr) : (Real)1.25) * r_arm;
-      auto corner_rho = [&](Real lo, Real hi) -> Real {                    // min curvature radius of base() over [lo,hi]
-        const Integer M = 200; const Real h = (hi - lo) / (Real)M; Real kmax = 0;
-        for (Integer i = 1; i < M; i++) {
-          const Real t0 = lo + (Real)i*h;
-          const Vec3<Real> xm = base(t0-h), x0 = base(t0), xp = base(t0+h);
-          const Vec3<Real> d1 = scal((Real)1/(2*h), sub(xp, xm));
-          const Vec3<Real> d2 = scal((Real)1/(h*h), sub(add(xp, xm), scal((Real)2, x0)));
-          const Real sp = nrm(d1), cn2 = nrm(cross(d1, d2));
-          if ((double)sp > 1e-30) { const Real k = cn2/(sp*sp*sp); if ((double)k > (double)kmax) kmax = k; }
-        }
-        return (double)kmax > 1e-30 ? (Real)1/kmax : (Real)1e30;
-      };
-      // HARD caps that CANNOT meet (bse<=0.40S < 0.60S<=bsx), so the two pins never cross => the run never
-      // collapses to the near-raw-vmtk reset (which re-introduces bends AND spoils mouth conformity). A >=0.2S
-      // central vmtk run is always retained. The cap fraction is env-tunable (QJ_ARM_CORNER_RELAX_CAP, default
-      // 0.40) so a stubborn sharp-mouth SHORT arm -- whose u->v turn cannot reach rho>=tgt within a 0.40S corner
-      // chord -- can spread its corner over more arclength while KEEPING the arm curved (no straightening); the
-      // symmetric exit cap is 1-frac so the >= (1-2*frac)*S central run is retained (frac<0.5). gmax scales with
-      // frac so the 0.01S step can actually reach the wider cap.
-      // QJ_ARM_CORNER_RELAX_CAP: fixed to production 0.49 (was env; baked 2026-10-07 as the seamsettle_tr6 baseline)
-      const Real cap_frac = (Real)0.49;
-      // MUTUAL-BORROW cap (2026-09-30). The old caps were SYMMETRIC and INDEPENDENT (bse<=frac*S, bsx>=(1-frac)*S),
-      // so a jut arm whose NEAR corner needs no room (straight/merged, rho>>tgt) still could not spread its FAR
-      // corner past (1-frac)*S -- e.g. j004->6 stalled at far rho/r=0.824 with bsx pinned at 0.5S while its near
-      // corner sat slack at bse=0.21S. Replace the two fixed caps with ONE mutual constraint: each pin may push
-      // toward mid-arm as long as >= min_run of raw vmtk run remains between the pins (bse + min_run <= bsx). A
-      // tight corner therefore BORROWS the opposite corner's slack; a >= min_run central run is always retained
-      // (never the near-raw reset), the mouth rings/leads are untouched (closure-neutral), and the arm stays
-      // curved (the u->v turn just spreads over more arclength). min_run reuses the RELAX_CAP knob: (1-2*frac)*S,
-      // so CAP=0.49 => min_run 0.02S (max borrowing), CAP=0.40 => 0.20S (as before, but now reallocatable).
-      const Real min_run = std::max<Real>((Real)0.02, (Real)1 - (Real)2*cap_frac) * S;
-      const Real step = (Real)0.01*S; const Integer gmax = (Integer)110;   // 110*0.01S covers a full-S traverse
-      auto e1Lw = [&](){ return (Real)lp/n; };      auto e1Rw = [&](){ return (Real)(lp+cp)/n; };
-      auto e2Lw = [&](){ return (Real)(n-lp-cp)/n; }; auto e2Rw = [&](){ return (Real)(n-lp)/n; };
-      // NEAR corner first: settle bse (push toward mid while it folds), so the far corner sees the final run floor.
-      { Integer g=0;
-        while ((double)corner_rho(e1Lw(), e1Rw()) < (double)tgt && (double)(bse + min_run) < (double)bsx && g++ < gmax) bse += step; }
-      // FAR corner: push bsx toward mid, floored only by keeping min_run past the (now settled) near pin.
-      { Integer g=0;
-        while ((double)corner_rho(e2Lw(), e2Rw()) < (double)tgt && (double)(bsx - min_run) > (double)bse && g++ < gmax) bsx -= step; }
-      // NEAR corner again: if the near corner is the tight one, let it now borrow whatever the far corner left.
-      { Integer g=0;
-        while ((double)corner_rho(e1Lw(), e1Rw()) < (double)tgt && (double)(bse + min_run) < (double)bsx && g++ < gmax) bse += step; }
-      if (std::getenv("QJ_CORNER"))
-        std::cout << "  [corner-relax] far rho/r=" << (double)(corner_rho(e2Lw(),e2Rw())/r_arm)
-                  << " near rho/r=" << (double)(corner_rho(e1Lw(),e1Rw())/r_arm)
-                  << "  bse/S=" << (double)(bse/S) << " bsx/S=" << (double)(bsx/S)
-                  << " (tgt " << (double)(tgt/r_arm) << ")\n";
-    }
-  }
-  // Decide the degenerate-corner flags NOW (corner arclengths are final), BEFORE the RMF is tabulated, so
-  // the straightened base() feeds the frame (no flip). Measured with the flags still false => the reversing
-  // corner's true (short) arclength is what triggers the merge.
-  if (do_merge) {
-    auto seg_len = [&](Real a, Real b) -> Real {
-      const Integer M = 24; Real s = 0; Vec3<Real> pp = base(a);
-      for (Integer i = 1; i <= M; i++) { const Vec3<Real> p = base(a + (b - a) * (Real)i / M); s += nrm(sub(p, pp)); pp = p; }
-      return s;
-    };
-    const Real e1L=(Real)lp/n, e1R=(Real)(lp+cp)/n, e2L=(Real)(n-lp-cp)/n, e2R=(Real)(n-lp)/n;
-    const Integer nrun = std::max<Integer>(1, n - 2*(lp+cp));
-    const Real mean_run = seg_len(e1R, e2L) / (Real)nrun;                 // arclength per RUN panel
-    const Real thr = merge_frac * mean_run;
-    cmerge0 = ((double)seg_len(e1L, e1R) < (double)thr);                  // corner arclength below half a run panel
-    cmerge1 = ((double)seg_len(e2L, e2R) < (double)thr);
-    if (std::getenv("QJ_CORNER"))
-      std::cout << "  [corner-merge] mode=" << cmerge_env << "  corner0 len=" << (double)seg_len(e1L,e1R)
-                << (cmerge0 ? " MERGE" : " keep") << "  corner1 len=" << (double)seg_len(e2L,e2R)
-                << (cmerge1 ? " MERGE" : " keep") << "  (thr=" << (double)thr << ")\n";
-  }
-  // ---- CURVATURE-BOUNDED SINGLE-HERMITE RESCUE decision (QJ_ARM_SMOOTH_CORNER). Now that lp/cp/n/bse/bsx
-  // and the merge flags are final, measure the CONTINUOUS curvature radius of the pre-rescue base() in the
-  // two corner windows. If either corner folds (rho < target*r_arm) -- the short-arm far-/near-mouth fold
-  // the census pins at loc~0.85 -- switch this arm to the single-Hermite rescue and grow its handle until
-  // the whole-arm rho clears the target (or the handle cap is hit; then WARN). Leaves healthy arms on the
-  // blend path (rescue stays false => base() byte-identical). Default-off => byte-identical when unset.
-  // QJ_CAP_STRAIGHT (default off): for CAP arms (far end = free hemisphere tip, NOT a shared seam), force the
-  // single-Hermite rescue UNCONDITIONALLY -- skip the fold/self-gap trigger and the far-end revert guard. The
-  // rescued arm ends with a straight coaxial lead Q1->tip along uB=-endTang, so its terminal mouth ring is
-  // EXACTLY perpendicular to endTang == the dome equator plane (add_cap_hemisphere_frame uses capring.u=endTang),
-  // reproducing the straight-capsule seam (8e-15 closure / 3.4e-6 DL) that a bent cap breaks. Without this, on a
-  // sharply-bent cap the far-corner MERGE routes the terminal straight along (tip-Pex) -- tilted a few deg off
-  // endTang -- so the last ring sits tilted under the dome (partial slit => DL free-edge ~0.5). The far end is
-  // fidelity-free (user directive: closed well-formed surface over vmtk fidelity), so forcing straight is safe.
-  const bool cap_straight = is_cap && std::getenv("QJ_CAP_STRAIGHT") != nullptr;
-  if (blend && (std::getenv("QJ_ARM_SMOOTH_CORNER") || cap_straight) && (double)bcl.total > 1e-12) {
-    const Real r_arm = std::max(rA, rB);
-    const Real smf = std::getenv("QJ_ARM_SMOOTH_MARGIN") ? (Real)std::atof(std::getenv("QJ_ARM_SMOOTH_MARGIN")) : margin;
-    const Real target = ((Real)1 + smf) * r_arm;
-    auto win_rho = [&](Real lo, Real hi) -> Real {                        // min curvature radius of base() over [lo,hi]
-      const Integer M = 200; const Real h = (hi - lo) / (Real)M; Real kmax = 0;
-      for (Integer i = 1; i < M; i++) { const Real t0 = lo + (Real)i*h;
-        const Vec3<Real> xm = base(t0-h), x0 = base(t0), xp = base(t0+h);
-        const Vec3<Real> d1 = scal((Real)1/(2*h), sub(xp, xm));
-        const Vec3<Real> d2 = scal((Real)1/(h*h), sub(add(xp, xm), scal((Real)2, x0)));
-        const Real sp = nrm(d1), cn2 = nrm(cross(d1, d2));
-        if ((double)sp > 1e-30) { const Real k = cn2/(sp*sp*sp); if ((double)k > (double)kmax) kmax = k; } }
-      return (double)kmax > 1e-30 ? (Real)1/kmax : (Real)1e30;
-    };
-    const Real e1L=(Real)lp/n, e1R=(Real)(lp+cp)/n, e2L=(Real)(n-lp-cp)/n, e2R=(Real)(n-lp)/n;
-    const Real rho_near = win_rho(e1L, e1R), rho_far = win_rho(e2L, e2R);
-    // Coarse SELF-APPROACH scan of base(): sample the centerline and find the min surface gap
-    // (|Xi-Xj|-2r)/r over station pairs separated by more than a tube DIAMETER in arclength (so straight-tube
-    // adjacency is excluded -- same mask as census_arms.py). A negative gap is a real self-crossing that rho
-    // is blind to (the near-/far-mouth hairpin, e.g. edge 004-8). Cheap: ~50^2 point pairs. Callable pre- and
-    // post-rescue (reads the live `rescue` flag through base()) so the accept/revert guard can compare.
-    auto scan_self_gap = [&]() -> Real {
-      const Integer MS = 200; std::vector<Vec3<Real>> Xs((size_t)MS+1); std::vector<Real> ss((size_t)MS+1);
-      Vec3<Real> pp = base((Real)0); ss[0] = 0; Real g = (Real)1e30;
-      for (Integer i = 0; i <= MS; i++) { Xs[(size_t)i] = base((Real)i/MS);
-        if (i>0) ss[(size_t)i] = ss[(size_t)i-1] + nrm(sub(Xs[(size_t)i], pp)); pp = Xs[(size_t)i]; }
-      const Real maskL = (Real)2.2*r_arm;
-      for (Integer i = 0; i <= MS; i++) for (Integer j = i+1; j <= MS; j++)
-        if ((double)(ss[(size_t)j]-ss[(size_t)i]) > (double)maskL)
-          g = std::min(g, (nrm(sub(Xs[(size_t)i], Xs[(size_t)j])) - (Real)2*r_arm)/r_arm);
-      return g;
-    };
-    const Real self_gap = scan_self_gap();                                 // pre-rescue (rescue==false)
-    if (cap_straight || std::min((double)rho_near, (double)rho_far) < (double)target || (double)self_gap < 0) {
-      rescue = true;                                                       // base() now = single Hermite Q0->Q1
-      const Real kr0 = std::getenv("QJ_ARM_SMOOTH_KR") ? (Real)std::atof(std::getenv("QJ_ARM_SMOOTH_KR")) : (Real)1.0;
-      const Vec3<Real> Q0 = add(A0, scal(bLl, uA)), Q1 = add(endC, scal(bLl, uB));
-      const Real chord = std::max<Real>((Real)1e-12, nrm(sub(Q1, Q0)));
-      Real kr = kr0, rho_r = 0;
-      for (Integer it = 0; it < 8; it++) {                                 // grow the handle until rho clears target
-        rescue_h = kr * chord; rho_r = rho_min_of() / r_arm;
-        if ((double)rho_r >= (double)((Real)1 + smf)) break;
-        kr *= (Real)1.3; if ((double)kr > 4.0) break;
-      }
-      // ACCEPT/REVERT guard: the single Hermite must not WORSEN self-approach. On a near-antiparallel seam
-      // (a junction-PLACEMENT pathology, e.g. edge 004-8) the direct Hermite bulges its start toward the
-      // opposite mouth and the near-mouth gap gets worse; keeping the blend path is then the lesser evil.
-      // Accept iff the rescued curve clears the fold AND its self_gap is no worse than baseline (small tol).
-      const Real post_gap = scan_self_gap();                              // post-rescue (rescue==true)
-      const bool fold_fixed = ((double)rho_r >= (double)((Real)1 + smf));
-      const bool gap_ok = ((double)post_gap >= 0) || ((double)post_gap >= (double)self_gap - 1e-6);
-      // For a forced cap-straight arm accept unconditionally: the terminal-straight seam is the goal regardless
-      // of the interior fold/gap (tip is free; the near-mouth ring stays coaxial with the owner junction hole).
-      rescue = cap_straight || (fold_fixed && gap_ok);                    // else leave the arm on the blend path
-      if (std::getenv("QJ_CORNER"))
-        std::cout << "  [smooth-corner]" << (cap_straight ? "[cap-straight]" : "")
-                  << " pre rho/r near=" << (double)(rho_near/r_arm) << " far=" << (double)(rho_far/r_arm)
-                  << " self_gap/r=" << (double)self_gap
-                  << " -> " << (rescue ? "RESCUE" : "revert(placement)") << " kr=" << (double)kr
-                  << " rho/r=" << (double)rho_r << " post_gap/r=" << (double)post_gap
-                  << ((double)rho_r < (double)((Real)1+smf) ? "  STILL TIGHT" : "") << "\n";
-    }
-  }
-  // ---- SELF-CONTACT loop-collapse (QJ_ARM_MONOTONE, default off) ----
-  // Detect where the tube contacts ITSELF: two interior stations more than QJ_ARM_MONOTONE_ARCSEP panel-lengths
-  // apart in arclength (default 1.5, so genuinely non-adjacent) whose CENTER distance |Xi-Xj| < (2+tol)*r_mid
-  // (tol = QJ_ARM_MONOTONE_TOL, default 0.5) -- i.e. their surfaces are within tol*r. Such a pair brackets a
-  // doubled-back excursion (a hairpin) OR a hard inner-wall fold. Replace the bracketed segment [ti,tj] with the
-  // STRAIGHT chord Xi->Xj (a single short-arclength, single-directional segment): the artificial excursion is
-  // excised. Restricted to the interior [e1L,e2R] so the terminal coaxial LEADS -- and the axis-conforming mouth
-  // rings -- are untouched. NB chord-PROJECTION monotonicity is deliberately NOT used: it both misses parallel
-  // self-contacts (projection stays monotone through the loop) and false-flags legitimate >90 deg axis-conforming
-  // corners (measured 2026-09-28: it collapsed 80 innocent arms and drove closure 1.19->8.96 while leaving the
-  // real self-contacts untouched). Default-off => curve==base (byte-identical).
-  //   MEASURED HARMFUL 2026-09-28 (this SELF-CONTACT version, default OFF): it DOES straighten the genuine
-  //   curvature folds (edge 117-130 rho/r 0.87->1.41, cap28 1.48->2.19, 271-277 2.60->3.80) but WORSENS closure
-  //   1.19->5.92 (32 arms collapsed; arm |int n dA| 81.52->75.8 no longer cancels junc 81.56). Same watertightness
-  //   trade as every near-seam perturbation (bridge/corner-relax/radius-dip/turn-refine): straightening an interior
-  //   segment pulls the arm off the vmtk path so the mouth/frame flux match opens. It also does NOT move the
-  //   1-panel-separation dist/r "self-contact" metric, which reflects tube-DIAMETER proximity of adjacent sections
-  //   at a bend, not a collapsible loop. The radius route (QJ_RADIUS_SCALE) stays the only closure-neutral fold fix.
-  struct MonoLoop { Real ta, tb; Vec3<Real> Pa, Pb; };
-  std::vector<MonoLoop> mono_loops;
-  if (std::getenv("QJ_ARM_MONOTONE") && blend && (double)bcl.total > 1e-12) {
-    const Real e1L=(Real)lp/n, e2R=(Real)(n-lp)/n;                          // keep terminal leads intact
-    const Real rmid = (Real)0.5*(rA+rB);
-    const Real ctol = std::getenv("QJ_ARM_MONOTONE_TOL")    ? (Real)std::atof(std::getenv("QJ_ARM_MONOTONE_TOL"))    : (Real)0.5;
-    const Real asep = std::getenv("QJ_ARM_MONOTONE_ARCSEP") ? (Real)std::atof(std::getenv("QJ_ARM_MONOTONE_ARCSEP")) : (Real)1.5;
-    const Integer N = std::max<Integer>((Integer)400, (Integer)30*n);
-    std::vector<Real> tt((size_t)N+1), ss((size_t)N+1); std::vector<Vec3<Real>> XX((size_t)N+1);
-    for (Integer i=0;i<=N;i++){ tt[(size_t)i]=e1L+(e2R-e1L)*(Real)i/(Real)N; XX[(size_t)i]=base(tt[(size_t)i]); }
-    ss[0]=0; for (Integer i=1;i<=N;i++) ss[(size_t)i]=ss[(size_t)i-1]+nrm(sub(XX[(size_t)i],XX[(size_t)i-1]));
-    const Real gap_arc = asep*(ss[(size_t)N]/(Real)std::max<Integer>(1,(n-2*lp)));  // >asep interior-panel-lengths
-    const Real contact = ((Real)2+ctol)*rmid;
-    std::vector<char> mark((size_t)N+1, 0);
-    for (Integer i=0;i<=N;i++) for (Integer j=i+1;j<=N;j++) {
-      if ((double)(ss[(size_t)j]-ss[(size_t)i]) <= (double)gap_arc) continue;
-      if ((double)nrm(sub(XX[(size_t)i],XX[(size_t)j])) < (double)contact) { for (Integer k=i;k<=j;k++) mark[(size_t)k]=1; }
-    }
-    Integer i=0;
-    while (i<=N){
-      if (mark[(size_t)i]) { Integer j=i; while (j<N && mark[(size_t)j+1]) j++;   // maximal marked run [i,j]
-        mono_loops.push_back(MonoLoop{ tt[(size_t)i], tt[(size_t)j], XX[(size_t)i], XX[(size_t)j] }); i=j+1; }
-      else i++;
-    }
-    if (std::getenv("QJ_CORNER") && !mono_loops.empty())
-      std::cout << "  [monotone] collapsed " << mono_loops.size() << " self-contact loop(s)"
-                << " (tol " << (double)ctol << " arcsep " << (double)asep << ")\n";
-  }
+  const Vec3<Real> chA = sub(PhA, QA), chB = sub(QB, PhB);
+  const Real hA0 = ferg_h(uA, chA),  hA1 = ferg_h(teA, chA);      // corner A: QA(uA) -> PhA(teA)
+  const Real hB0 = ferg_h(teB, chB), hB1 = ferg_h(fwdB, chB);     // corner B: PhB(teB) -> QB(fwdB)
+  if (corner_c2 && diag) std::cout << "    [ds-c2] natural body; teA.tanA=" << (double)dot(teA,tanA)
+                                   << " teB.tanB=" << (double)dot(teB,tanB) << "\n";
+
+  // Piecewise centerline c(t). seam_corner: lead -> quintic corner -> C2 body spline -> quintic corner -> lead.
+  // clamp/natural: straight lead A0->QA, C2 spline QA->QB, straight lead QB->endC.
   auto curve = [&](Real t) -> Vec3<Real> {
-    for (const auto& lp_ : mono_loops)
-      if ((double)t >= (double)lp_.ta && (double)t <= (double)lp_.tb) {
-        const Real u = ((double)lp_.tb > (double)lp_.ta) ? (t-lp_.ta)/(lp_.tb-lp_.ta) : (Real)0;
-        return add(lp_.Pa, scal(u, sub(lp_.Pb, lp_.Pa)));
-      }
-    return base(t);
-  };
-  // Dump the FINAL (post-guard) meshed centerline for the approximation-graph verification artifact.
-  if (sampled_out) {
-    const Integer Ns = std::max<Integer>((Integer)4*n, (Integer)32);
-    sampled_out->clear(); sampled_out->reserve((size_t)Ns + 1);
-    for (Integer k = 0; k <= Ns; k++) sampled_out->push_back(curve((Real)k/Ns));
-    // For BLEND mode also emit the REFERENCE vmtk centerline v(l) at the same stations, so the exact
-    // displacement |c(l)-v(l)| = |a_A*d_A + a_B*d_B| can be measured directly (not via nearest-to-polyline,
-    // which conflates the centripetal-CR-vs-chord interpolation gap on curved edges).
-    if (sampled_ref) {
-      sampled_ref->clear();
-      if (blend && (double)bcl.total > 1e-12) {
-        for (Integer k = 0; k <= Ns; k++) {                            // NEAREST point on the vmtk curve to
-          const Vec3<Real> P = curve((Real)k/Ns);                      // each meshed node = true deviation
-          Real best = 0, bd = (Real)1e30; const Integer NS = 2000;
-          for (Integer m = 0; m <= NS; m++) { const Real s = (Real)m/NS;
-            const Real d = nrm(sub(bcl.eval(s), P)); if ((double)d < (double)bd) { bd = d; best = s; } }
-          Real lo = std::max<Real>(0, best - (Real)1/NS), hi = std::min<Real>(1, best + (Real)1/NS);
-          for (Integer ref = 0; ref < 3; ref++) {                      // parabola-free local refine (removes the
-            const Integer M = 40; Real b2 = lo, d2 = (Real)1e30;       // ~S/NS sampling floor -> true ~0 on the run)
-            for (Integer m = 0; m <= M; m++) { const Real s = lo + (hi-lo)*(Real)m/M;
-              const Real d = nrm(sub(bcl.eval(s), P)); if ((double)d < (double)d2) { d2 = d; b2 = s; } }
-            const Real w = (hi-lo)/M; lo = std::max<Real>(0, b2-w); hi = std::min<Real>(1, b2+w); best = b2;
-          }
-          sampled_ref->push_back(bcl.eval(best));
-        }
-      }
+    if (seam_corner) {
+      if ((double)t <= (double)wLA) { const Real q = (double)wLA>1e-30 ? t/wLA : (Real)0; return add(A0, scal(q*Llead, uA)); }
+      if ((double)t <  (double)wCA) { const Real s = (t-wLA)/(wCA-wLA);         // corner A: stub(uA) -> body(teA)
+        return HybridAssembly<Real>::hermite5(QA, uA, hA0, PhA, teA, hA1, s); }
+      if ((double)t <= (double)wCB) { const Real tau = (t-wCA)/(wCB-wCA); return bcl.eval(tau); }
+      if ((double)t <  (double)wLB) { const Real s = (t-wCB)/(wLB-wCB);         // corner B: body(teB) -> stub(fwdB)
+        return HybridAssembly<Real>::hermite5(PhB, teB, hB0, QB, fwdB, hB1, s); }
+      const Real q = (double)(1-wLB)>1e-30 ? (t-wLB)/((Real)1-wLB) : (Real)1; return add(QB, scal(q*Llead, fwdB));
     }
-  }
-  // ---- Mid-arm radius DIP (opt-in, seam-safe). Where the centerline bends tighter than the
-  // seam-conforming radius allows (local curvature radius rho(t) < r*(1+margin) => inner-wall self-fold),
-  // locally THIN the tube so rho(t) > r*(1+margin), leaving BOTH mouth rings exact (t=0->rA, t=1->rB) via
-  // an endpoint-vanishing window -- the seam-safe cousin of QJ_CORNER_SHRINK (which scales rA/rB and so
-  // breaks watertightness). Bounded below by QJ_RADIUS_DIP_FLOOR * seam-taper radius so the arm can never
-  // become a needle. QJ_ARM_RADIUS_DIP=1 enables; the fold-clip target reuses QJ_CORNER_MARGIN (`margin`).
-  const bool radius_dip = (std::getenv("QJ_ARM_RADIUS_DIP") != nullptr);
-  const Real dip_floor = std::getenv("QJ_RADIUS_DIP_FLOOR") ? (Real)std::atof(std::getenv("QJ_RADIUS_DIP_FLOOR")) : (Real)0.5;
-  // Mouth POU half-window (fraction of arclength over which the dip ramps from 0 at the seam to full in the
-  // interior). Smaller => the taper reaches CLOSER to the mouth (clears near-junction folds) while the ring
-  // AT t=0/1 stays exactly rA/rB (watertight). Default 0.08; QJ_RADIUS_DIP_WIN overrides.
-  const Real dip_win = std::getenv("QJ_RADIUS_DIP_WIN") ? std::max<Real>((Real)1e-3, (Real)std::atof(std::getenv("QJ_RADIUS_DIP_WIN"))) : (Real)0.08;
-  const Integer Nrho = std::max<Integer>((Integer)400, (Integer)20*n);
-  std::vector<Real> rho_tab((size_t)Nrho+1, (Real)1e30);
-  if (radius_dip) {
-    const Real h = (Real)1/Nrho;
-    for (Integer i = 1; i < Nrho; i++) {
-      const Vec3<Real> xm = base((i-1)*h), x0 = base(i*h), xp = base((i+1)*h);
+    if ((double)t <= (double)wLA) { const Real q = (double)wLA>1e-30 ? t/wLA : (Real)0; return add(A0, scal(q*Llead, uA)); }
+    if ((double)t >= (double)wLB) { const Real q = (double)(1-wLB)>1e-30 ? (t-wLB)/((Real)1-wLB) : (Real)1; return add(QB, scal(q*Llead, fwdB)); }
+    const Real tau = (t - wLA)/(wLB - wLA);
+    return bcl.eval(tau);
+  };
+  auto radius_at = [&](Real t) -> Real { return rA + t*(rB - rA); };      // exact seam-conforming linear taper
+
+  // Min osculating radius of the spline body (honest fold report; sparse decimation should keep rho >> r).
+  // Sample the spline on its OWN parameter (bcl.eval) so the stencil never straddles the C1 lead/spline
+  // joins -- doing that on curve(t) reported a spurious ~0 curvature right at the mouths (the earlier
+  // false 494-FOLD spam). The joins are deliberate curvature steps on panel boundaries, not folds.
+  if (diag) {
+    const Integer M = 400; Real kmax = 0; const Real h = (Real)1/M;
+    for (Integer i = 1; i < M; i++) {
+      const Real tt = (Real)i/M;                          // spline-local parameter in (0,1)
+      const Vec3<Real> xm = bcl.eval(tt-h), x0 = bcl.eval(tt), xp = bcl.eval(tt+h);
       const Vec3<Real> d1 = scal((Real)1/(2*h), sub(xp, xm));
       const Vec3<Real> d2 = scal((Real)1/(h*h), sub(add(xp, xm), scal((Real)2, x0)));
       const Real sp = nrm(d1), cn2 = nrm(cross(d1, d2));
-      rho_tab[(size_t)i] = ((double)sp > 1e-30 && (double)cn2 > 1e-30) ? (Real)(sp*sp*sp/cn2) : (Real)1e30;
+      if ((double)sp > 1e-30) { const Real k = cn2/(sp*sp*sp); if ((double)k > (double)kmax) kmax = k; }
     }
-    rho_tab[0] = rho_tab[1]; rho_tab[(size_t)Nrho] = rho_tab[(size_t)Nrho-1];
+    const Real rho_body = (double)kmax > 1e-30 ? (Real)1/kmax : (Real)1e30;
+    // seam_corner: also sample each quintic corner on curve(t) WITHIN its own (wLA,wCA)/(wCB,wLB) interval so
+    // the stencil never straddles a C1 panel-boundary join (same reason the body is sampled on bcl.eval).
+    Real rho_cA = (Real)1e30, rho_cB = (Real)1e30;
+    if (seam_corner) {
+      auto corner_rho = [&](Real lo, Real hi) -> Real {
+        const Integer MC = 200; const Real span = hi - lo; if ((double)span <= 1e-12) return (Real)1e30;
+        const Real hh = span / (MC + 2); Real km = 0;
+        for (Integer i = 1; i < MC; i++) {
+          const Real tt = lo + span*(Real)i/MC;
+          const Vec3<Real> xm = curve(tt-hh), x0 = curve(tt), xp = curve(tt+hh);
+          const Vec3<Real> d1 = scal((Real)1/(2*hh), sub(xp, xm));
+          const Vec3<Real> d2 = scal((Real)1/(hh*hh), sub(add(xp, xm), scal((Real)2, x0)));
+          const Real sp = nrm(d1), cn2 = nrm(cross(d1, d2));
+          if ((double)sp > 1e-30) { const Real k = cn2/(sp*sp*sp); if ((double)k > (double)km) km = k; }
+        }
+        return (double)km > 1e-30 ? (Real)1/km : (Real)1e30;
+      };
+      rho_cA = corner_rho(wLA, wCA); rho_cB = corner_rho(wCB, wLB);
+      kmax = std::max(kmax, std::max((Real)1/std::max((Real)1e-30,rho_cA), (Real)1/std::max((Real)1e-30,rho_cB)));
+      std::cout << "    [corner rho/r] A=" << (double)(rho_cA/r_arm) << " body=" << (double)(rho_body/r_arm)
+                << " B=" << (double)(rho_cB/r_arm) << "\n";
+    }
+    const Real rho = (double)kmax > 1e-30 ? (Real)1/kmax : (Real)1e30;
+    std::cout << "  [downsample] " << (dump_tag?dump_tag:"") << (is_cap?" (cap)":"")
+              << (seam_corner?" seamcorner":"") << " ctrl=" << ctrl.size()
+              << " (h=" << (double)hstep << " swing A/B=" << (double)(thA*180/M_PI) << "/" << (double)(thB*180/M_PI) << "deg)"
+              << " rho_min/r=" << (double)(rho/r_arm)
+              << ((double)rho < (double)r_arm ? "  FOLD" : "") << "\n";
   }
-  auto radius_at = [&](Real t) -> Real {
-    const Real rlin = rA + t*(rB - rA);                                    // seam-conforming linear taper
-    if (!radius_dip) return rlin;
-    Real g = t*Nrho; if ((double)g < 0) g = 0; if (g > (Real)Nrho) g = (Real)Nrho;
-    Integer i = (Integer)g; if (i >= Nrho) i = Nrho-1; const Real f = g - i;
-    const Real rho_t = rho_tab[(size_t)i]*((Real)1-f) + rho_tab[(size_t)i+1]*f;
-    const Real r_allow = rho_t/((Real)1+margin);                           // radius keeping rho > r*(1+margin)
-    Real rr = std::min(rlin, r_allow);
-    const Real floor_r = dip_floor * rlin;                                 // never a needle
-    if ((double)rr < (double)floor_r) rr = floor_r;
-    const Real w = std::min<Real>((Real)1, std::min<Real>(t, (Real)1-t)/dip_win);  // 0 at mouths
-    const Real wr = HybridAssembly<Real>::pou_ramp(w);
-    return rlin*((Real)1-wr) + rr*wr;                                      // mouths exact, dip in interior
-  };
-  // Rotation-minimizing frame (double reflection, Wang et al.) tabulated on a fine grid.
+
+  // ---- rotation-minimizing frame (double reflection), tabulated; closure-twist onto endE1 at t=1. ----
   const Integer Ng = std::max<Integer>((Integer)200, (Integer)20*n);
   auto tang = [&](Integer i) -> Vec3<Real> {
     const Real h = (Real)1/Ng;
@@ -1406,138 +939,72 @@ template <class Real> void append_centerline_fiber(const ArmSeam<Real>& seamA, c
     if (i >= Ng) return unit(sub(curve((Real)1), curve((Real)1-h)));
     return unit(sub(curve((i+1)*h), curve((i-1)*h)));
   };
-  // Report the ACTUAL meshed terminal cross-section (center = curve(1), outward axis = terminal tangent) so a
-  // leaf-cap dome can be registered to the tube's real terminal ring instead of the idealized endTang -- the
-  // flagella "cap conforms to the slender's tip ring" recipe. The idealized endTang can tilt a few tenths of
-  // a degree off the meshed tangent (corner-merge/blend at the far mouth), tilting the dome equator plane so
-  // part of the ring dips ~1e-4 INSIDE the tube surface => the cross-list near-singular cap blow-up.
   if (out_termC) *out_termC = curve((Real)1);
   if (out_termU) *out_termU = tang(Ng);
-  // ---- QJ_DUMP_STAGES: emit every captured stage for this arm (append; keyed by dump_tag). READ-ONLY. ----
-  if (dbg) {
-    std::ofstream ds(_qj_dsf, std::ios::app);
-    if (ds) {
-      ds << std::setprecision(17);
-      ds << "# ARM " << dump_tag << " is_cap=" << (is_cap ? 1 : 0) << " blend=" << (blend ? 1 : 0)
-         << " seam_settle=" << (seam_settle ? 1 : 0) << "\n";
-      auto dump_pts = [&](const char* nm, const std::vector<Vec3<Real>>& P) {
-        ds << "STAGE " << nm << " n=" << P.size() << "\n";
-        for (const auto& p : P) ds << (double)p[0] << " " << (double)p[1] << " " << (double)p[2] << "\n";
-      };
-      dump_pts("raw", dbg_raw);                 // raw resampled vmtk knots (== .graph edge points)
-      dump_pts("curv_limited", dbg_curv);        // after QJ_ARM_CL_SMOOTH curvature limiter (+bridge)
-      dump_pts("lowpass", dbg_lowpass);          // after Taubin QJ_ARM_CL_LOWPASS; these are the C2 knots
-      // C2 natural-cubic-spline knots: position, cumulative arclength s, and 2nd-derivative coeff M (empty => C1)
-      ds << "STAGE spline_knots n=" << bcl.P.size() << "\n";
-      for (size_t k = 0; k < bcl.P.size(); k++)
-        ds << (double)bcl.P[k][0] << " " << (double)bcl.P[k][1] << " " << (double)bcl.P[k][2]
-           << " s=" << (double)(k < bcl.s.size() ? bcl.s[k] : (Real)0)
-           << " M=" << (double)(k < bcl.M.size() ? bcl.M[k][0] : (Real)0)
-           << "," << (double)(k < bcl.M.size() ? bcl.M[k][1] : (Real)0)
-           << "," << (double)(k < bcl.M.size() ? bcl.M[k][2] : (Real)0) << "\n";
-      // Lead/corner control geometry (describes the coaxial-lead + quintic-Hermite corner + seam-settle stage)
-      ds << "CONTROL lead_corner\n";
-      ds << "A0 " << (double)A0[0] << " " << (double)A0[1] << " " << (double)A0[2] << "\n";
-      ds << "uA " << (double)uA[0] << " " << (double)uA[1] << " " << (double)uA[2] << "\n";
-      ds << "QA " << (double)bQA[0] << " " << (double)bQA[1] << " " << (double)bQA[2] << " bse=" << (double)bse << "\n";
-      ds << "endC " << (double)endC[0] << " " << (double)endC[1] << " " << (double)endC[2] << "\n";
-      ds << "uB " << (double)uB[0] << " " << (double)uB[1] << " " << (double)uB[2] << "\n";
-      ds << "QB " << (double)bQB[0] << " " << (double)bQB[1] << " " << (double)bQB[2] << " bsx=" << (double)bsx << "\n";
-      ds << "params S=" << (double)bcl.total << " lead_len=" << (double)bLl << " corner_kr=" << (double)corner_kr
-         << " rA=" << (double)rA << " rB=" << (double)rB << "\n";
-      // Final meshed centerline + radius (the curve CSBQ actually sweeps; also recoverable from the .arms bundle)
-      const Integer Nf = std::max<Integer>((Integer)4*n, (Integer)64);
-      ds << "STAGE final n=" << (Nf + 1) << "\n";
-      for (Integer k = 0; k <= Nf; k++) {
-        const Real t = (Real)k / Nf; const Vec3<Real> c = curve(t);
-        ds << (double)c[0] << " " << (double)c[1] << " " << (double)c[2] << " r=" << (double)radius_at(t) << "\n";
-      }
-      ds << "# END ARM " << dump_tag << "\n";
-    }
-  }
   std::vector<Vec3<Real>> Rtab((size_t)Ng+1);
   Vec3<Real> ti = tang(0);
-  Vec3<Real> r = unit(sub(seamA.e1, scal(dot(seamA.e1, ti), ti)));
-  if ((double)nrm(r) < 1e-9) { Vec3<Real> a{1,0,0}; if (std::fabs((double)ti[0])>0.9) a = Vec3<Real>{0,1,0}; r = unit(sub(a, scal(dot(a,ti), ti))); }
-  Rtab[0] = r;
+  Vec3<Real> rr = unit(sub(seamA.e1, scal(dot(seamA.e1, ti), ti)));
+  if ((double)nrm(rr) < 1e-9) { Vec3<Real> a{1,0,0}; if (std::fabs((double)ti[0])>0.9) a = Vec3<Real>{0,1,0}; rr = unit(sub(a, scal(dot(a,ti), ti))); }
+  Rtab[0] = rr;
   for (Integer i = 0; i < Ng; i++) {
     const Vec3<Real> xi = curve(i/(Real)Ng), xi1 = curve((i+1)/(Real)Ng);
     const Vec3<Real> ti1 = tang(i+1);
     const Vec3<Real> v1 = sub(xi1, xi); const Real c1 = dot(v1, v1);
-    const Vec3<Real> rL = (double)c1>0 ? sub(r,  scal(2*dot(v1,r )/c1, v1)) : r;
+    const Vec3<Real> rL = (double)c1>0 ? sub(rr, scal(2*dot(v1,rr)/c1, v1)) : rr;
     const Vec3<Real> tL = (double)c1>0 ? sub(ti, scal(2*dot(v1,ti)/c1, v1)) : ti;
-    const Vec3<Real> v2 = sub(ti1, tL); const Real c2 = dot(v2, v2);
-    Vec3<Real> r1 = (double)c2>0 ? sub(rL, scal(2*dot(v2,rL)/c2, v2)) : rL;
-    r1 = unit(r1); Rtab[(size_t)i+1] = r1; r = r1; ti = ti1;
+    const Vec3<Real> v2 = sub(ti1, tL); const Real c2d = dot(v2, v2);
+    Vec3<Real> r1 = (double)c2d>0 ? sub(rL, scal(2*dot(v2,rL)/c2d, v2)) : rL;
+    r1 = unit(r1); Rtab[(size_t)i+1] = r1; rr = r1; ti = ti1;
   }
-  // ---- CLOSURE TWIST (owner<->neighbour frame conformity). The RMF above is seeded to match the OWNER seam
-  // frame at t=0 (r = seamA.e1) but drifts freely to t=1, so the far ring lands azimuthally MISMATCHED to the
-  // neighbour junction's seam frame (measured mean ~91 deg, up to 180 across the n298 network). The tube
-  // surface set is frame-invariant, but the PARAMETRISATION is not: e1(t) enters dX/dt (an r*e1'(t) term) and
-  // the CSBQ self/near toroidal quadrature, so a frame that jumps ~90 deg between the arm's far ring and the
-  // adjoining junction hole is a NONSMOOTH junction->arm transition => high DL/near-eval error at the far seam
-  // (the "far end always worse than home end" asymmetry). Remedy: when the caller supplies the far target
-  // frame endE1 (neighbour seam e1 for interior arms, cap-ring e1 for leaves), distribute a UNIFORM twist
-  // theta(t)=t*phi about the local tangent so the frame matches endE1 at t=1 too (phi = minimal residual angle
-  // from the propagated end frame to endE1, about the end tangent). Uniform twist keeps de1/dt bounded/smooth
-  // (a constant added twist-rate phi/L) -- strictly better than the current infinite jump at the seam. Both
-  // seams now conform, exactly like the home end. endE1==0 (unset) preserves the old free-drift behaviour.
-  //
+  // Uniform closure twist so the far ring matches endE1 (neighbour/cap frame); identical to the blend path.
+  Real phi = 0;
+  if (!constant_orient && ((double)endE1[0]!=0 || (double)endE1[1]!=0 || (double)endE1[2]!=0)) {
+    const Vec3<Real> tend = tang(Ng);
+    const Vec3<Real> e1t = unit(sub(endE1, scal(dot(endE1, tend), tend)));
+    const Vec3<Real> rend = Rtab[(size_t)Ng];
+    if ((double)nrm(e1t) > 1e-9) {
+      Real cph = dot(rend, e1t); cph = std::max((Real)-1, std::min((Real)1, cph));
+      phi = std::acos((double)cph);
+      if ((double)dot(cross(rend, e1t), tend) < 0) phi = -phi;
+    }
+  }
   const Vec3<Real> r0const = Rtab[0];
   auto orient_of = [&](Real t) -> Vec3<Real> {
     if (constant_orient) return r0const;
     Real g = t*Ng; if ((double)g < 0) g = 0; if (g > (Real)Ng) g = (Real)Ng;
     Integer i = (Integer)g; if (i >= Ng) i = Ng-1; const Real f = g - i;
-    return unit(add(scal((1-f), Rtab[(size_t)i]), scal(f, Rtab[(size_t)i+1])));
+    Vec3<Real> e1 = unit(add(scal((1-f), Rtab[(size_t)i]), scal(f, Rtab[(size_t)i+1])));
+    if ((double)phi != 0) {                              // rotate e1 by t*phi about the local tangent (Rodrigues)
+      const Vec3<Real> k = tang((Integer)std::lround((double)t*Ng));
+      const Real th = t*phi, ct = std::cos((double)th), st = std::sin((double)th);
+      e1 = add(add(scal(ct, e1), scal(st, cross(k, e1))), scal(dot(k,e1)*((Real)1-ct), k));
+      e1 = unit(e1);
+    }
+    return e1;
   };
-  // ---- Panel knot vector. UNIFORM by default => t = tk[p] + cn[j]*(tk[p+1]-tk[p]) = (p+cn[j])/n, i.e.
-  // byte-identical to the pre-merge sampling (regression-safe: merge OFF changes nothing). When a corner is
-  // flagged degenerate (cmerge0/cmerge1, decided above) its now-short straight panel(s) are absorbed into
-  // the neighbour by deleting the shared knot: for corner0 the lead is on the LEFT of the run, for corner1
-  // on the RIGHT, so merge=lead deletes the knot on the lead side and merge=vmtk the knot on the run side.
-  // Terminal knots (0,1) are never removed (rings stay conforming to the junction holes).
+
+  // ---- panel knot vector: uniform, lead pinned to panels [0,lp) and [n-lp,n); turn-refine the spline body.
   std::vector<Real> tk; tk.reserve((size_t)n + 1);
   for (Integer k = 0; k <= n; k++) tk.push_back((Real)k / (Real)n);
-  if (do_merge && (cmerge0 || cmerge1)) {
-    std::vector<bool> keepk((size_t)n + 1, true);
-    auto rm = [&](Integer k){ if (k > 0 && k < n) keepk[(size_t)k] = false; };
-    if (cmerge0) for (Integer p = lp;         p < lp + cp; p++) rm(merge_lead ? p     : p + 1);  // corner0: lead left / run right
-    if (cmerge1) for (Integer p = n - lp - cp; p < n - lp;  p++) rm(merge_lead ? p + 1 : p);      // corner1: lead right / run left
-    std::vector<Real> tk2; tk2.reserve(tk.size());
-    for (Integer k = 0; k <= n; k++) if (keepk[(size_t)k]) tk2.push_back(tk[(size_t)k]);
-    tk.swap(tk2);
-    if (std::getenv("QJ_CORNER"))
-      std::cout << "  [corner-merge] " << (long)(n + 1 - (Integer)tk.size()) << " knot(s) removed => "
-                << (long)(tk.size() - 1) << " panels (was " << (long)n << ")\n";
+  // QJ_DS_PANEL_SNAP: shift the body panel boundaries onto the C2 spline knots (no degree-10 panel straddles a
+  // knot's 3rd-derivative jump). Body = tk indices [lp+cp .. n-lp-cp] (nmid panels); with K==nmid the spline has
+  // exactly nmid segments, knot k at arclength bcl.s[k], mapped to t = wCA + (bcl.s[k]/bcl.total)*(wCB-wCA).
+  // Leads/corners keep their uniform boundaries. SHIFT, not split: panel count/size unchanged (runs BEFORE
+  // turn-refine, which then subdivides WITHIN a knot-aligned segment -- no interior knot, no straddle).
+  if (panel_snap && seam_corner && (Integer)bcl.s.size() == nmid + 1 && (double)bcl.total > 1e-30) {
+    const Integer b0 = lp + cp;                                // tk[b0]==wCA ; tk[b0+nmid]==wCB
+    for (Integer k = 1; k < nmid; k++)
+      tk[(size_t)(b0 + k)] = wCA + (bcl.s[(size_t)k]/bcl.total) * (wCB - wCA);
   }
-  // Panel-ROLE transition t-values (lead0|corner0, corner0|run, run|corner1, corner1|lead1). All are integer
-  // multiples of 1/n (uniform panels), so each sits ON a knot -- UNLESS its corner was merged, in which case the
-  // transition is now interior to a merged panel (no inter-panel break there, correctly excluded below).
-  const double role_tb[4] = { (double)lp/n, (double)(lp+cp)/n, (double)(n-lp-cp)/n, (double)(n-lp)/n };
-  // ---- Local n_axial REFINEMENT at panel-ROLE transitions (QJ_ARM_ROLE_REFINE, default off => tk unchanged,
-  // bit-identical). The surface "open spaces" are inter-panel gaps where the CSBQ centerline turns too fast
-  // BETWEEN panels: two order-`cheb` Chebyshev panels meet at a shared knot, and across a lead|corner or
-  // corner|run role boundary the tangent turns sharply, so the per-panel tube reconstructions mismatch (a
-  // gap/overlap). Subdividing the panels TOUCHING those role knots into REFINE sub-panels resolves the same
-  // bend in smaller steps (per-panel turn ~1/REFINE) WITHOUT moving the curve or the radius (closure-neutral).
-  // QJ_ARM_ROLE_REFINE_SPAN(=1) panels each side of each role knot qualify.
-  const Integer role_refine = std::getenv("QJ_ARM_ROLE_REFINE") ? std::max<Integer>(1, (Integer)std::atoi(std::getenv("QJ_ARM_ROLE_REFINE"))) : (Integer)1;
-  const Integer role_span   = std::getenv("QJ_ARM_ROLE_REFINE_SPAN") ? std::max<Integer>(0, (Integer)std::atoi(std::getenv("QJ_ARM_ROLE_REFINE_SPAN"))) : (Integer)1;
-  // ---- Curvature-adaptive n_axial refinement (QJ_ARM_TURN_REFINE=<deg>, default 6 = on). The diagnostic
-  // showed the inter-panel direction jumps are NOT at the role transitions (those are gentle, ~4 deg/panel)
-  // but in the interior raw-vmtk RUN, which bends ~26 deg/panel (up to 72). Subdivide ANY panel whose own
-  // tangent bend across it exceeds the cap into ceil(bend/cap) sub-panels (capped by QJ_ARM_TURN_REFINE_MAX,
-  // default 24), so every sub-panel turns <= cap. Closure-neutral (same curve, same radius); resolves the
-  // under-resolution "open spaces" (does NOT fix true rho<r self-folds -- those need smoothing/taper/scale).
-  // Now DEFAULT-ON (the "tr6" baseline, 2026-10-07): refine angle 6 deg, per-panel subdivision cap 24. Both remain
-  // env-overridable knobs (QJ_ARM_TURN_REFINE=<deg>, QJ_ARM_TURN_REFINE_MAX=<n>).
+  // Curvature-adaptive turn refinement (same lever as the blend path, default 6 deg / cap 24): split any
+  // panel whose tangent bends more than the cap into ceil(bend/cap) sub-panels (same curve, same radius).
   const char* trc = std::getenv("QJ_ARM_TURN_REFINE") ? std::getenv("QJ_ARM_TURN_REFINE") : "6";
-  if (trc && std::atof(trc) <= 0.0) trc = nullptr;                          // QJ_ARM_TURN_REFINE=0 turns it off
+  if (trc && std::atof(trc) <= 0.0) trc = nullptr;
   const Integer turn_refine_max = std::getenv("QJ_ARM_TURN_REFINE_MAX") ? std::max<Integer>(1, (Integer)std::atoi(std::getenv("QJ_ARM_TURN_REFINE_MAX"))) : (Integer)24;
   if (trc) {
     const double cap = std::max(1.0, std::atof(trc));
-    auto tang_at = [&](Real t, int side) -> Vec3<Real> {                   // side<0: forward from t; side>0: backward to t
-      const Real d = std::max<Real>((Real)1e-6, (Real)1e-3);
+    auto tang_at = [&](Real t, int side) -> Vec3<Real> {
+      const Real d = (Real)1e-3;
       return side < 0 ? unit(sub(curve(std::min<Real>((Real)1, t + d)), curve(t)))
                       : unit(sub(curve(t), curve(std::max<Real>((Real)0, t - d))));
     };
@@ -1549,124 +1016,610 @@ template <class Real> void append_centerline_fiber(const ArmSeam<Real>& seamA, c
       const double bend = std::acos(d) * 180.0 / M_PI;
       Integer k = (Integer)std::ceil(bend / cap); if (k < 1) k = 1; if (k > turn_refine_max) k = turn_refine_max;
       tk3.push_back(ta);
-      for (Integer s = 1; s < k; s++) tk3.push_back((Real)(ta + (tb - ta) * (Real)s / (Real)k));
+      for (Integer sgi = 1; sgi < k; sgi++) tk3.push_back((Real)(ta + (tb - ta) * (Real)sgi / (Real)k));
     }
     tk3.push_back(tk.back());
     tk.swap(tk3);
-    if (std::getenv("QJ_CORNER"))
-      std::cout << "  [turn-refine] cap " << cap << " deg (max x" << (long)turn_refine_max
-                << ") => " << (long)(tk.size() - 1) << " panels (was " << (long)n << ")\n";
-  } else if (std::getenv("QJ_ARM_ROLE_REFINE") && role_refine > 1) {
-    const double htol = (double)(role_span + (Integer)0.5) / (double)n;    // panel center within this of a role knot qualifies
-    std::vector<Real> tk3; tk3.reserve(tk.size() * (size_t)role_refine);
-    for (Integer p = 0; p + 1 < (Integer)tk.size(); p++) {
-      const double ta = (double)tk[(size_t)p], tb = (double)tk[(size_t)p + 1], tcen = 0.5 * (ta + tb);
-      bool near_role = false;
-      for (int b = 0; b < 4; b++) if (std::fabs(tcen - role_tb[b]) < htol) near_role = true;
-      tk3.push_back(tk[(size_t)p]);
-      if (near_role) for (Integer s = 1; s < role_refine; s++)
-        tk3.push_back((Real)(ta + (tb - ta) * (double)s / (double)role_refine));
-    }
-    tk3.push_back(tk.back());
-    tk.swap(tk3);
-    if (std::getenv("QJ_CORNER"))
-      std::cout << "  [role-refine] x" << (long)role_refine << " span " << (long)role_span
-                << " => " << (long)(tk.size() - 1) << " panels (was " << (long)n << ")\n";
-  }
-  // ---- Panel-SIZE GRADING (QJ_ARM_PANEL_GRADE=<R>, R>1; default OFF => tk untouched, bundle byte-identical).
-  // Turn-refine splits a bent panel into ceil(bend/6) equal sub-panels but leaves its straight neighbours at the
-  // full h_panel, so the arc length jumps by up to ~7x (and 24x cap) across one knot (e.g. 2.61 -> 0.37). The
-  // production DL hotspots (out/network-greens-7158497: all top-20 nodes, 5 sites) sit exactly on these long|short
-  // knots: the long panel carries a steep curvature RAMP (violating the toroidal rule's near-constant-curvature
-  // assumption) and its neighbour's near-quad sees a 7x smaller element. Remedy = 2:1-style BALANCING (as in an
-  // octree): repeatedly bisect (in t) any panel whose arc length exceeds R x its shorter neighbour until all
-  // neighbour ratios <= R. Same curve, same radius, same surface => closure-neutral; terminal knots 0/1 kept.
-  // Costs ~+5% arm panels at R=2 on n298. QJ_ARM_PANEL_GRADE_MAX bounds the sweeps (default 8).
-  if (const char* gre = std::getenv("QJ_ARM_PANEL_GRADE")) {
-    const double gR = std::atof(gre);
-    if (gR > 1.0 && (Integer)tk.size() >= 3) {
-      const Integer gmax = std::getenv("QJ_ARM_PANEL_GRADE_MAX") ? std::max<Integer>(1, (Integer)std::atoi(std::getenv("QJ_ARM_PANEL_GRADE_MAX"))) : (Integer)8;
-      auto plen = [&](Real ta, Real tb) -> double {
-        double s = 0; Vec3<Real> pp = curve(ta);
-        for (int q = 1; q <= 8; q++) { const Vec3<Real> pq = curve(ta + (tb - ta) * (Real)q / (Real)8); s += (double)nrm(sub(pq, pp)); pp = pq; }
-        return s; };
-      const size_t np0 = tk.size() - 1;
-      for (Integer sweep = 0; sweep < gmax; sweep++) {
-        const size_t np = tk.size() - 1;
-        std::vector<double> L(np);
-        for (size_t p = 0; p < np; p++) L[p] = plen(tk[p], tk[p + 1]);
-        std::vector<Real> tkn; tkn.reserve(tk.size() + 8);
-        bool changed = false;
-        for (size_t p = 0; p < np; p++) {
-          tkn.push_back(tk[p]);
-          double nbmin = 1e300;
-          if (p > 0) nbmin = std::min(nbmin, L[p - 1]);
-          if (p + 1 < np) nbmin = std::min(nbmin, L[p + 1]);
-          if (L[p] > gR * nbmin * 1.0001) { tkn.push_back((Real)0.5 * (tk[p] + tk[p + 1])); changed = true; }
-        }
-        tkn.push_back(tk.back());
-        tk.swap(tkn);
-        if (!changed) break;
-      }
-      if (std::getenv("QJ_CORNER"))
-        std::cout << "  [panel-grade] R=" << gR << " => " << (long)(tk.size() - 1) << " panels (was " << (long)np0 << ")\n";
-    }
-  }
-  // ---- Panel-boundary DIRECTION-JUMP diagnostic (QJ_ARM_PANEL_DIAG): confirms whether the breaks sit at role
-  // transitions. Reports the max inter-panel chord-tangent turn at ROLE knots vs at interior-RUN knots.
-  if (std::getenv("QJ_ARM_PANEL_DIAG") && (Integer)tk.size() >= 3) {
-    const double dtol = 0.25 / (double)n;
-    auto chord = [&](Integer p) { return unit(sub(curve(tk[(size_t)p + 1]), curve(tk[(size_t)p]))); };
-    double role_max = 0, run_max = 0;
-    for (Integer p = 1; p + 1 < (Integer)tk.size(); p++) {
-      const Vec3<Real> c0 = chord(p - 1), c1 = chord(p);
-      double d = (double)dot(c0, c1); d = std::max(-1.0, std::min(1.0, d));
-      const double turn = std::acos(d) * 180.0 / M_PI;
-      bool role = false; for (int b = 0; b < 4; b++) if (std::fabs((double)tk[(size_t)p] - role_tb[b]) < dtol) role = true;
-      if (role) role_max = std::max(role_max, turn); else run_max = std::max(run_max, turn);
-    }
-    std::cout << "  [panel-diag] npan=" << (long)((Integer)tk.size() - 1)
-              << " roleMaxTurn=" << role_max << " runMaxTurn=" << run_max << "\n";
   }
   const Integer npanel = (Integer)tk.size() - 1;
-  const bool merged = (npanel != n);                                      // any corner panel merged?
-  // Sample Chebyshev-per-panel.
+
+  // ---- Chebyshev interpolation error of the centerline (QJ_CORNER diag). CSBQ represents each panel's
+  // centerline by its values at the `cheb` Chebyshev nodes; the degree-(cheb-1) interpolant of those nodes
+  // is what the solver actually sees. The error = max_t |L_panel(t) - curve(t)| over each panel, i.e. how
+  // far the panel polynomial departs from the true geometry. A seam corner that is smooth within each panel
+  // drives this toward zero; a knot/curvature step inside a panel (the M8 straddle) spikes it. Report the
+  // overall max/r AND the max over the two SEAM panel-blocks (lead+corner on each end) separately, since the
+  // seam neighbourhood is what sets the junction cross-list free-edge. ----
+  if (diag) {
+    const Vector<Real>& cnd = SlenderElemList<Real>::CenterlineNodes(cheb);
+    auto lagrange = [&](const std::vector<Vec3<Real>>& fj, Real xi) -> Vec3<Real> {   // nodes at cnd[], sample xi in [0,1]
+      Vec3<Real> acc{(Real)0,(Real)0,(Real)0};
+      for (Long j = 0; j < cheb; j++) {
+        Real w = 1;
+        for (Long m = 0; m < cheb; m++) if (m != j) w *= (double)(xi - cnd[m]) / (double)(cnd[j] - cnd[m]);
+        acc = add(acc, scal(w, fj[(size_t)j]));
+      }
+      return acc;
+    };
+    Real emax = 0, eseam = 0; const Integer MS = 50;
+    for (Integer p = 0; p < npanel; p++) {
+      const Real ta = tk[(size_t)p], tb = tk[(size_t)p+1];
+      std::vector<Vec3<Real>> fj((size_t)cheb);
+      for (Long j = 0; j < cheb; j++) fj[(size_t)j] = curve(ta + cnd[j]*(tb-ta));
+      Real ep = 0;
+      for (Integer sgi = 0; sgi <= MS; sgi++) { const Real xi = (Real)sgi/MS;
+        const Real e = nrm(sub(lagrange(fj, xi), curve(ta + xi*(tb-ta)))); if ((double)e > (double)ep) ep = e; }
+      if ((double)ep > (double)emax) emax = ep;
+      const bool seam_block = seam_corner ? ((double)tb <= (double)wCA + 1e-9 || (double)ta >= (double)wCB - 1e-9)
+                                          : ((double)tb <= (double)wLA + 1e-9 || (double)ta >= (double)wLB - 1e-9);
+      if (seam_block && (double)ep > (double)eseam) eseam = ep;
+    }
+    std::cout << "    [cheb interp err/r] max=" << (double)(emax/r_arm) << " seam=" << (double)(eseam/r_arm)
+              << " (npanel=" << npanel << ")\n";
+  }
+
+  // ---- optional per-stage dump (QJ_DUMP_STAGES) so the verification artifact can draw this path too. ----
+  if (const char* dsf = std::getenv("QJ_DUMP_STAGES"); dsf && dsf[0] && dump_tag) {
+    std::ofstream dsout(dsf, std::ios::app);
+    if (dsout) {
+      dsout << std::setprecision(17);
+      dsout << "# ARM " << dump_tag << " is_cap=" << (is_cap ? 1 : 0) << " downsample=1\n";
+      dsout << "SEAM A0 " << (double)A0[0] << " " << (double)A0[1] << " " << (double)A0[2]
+            << " uA " << (double)uA[0] << " " << (double)uA[1] << " " << (double)uA[2]
+            << " endC " << (double)endC[0] << " " << (double)endC[1] << " " << (double)endC[2]
+            << " uB " << (double)uB[0] << " " << (double)uB[1] << " " << (double)uB[2]
+            << " rA " << (double)rA << " rB " << (double)rB << "\n";
+      auto dump_pts = [&](const char* nm, const std::vector<Vec3<Real>>& P) {
+        dsout << "STAGE " << nm << " n=" << P.size() << "\n";
+        for (const auto& p : P) dsout << (double)p[0] << " " << (double)p[1] << " " << (double)p[2] << "\n";
+      };
+      dump_pts("raw", cl_in);
+      dump_pts("downsampled", ctrl);
+      const Integer Nf = std::max<Integer>((Integer)4*npanel, (Integer)64);
+      dsout << "STAGE final n=" << (Nf + 1) << "\n";
+      for (Integer k = 0; k <= Nf; k++) { const Real t=(Real)k/Nf; const Vec3<Real> c=curve(t);
+        dsout << (double)c[0] << " " << (double)c[1] << " " << (double)c[2] << " r=" << (double)radius_at(t) << "\n"; }
+      dsout << "# END ARM " << dump_tag << "\n";
+    }
+  }
+
+  // ---- emit CSBQ panels: Chebyshev-per-panel sampling of curve/radius/orient (never the panel endpoints). ----
   const Vector<Real>& cn = SlenderElemList<Real>::CenterlineNodes(cheb);
-  Real dip_deepest = (Real)1;                                             // min applied radius / seam-taper radius
-  // Fourier BUMP on tapered panels (QJ_ARM_DIP_FOURIER, default 0 = off). Where the radius taper thins the
-  // tube (a waist), raise the azimuthal order on THAT panel proportional to the taper depth, so the tighter
-  // near-quadrature aspect/toroidal ranges stay resolved. Capped at 52 (the densest cached toroidal rule).
-  const Integer dipf_extra = std::getenv("QJ_ARM_DIP_FOURIER") ? (Integer)std::atoi(std::getenv("QJ_ARM_DIP_FOURIER")) : (Integer)0;
+  const Long seam_c0 = coord.Dim();                             // node offset for the inter-panel seam check below
   for (Integer p = 0; p < npanel; p++) {
     const Real ta = tk[(size_t)p], tb = tk[(size_t)p + 1];
-    Long fp = fourier;
-    if (radius_dip && dipf_extra > 0) {
-      Real rmin_ratio = (Real)1;
-      for (Long j = 0; j < cheb; j++) {
-        const Real t = merged ? (ta + cn[j] * (tb - ta)) : ((p + cn[j]) / (Real)n);
-        const Real rl = rA + t*(rB - rA); if ((double)rl > 0) rmin_ratio = std::min(rmin_ratio, radius_at(t)/rl);
-      }
-      if ((double)rmin_ratio < 0.98) {
-        Real def = (Real)1 - rmin_ratio; if ((double)def > 1) def = 1;
-        fp = std::min<Long>((Long)52, fourier + (Long)std::lround((double)dipf_extra * (double)def));
-      }
-    }
-    elem_order.PushBack(cheb); forder.PushBack(fp);
+    elem_order.PushBack(cheb); forder.PushBack(fourier);
     for (Long j = 0; j < cheb; j++) {
-      // No merge => reproduce the pre-merge expression EXACTLY (bit-identical bundles); merged panels are
-      // non-uniform so must use the knot interval.
-      const Real t = merged ? (ta + cn[j] * (tb - ta)) : ((p + cn[j]) / (Real)n);
-      const Vec3<Real> Pc = curve(t); const Vec3<Real> o = orient_of(t);
-      const Real rlin = rA + t*(rB - rA); const Real rr = radius_at(t);
-      if ((double)rlin > 0 && (double)(rr/rlin) < (double)dip_deepest) dip_deepest = rr/rlin;
+      const Real t = ta + cn[j] * (tb - ta);
+      const Vec3<Real> Pc = curve(t); const Vec3<Real> o = orient_of(t); const Real rv = radius_at(t);
       coord.PushBack(Pc[0]); coord.PushBack(Pc[1]); coord.PushBack(Pc[2]);
-      radius.PushBack(rr);
+      radius.PushBack(rv);
       orient.PushBack(o[0]); orient.PushBack(o[1]); orient.PushBack(o[2]);
     }
   }
-  if (radius_dip && std::getenv("QJ_CORNER") && (double)dip_deepest < 0.999)
-    std::cout << "  [dip] mid-arm radius thinned to x" << (double)dip_deepest
-              << " of seam taper (floor x" << (double)dip_floor << ", mouths exact)\n";
+  // Inter-panel seam smoothness from the Chebyshev nodes CSBQ actually sees (QJ_ARM_SEAM_CHECK, default on):
+  // dpos (C0), dtang (C1), dkappa (C2). With panel_snap aligning panels to the C2 knots these should fall to
+  // the Chebyshev floor (dpos ~1e-10, dtang ~1e-6); a straddle keeps them at ~1e-4. Pure diagnostic.
+  report_arm_seam_smoothness<Real>(coord, seam_c0, npanel, cheb, dump_tag);
+}
+
+// ===================================================================================================
+// POLY-FIT arm centerline (QJ_ARM_POLYFIT) -- see docs/polyfit_centerline.md and python/polyfit_centerline.py.
+// Copy of append_downsampled_fiber (same signature; smoothing, mouths, straight lead, quintic-Hermite corner,
+// RMF orient, radius taper, seam-check, caps IDENTICAL) with ONLY these stages replaced:
+//   window  -> pf::adaptive_body_window (fold fix: push an end's room deeper while its fitted rho/r < 1.6),
+//   body    -> pf::SegPolyFit (turn+length-aware wide-knot piecewise degree-QJ_PF_DEG Chebyshev, C^QJ_PF_CONT),
+//   panels  -> boundaries SNAPPED ONTO the few segment knots, n_axial distributed ~ segment arclength.
+// Env knobs: QJ_PF_DEG[9] QJ_PF_CONT[4] QJ_PF_LSEG[45] QJ_PF_TURN_SEG[35] QJ_PF_SINGLE[0].
+// ===================================================================================================
+template <class Real> void append_polyfit_fiber(const ArmSeam<Real>& seamA, const Vec3<Real>& endC,
+    const Vec3<Real>& endTang, const std::vector<Vec3<Real>>& cl_in, Real rA, Real rB,
+    Integer n_axial, Integer lead_panels, Long cheb, Long fourier,
+    Vector<Long>& elem_order, Vector<Long>& forder, Vector<Real>& coord, Vector<Real>& radius, Vector<Real>& orient,
+    bool constant_orient, Vec3<Real> endE1, bool is_cap,
+    Vec3<Real>* out_termC, Vec3<Real>* out_termU, const char* dump_tag, Real* out_termR = nullptr) {
+  using namespace gnet;
+  const bool diag = (std::getenv("QJ_CORNER") != nullptr);
+  const Vec3<Real> A0 = seamA.C;
+  const Vec3<Real> uA = unit(seamA.u);
+  const Vec3<Real> fwdB = unit(endTang);                 // forward travel direction at the far end
+  const Vec3<Real> uB = scal((Real)-1, fwdB);            // junction B's arm-exit axis (= -endTang)
+  const Vec3<Real> chord = sub(endC, A0); const Real L = nrm(chord);
+  const Real r_arm = std::max(rA, rB);
+
+  // Degenerate arm => exact straight tapered tube (handled by the dedicated helper).
+  if ((double)L < 1e-12 || cl_in.size() < 2) {
+    append_straight_fiber<Real>(seamA, endC, rA, rB, std::max<Integer>(6, n_axial), cheb, fourier,
+                                elem_order, forder, coord, radius, orient);
+    if (out_termC) *out_termC = endC;
+    if (out_termU) *out_termU = uA;
+    return;
+  }
+
+  // ---- SMOOTH the FULL vmtk centerline up front (simple moving average, global ends fixed). The vmtk
+  // skeleton is already smooth; only its *discrete* curvature is noisy, and a few averaging passes open the
+  // tightest bends (here raw rho 0.73r -> 2.1r) without moving the path at figure scale. Doing it on the WHOLE
+  // curve -- not on the later extracted window -- is essential: a tight bend often sits right next to a mouth,
+  // and a window-local average that pins its endpoints would leave exactly that bend unsmoothed. ----
+  const Integer sm_passes = std::getenv("QJ_DS_SMOOTH") ? std::max<Integer>(0,(Integer)std::atoi(std::getenv("QJ_DS_SMOOTH"))) : (Integer)8;
+  std::vector<Vec3<Real>> clS = cl_in;
+  for (Integer it = 0; it < sm_passes && clS.size() >= 3; it++) {
+    std::vector<Vec3<Real>> sm = clS;
+    for (size_t k = 1; k+1 < clS.size(); k++)
+      sm[k] = scal((Real)0.25, add(add(clS[k-1], clS[k+1]), scal((Real)2, clS[k])));
+    clS.swap(sm);
+  }
+  // ---- Taubin lambda|mu low-pass (DEFAULT ON, QJ_DS_LOWPASS passes, default 64; QJ_DS_LOWPASS=0 opts out =>
+  // byte-identical to the moving-average-only path). Applied to INTERIOR arms only (NOT caps -- see below), on
+  // the full SMOOTHED centerline BEFORE the window extraction / uniform downsample, so the sparse knots are
+  // sampled from the denoised curve. The 3-point average above is a pure Laplacian SHRINK step (equivalent to
+  // one Taubin lambda=0.5 half-pass with no anti-shrink): a weak low-pass that, on a tortuous interior arm,
+  // leaves residual dkappa/ds curvature noise the toroidal special quadrature cannot resolve -> a ~0.5 DL
+  // free-edge MID-ARM (see [[network-interior-arm-lowpass]]; measured on interior j120->133: DL arm 0.545 ->
+  // 0.00424, 128x, with 64 Taubin passes). Taubin interleaves an anti-shrink mu step (mu<-lambda<0) so it
+  // removes the high-frequency curvature band WITHOUT shrinking the bend (tortuosity preserved) -- the
+  // production CL_LOWPASS fix (lambda 0.5 / mu -0.53). Global ends held fixed each half-step => mouth rings
+  // untouched, watertightness-neutral.
+  //   !is_cap: CAP (leaf) arms are EXCLUDED. A cap's far end is a free tip with a dome seated on the tube's
+  // terminal; caps are already clean without the low-pass (DL ~0.006), and applying Taubin reshapes the near-
+  // tip body curvature (rho/r 1.77->1.41 under the dome) and drives a ~0.9 DL free-edge there (measured on cap
+  // j286->289: 0.006 -> 0.915). Re-deriving the cap axis from the smoothed centerline does NOT help (Taubin
+  // barely moves the near-fixed-endpoint tangent); the only noisy arms that NEED the low-pass are the long
+  // tortuous interior ones. So the low-pass is interior-only. (QJ_CAP_LOWPASS, which opted caps back in after a
+  // tip trim, was reverted 2026-10-15: at full-net scale Taubin un-pins the cap's JUNCTION-SEAM endpoint and
+  // spawns worse cross-list blowups -- the dominant cap error is the seam, not the tip. See s11 memory.) ----
+  const Integer lp_passes = std::getenv("QJ_DS_LOWPASS") ? std::max<Integer>(0,(Integer)std::atoi(std::getenv("QJ_DS_LOWPASS"))) : (Integer)64;
+  if (lp_passes > 0 && !is_cap && clS.size() >= 3) {
+    const Real lp_lam = std::getenv("QJ_DS_LOWPASS_LAMBDA") ? (Real)std::atof(std::getenv("QJ_DS_LOWPASS_LAMBDA")) : (Real)0.5;
+    const Real lp_mu  = std::getenv("QJ_DS_LOWPASS_MU")     ? (Real)std::atof(std::getenv("QJ_DS_LOWPASS_MU"))     : (Real)-0.53;
+    auto lap_step = [&](Real w){                              // one uniform-weight Laplacian smoothing half-step, ends fixed
+      std::vector<Vec3<Real>> sm = clS;
+      for (size_t k = 1; k+1 < clS.size(); k++) {
+        const Vec3<Real> lapk = sub(scal((Real)0.5, add(clS[k-1], clS[k+1])), clS[k]);
+        sm[k] = add(clS[k], scal(w, lapk));
+      }
+      clS.swap(sm);
+    };
+    for (Integer it = 0; it < lp_passes; it++) { lap_step(lp_lam); lap_step(lp_mu); }
+  }
+  std::vector<Real> cs(clS.size(), (Real)0);
+  for (size_t k = 1; k < clS.size(); k++) cs[k] = cs[k-1] + nrm(sub(clS[k], clS[k-1]));
+  const Real total = cs.back();
+
+  // ---- SEAM-CORNER mode (DEFAULT; the production seam-settle recipe). The
+  // clamp_mode below forced the body-spline END knots QA/QB exactly onto the junction axis AND clamped the
+  // end tangent -- a double constraint that bent the ~0.1r-off-axis vessel back onto the axis over the one
+  // segment next to the clamp, the residual ~12x gap to the production seamsettle_tr6 baseline. Production
+  // keeps the body on the TRUE centerline and bridges each mouth with ONE gentle quintic Hermite "seam
+  // corner" that leaves the on-axis mouth ring coaxial (tangent = seam axis, zero endpoint acceleration) and
+  // ARRIVES on the vessel with the vessel's own tangent -- re-seating the terminal ring flush under the seam
+  // without straightening the vessel. Reproduced here: 1-panel straight coaxial lead (watertight mouth ring)
+  // -> cp-panel quintic Hermite corner QA->P_hA -> downsampled C2 body spline over the real (un-forced)
+  // window knots -> mirror corner -> lead. Opt out with QJ_DS_NO_SEAM_CORNER (=> old clamp/natural bridge).
+  const bool seam_corner = true;                          // polyfit is always seam-corner (lead|quintic corner|body|corner|lead)
+  // ---- coaxial lead length: one scale-invariant stub, capped to a fraction of the arm. Seam-corner and the
+  // legacy CLAMPED mode both use a SHORTER half-radius stub: the stub end QA/QB carries the on-axis mouth
+  // ring, and the quintic corner (resp. clamped spline) curves onto the off-axis vessel over its own run; a
+  // long stub would instead cram the turn into the one segment next to the stub and fold. The glued stub is
+  // straight+coaxial so the mouth ring conforms either way. ----
+  const bool clamp_mode = false;
+  Real Llead = (clamp_mode || seam_corner) ? (Real)0.5 * std::max(rA, rB) : std::max(rA, rB);
+  if (const char* e = std::getenv("QJ_DS_LEAD")) Llead = std::max((Real)1e-9, (Real)std::atof(e));
+  Llead = std::min(Llead, (Real)0.35 * total);           // leave room for a non-degenerate interior
+  const Vec3<Real> QA = add(A0,   scal(Llead, uA));
+  const Vec3<Real> QB = add(endC, scal(Llead, uB));      // QB = endC - Llead*endTang (so endC = QB + Llead*fwdB)
+
+  // ---- point on the SMOOTHED centerline at arclength s (linear-interp) ----
+  auto cl_at = [&](Real s) -> Vec3<Real> {
+    if ((double)s <= 0) return clS.front();
+    if ((double)s >= (double)total) return clS.back();
+    size_t i = 0; while (i+1 < cs.size() && (double)cs[i+1] < (double)s) i++;
+    const Real h = std::max((Real)1e-30, cs[i+1]-cs[i]); const Real w = (s-cs[i])/h;
+    return add(scal((Real)1-w, clS[i]), scal(w, clS[i+1]));
+  };
+
+  // ---- POLYFIT stages 3-5: adaptive body window + segmented constrained fit on the SMOOTHED centerline clS ----
+  auto envd = [](const char* k, double d){ const char* e = std::getenv(k); return e ? std::atof(e) : d; };
+  const int pf_deg  = (int)envd("QJ_PF_DEG", 9),  pf_cont = (int)envd("QJ_PF_CONT", 4);
+  const double pf_Lseg = envd("QJ_PF_LSEG", 45.0), pf_turn = envd("QJ_PF_TURN_SEG", 35.0);
+  const bool pf_single = envd("QJ_PF_SINGLE", 0.0) != 0.0;
+  // QJ_PF_END_KAPPA0 (DEFAULT ON): pin the body poly's end curvature to zero so the corner->body join is C2
+  // (matches DOWNSAMPLE's natural-C2 ends; the quintic corner is already zero-accel there). Set =0 to opt out.
+  const bool pf_endk0 = envd("QJ_PF_END_KAPPA0", 1.0) != 0.0;
+  // LOCAL curvature relax (QJ_PF_RELAX_RHO, default 0 = OFF). When >0, any arm whose FITTED body min rho/r falls
+  // below this target gets EXTRA moving-average passes applied to its smoothed centerline clS (ends fixed, so the
+  // mouth rings and watertightness are untouched -- the same safe shrink step already run `sm_passes` times), and
+  // the body window + segmented fit are redone, until the fitted body rho/r clears the target or QJ_PF_RELAX_MAX
+  // extra passes are spent. This OPENS the tightest bends toward the CSBQ clean toroidal threshold (~1.5): the DL
+  // const-density floor on the n298 net is set by the only two arms below 1.5 (caps j141->155 rho/r~1.27,
+  // j152->170 ~1.24), and that floor is a near-pinch QUADRATURE limit, not a centerline-representation or
+  // continuity deficit (raising Fourier made it worse). Arms already above the target fit on the first pass and
+  // get ZERO extra passes => byte-identical. A cap's far end is a free tip, so opening its bend moves the path
+  // <0.02 r (well inside the ~0.036 r baseline fit noise). The corner guard (pf_extra) re-runs each refit, so the
+  // seam corner stays >= pf_ctgt. Tunables: QJ_PF_RELAX_PASSES (batch per iter, default 4), QJ_PF_RELAX_MAX (cap).
+  const double pf_relax_rho = envd("QJ_PF_RELAX_RHO", 0.0);
+  const Integer pf_relax_batch = std::max<Integer>(1, (Integer)envd("QJ_PF_RELAX_PASSES", 4.0));
+  const Integer pf_relax_max = std::max<Integer>(0, (Integer)envd("QJ_PF_RELAX_MAX", 128.0));
+  // ---- CAP radius-shrink (QJ_PF_CAP_SHRINK=<target rho/r>, default 0=off; CAP arms only). Where the relax
+  // above still leaves a near-pinch cap below the clean toroidal threshold, instead of smoothing the path
+  // further, SHRINK the cap-END radius rB so rho/r_local clears the target at the tightest body point, and
+  // keep tapering DOWN to that smaller rB -- no flare back to the vessel radius. The owner MOUTH rA is
+  // unchanged (== junction seam => watertight); only the free tip shrinks. The hemisphere cap is then sized
+  // to the shrunk terminal radius (reported via out_termR), so the arm tip ring == cap equator (watertight).
+  // Floored at QJ_PF_CAP_SHRINK_FLOOR*rA (default 0.3, "never a needle"). Fires only when is_cap && the fitted
+  // body rho/r < target => clean caps and all interior arms are byte-identical.
+  const double pf_cap_shrink = envd("QJ_PF_CAP_SHRINK", 0.0);
+  const Real   pf_cap_floor  = (Real)envd("QJ_PF_CAP_SHRINK_FLOOR", 0.3);
+  auto cl_tan = [&](Real s)->Vec3<Real>{ const Real hh=(Real)0.03*total+(Real)1e-9; return unit(sub(cl_at(std::min(total,s+hh)), cl_at(std::max((Real)0,s-hh)))); };
+  (void)cl_tan;
+  std::vector<quad_junctions::pf::V3> smd(clS.size());
+  auto rebuild_smd = [&]{ smd.resize(clS.size()); for (size_t k = 0; k < clS.size(); k++) smd[k] = {(double)clS[k][0], (double)clS[k][1], (double)clS[k][2]}; };
+  rebuild_smd();
+  quad_junctions::pf::SegPolyFit pfit; quad_junctions::pf::PfWindow pwin;
+  // Window room is measured by AXIAL DEPTH past each mouth (projection on uA / uB), like the DOWNSAMPLE path's
+  // sdepth_fwd/bwd -- NOT arclength from clS[0]: the vmtk centerline starts ~2-3.5 r BEHIND the seam centre, so
+  // arclength Llead+2r from clS[0] lands behind the lead stub QA and the quintic corner hooks back (rho/r ~ 1e-4).
+  const std::function<int(double)> pf_idxA = [&](double depth)->int{
+    for (size_t k = 0; k < clS.size(); k++) if ((double)dot(sub(clS[k],A0),uA) >= depth) return (int)k;
+    return (int)clS.size() - 3; };
+  const std::function<int(double)> pf_idxB = [&](double depth)->int{
+    for (size_t k = clS.size(); k-- > 0;) if ((double)dot(sub(clS[k],endC),uB) >= depth) return (int)k;
+    return 2; };
+  // Corner guard (QJ_PF_CORNER_TGT, default 1.6 r; 0 disables): the python reference only tests the BODY rho/r, but with a
+  // real seam the on-axis stub must also swing onto the body start through ONE quintic Hermite corner; a body that starts
+  // too close to the mouth makes that corner fold (rho/r<1). Same push-deeper reaction as the body test (analogue of
+  // DOWNSAMPLE's QJ_DS_CORNER_TGT loop).
+  const double pf_ctgt = envd("QJ_PF_CORNER_TGT", 1.6);
+  const Real pf_ckr = std::getenv("QJ_DS_CORNER_KR") ? (Real)std::atof(std::getenv("QJ_DS_CORNER_KR")) : (Real)0.8;
+  auto pf_h5min = [&](const Vec3<Real>& P0,const Vec3<Real>& T0,Real h0,const Vec3<Real>& P1,const Vec3<Real>& T1,Real h1)->Real{
+    const Integer M=100; const Real hh=(Real)1/(M+2); Real km=0;
+    for (Integer i=1;i<M;i++){ const Real s=(Real)i/M;
+      const Vec3<Real> xm=HybridAssembly<Real>::hermite5(P0,T0,h0,P1,T1,h1,s-hh);
+      const Vec3<Real> x0=HybridAssembly<Real>::hermite5(P0,T0,h0,P1,T1,h1,s);
+      const Vec3<Real> xp=HybridAssembly<Real>::hermite5(P0,T0,h0,P1,T1,h1,s+hh);
+      const Vec3<Real> d1=scal((Real)1/(2*hh),sub(xp,xm)); const Vec3<Real> d2=scal((Real)1/(hh*hh),sub(add(xp,xm),scal((Real)2,x0)));
+      const Real sp=nrm(d1),cn2=nrm(cross(d1,d2)); if ((double)sp>1e-30){ const Real k=cn2/(sp*sp*sp); if ((double)k>(double)km) km=k; } }
+    return (double)km>1e-30 ? (Real)1/km : (Real)1e30; };
+  const std::function<std::pair<bool,bool>(const quad_junctions::pf::SegPolyFit&, const quad_junctions::pf::PfWindow&)> pf_extra =
+    [&](const quad_junctions::pf::SegPolyFit& F, const quad_junctions::pf::PfWindow&)->std::pair<bool,bool>{
+      if (pf_ctgt <= 0) return {true,true};
+      auto v3 = [](const quad_junctions::pf::V3& a){ return Vec3<Real>{(Real)a[0],(Real)a[1],(Real)a[2]}; };
+      const Vec3<Real> PA = v3(F.eval(0.0)), PB = v3(F.eval(1.0));
+      const Vec3<Real> tA = unit(v3(F.deriv(0.0,1))), tB = unit(v3(F.deriv(1.0,1)));
+      const Vec3<Real> chA = sub(PA, QA), chB = sub(QB, PB);
+      const Real LA = nrm(chA), LB = nrm(chB);
+      const Real rA_ = pf_h5min(QA, uA, pf_ckr*LA, PA, tA, pf_ckr*LA);
+      const Real rB_ = pf_h5min(PB, tB, pf_ckr*LB, QB, fwdB, pf_ckr*LB);
+      return {(double)rA_ >= pf_ctgt*(double)r_arm, (double)rB_ >= pf_ctgt*(double)r_arm}; };
+  auto do_fit = [&]() -> bool {                                  // base window, then shrink the room before giving up
+    bool ok = quad_junctions::pf::adaptive_body_window(smd, (double)r_arm, (double)Llead, pfit, pwin,
+                  2.0, 2.0, 12.0, 1.6, 0.12, pf_deg, pf_cont, pf_Lseg, pf_turn, pf_single, pf_endk0, pf_idxA, pf_idxB, pf_extra);
+    if (!ok) for (double kb : {1.0, 0.5, 0.0}) {
+      ok = quad_junctions::pf::adaptive_body_window(smd, (double)r_arm, (double)Llead, pfit, pwin,
+                  kb, 2.0, 12.0, 1.6, 0.12, pf_deg, pf_cont, pf_Lseg, pf_turn, pf_single, pf_endk0, pf_idxA, pf_idxB, pf_extra);
+      if (ok) break; }
+    return ok; };
+  auto body_min_rho_r = [&]() -> double { const auto rr = pfit.rho_over_r((double)r_arm, 1200);
+    return rr.empty() ? 1e30 : *std::min_element(rr.begin(), rr.end()); };
+  bool pf_ok = do_fit();
+  // LOCAL curvature relax: open the body bend with extra ends-fixed moving-average passes until the fitted body
+  // min rho/r clears pf_relax_rho (see the knob comment above). Fires only on arms below target; reverts to the
+  // last good fit if a refit ever fails (a smoother curve almost never does).
+  if (pf_ok && pf_relax_rho > 0 && (double)body_min_rho_r() < pf_relax_rho) {
+    Integer nrelax = 0;
+    while (nrelax < pf_relax_max && (double)body_min_rho_r() < pf_relax_rho) {
+      std::vector<Vec3<Real>> clS_prev = clS;
+      for (Integer it = 0; it < pf_relax_batch && clS.size() >= 3; it++) {
+        std::vector<Vec3<Real>> sm = clS;                        // one 0.25*(prev+next+2*cur) half-step, ends fixed
+        for (size_t k = 1; k+1 < clS.size(); k++)
+          sm[k] = scal((Real)0.25, add(add(clS[k-1], clS[k+1]), scal((Real)2, clS[k])));
+        clS.swap(sm);
+      }
+      rebuild_smd();
+      if (!do_fit()) { clS.swap(clS_prev); rebuild_smd(); do_fit(); break; }   // revert to last good, stop
+      nrelax += pf_relax_batch;
+    }
+    if (diag) std::cout << "    [pf-relax] " << (dump_tag?dump_tag:"") << " +" << (long)nrelax
+                        << " mov-avg passes -> body rho/r=" << body_min_rho_r() << " (target " << pf_relax_rho << ")\n";
+  }
+  // CAP radius-shrink (see knob comment): taper the free cap-end radius DOWN so the tightest fitted-body bend
+  // clears target rho/r_local; the cap dome is sized to this terminal radius via out_termR below. radius_at()
+  // captures rB by reference, so modifying it here (before panelization) retargets the linear taper's far end.
+  if (pf_ok && is_cap && pf_cap_shrink > 0) {
+    const double rr = body_min_rho_r();                        // min rho / r_arm over the fitted body
+    if (rr < pf_cap_shrink && rr < 1e29) {
+      const Real min_rho = (Real)rr * r_arm;                   // absolute min curvature radius of the body
+      const Real rB_new  = std::max<Real>(pf_cap_floor * rA, (Real)(min_rho / pf_cap_shrink));
+      if ((double)rB_new < (double)rB) {
+        if (diag) std::cout << "    [pf-capshrink] " << (dump_tag?dump_tag:"") << " rB " << (double)rB
+                            << " -> " << (double)rB_new << "  (body rho/r " << rr << " -> tip rho/r "
+                            << (double)(min_rho/rB_new) << ", target " << pf_cap_shrink << ")\n";
+        rB = rB_new;
+      }
+    }
+  }
+  if (!pf_ok) {   // still no valid window: fall back to the DOWNSAMPLE builder for this (very short) arm
+    if (diag) std::cout << "  [polyfit] " << (dump_tag?dump_tag:"") << " window/fit failed -> DOWNSAMPLE fallback\n";
+    append_downsampled_fiber<Real>(seamA, endC, endTang, cl_in, rA, rB, n_axial, lead_panels, cheb, fourier,
+                                   elem_order, forder, coord, radius, orient, constant_orient, endE1, is_cap,
+                                   out_termC, out_termU, dump_tag);
+    return;
+  }
+  if (out_termR) *out_termR = rB;                                // terminal (cap-end) tube radius = rB (possibly cap-shrunk)
+  const std::vector<double> pf_f = pfit.f;                       // segment knot fractions (tau in [0,1])
+  const Integer pf_S = (Integer)pfit.S;
+  auto pf_eval = [&](Real tau) -> Vec3<Real> { const auto v = pfit.eval((double)tau); return Vec3<Real>{(Real)v[0],(Real)v[1],(Real)v[2]}; };
+  const Integer nmid_pf = std::max<Integer>(std::max<Integer>(1, n_axial), pf_S);   // >=1 panel per segment
+  std::vector<Vec3<Real>> ctrl;                                  // body points (for dump / PhA,PhB)
+  for (int k = pwin.iA; k <= pwin.iB; k++) ctrl.push_back(clS[(size_t)k]);
+  // Body end tangents for the corners: the fit's own analytic end tangent (corner arrives along the body).
+  const Vec3<Real> tanA = Vec3<Real>{(Real)pfit.deriv(0.0,1)[0],(Real)pfit.deriv(0.0,1)[1],(Real)pfit.deriv(0.0,1)[2]};
+  const Vec3<Real> tanB = Vec3<Real>{(Real)pfit.deriv(1.0,1)[0],(Real)pfit.deriv(1.0,1)[1],(Real)pfit.deriv(1.0,1)[2]};
+  const Vec3<Real> teA = unit(tanA), teB = unit(tanB);
+  if (diag) std::cout << "    [pf-window] " << (dump_tag?dump_tag:"") << " cl0-behind-A0/r=" << (double)(dot(sub(clS.front(),A0),uA)/r_arm)
+      << " PhA axial depth/r=" << (double)(dot(sub(ctrl.front(),A0),uA)/r_arm) << " (Llead/r=" << (double)(Llead/r_arm)
+      << ")  PhB axial depth/r=" << (double)(dot(sub(ctrl.back(),endC),uB)/r_arm) << " tanA.uA=" << (double)dot(teA,uA) << " tanB.fwdB=" << (double)dot(teB,fwdB) << "\n";
+  const Real thA = 0, thB = 0; (void)thA; (void)thB;
+
+  // ---- panelization: one lead panel each side (per the assembler), plus (seam_corner) one quintic corner
+  // panel-block each side, the rest spread over the spline body.
+  const Integer lp = std::max<Integer>(1, lead_panels);
+  const Integer cp = seam_corner ? (std::getenv("QJ_DS_CORNER_PANELS")
+                     ? std::max<Integer>(1, (Integer)std::atoi(std::getenv("QJ_DS_CORNER_PANELS"))) : lp) : 0;
+  const Integer nmid = nmid_pf;
+  const Integer n = nmid + 2*lp + 2*cp;                  // total panels before turn-refine
+  // panel-fraction boundaries (seam_corner): lead A [0,wLA] | corner A [wLA,wCA] | body [wCA,wCB] | corner B
+  // [wCB,wLB] | lead B [wLB,1]. For clamp/natural (cp=0) wCA=wLA and wCB=wLB collapse to the 3-piece layout.
+  const Real wLA = (Real)lp/(Real)n, wCA = (Real)(lp+cp)/(Real)n;
+  const Real wCB = (Real)(n-lp-cp)/(Real)n, wLB = (Real)(n-lp)/(Real)n;
+  // Quintic Hermite seam-corner geometry: unit end tangents (axis uA/fwdB at the stub, vessel tanA/tanB at the
+  // body) scaled by a PER-END Ferguson handle, zero endpoint acceleration (same hermite5 the production
+  // seam-settle uses). P_hA/P_hB are the true (off-axis) body-window ends. The handle is
+  // h = corner_kr*|chord|*clamp(dot(tangent, chordhat), floor, cap). The Ferguson projection (floor<1) SHRINKS
+  // a handle whose tangent points away from the chord -- the production QJ_ARM_FERGUSON overshoot fix. But the
+  // seam corner's failure is the OPPOSITE: it joins an on-axis stub to an off-axis vessel end and needs a LONG
+  // handle to swing gently, so shrinking the handle tightens the fold. Hence Ferguson is OFF by default here
+  // (floor=cap=1 => h=corner_kr*|chord|) and the handle is set generously (corner_kr=0.8); set QJ_DS_CORNER_FLOOR<1
+  // to re-enable the projection. corner_kr sweet spot is ~0.8-1.0 (0.6 whips, >1.2 overshoots).
+  const Real corner_kr = std::getenv("QJ_DS_CORNER_KR") ? (Real)std::atof(std::getenv("QJ_DS_CORNER_KR")) : (Real)0.8;
+  const Real cfloor = std::getenv("QJ_DS_CORNER_FLOOR") ? (Real)std::atof(std::getenv("QJ_DS_CORNER_FLOOR")) : (Real)1.00;
+  const Real ccap   = std::getenv("QJ_DS_CORNER_CAP")   ? (Real)std::atof(std::getenv("QJ_DS_CORNER_CAP"))   : (Real)1.00;
+  const Vec3<Real> PhA = ctrl.front(), PhB = ctrl.back();   // true (off-axis) smoothed-centerline body-window ends
+  auto ferg_h = [&](const Vec3<Real>& T, const Vec3<Real>& chord) -> Real {
+    const Real Lc = nrm(chord); if ((double)Lc < 1e-30) return (Real)0;
+    const Vec3<Real> ch = unit(chord);
+    return corner_kr * Lc * std::min(ccap, std::max(cfloor, dot(T, ch)));
+  };
+  const Vec3<Real> chA = sub(PhA, QA), chB = sub(QB, PhB);
+  const Real hA0 = ferg_h(uA, chA),  hA1 = ferg_h(teA, chA);      // corner A: QA(uA) -> PhA(teA)
+  const Real hB0 = ferg_h(teB, chB), hB1 = ferg_h(fwdB, chB);     // corner B: PhB(teB) -> QB(fwdB)
+
+  // Piecewise centerline c(t). seam_corner: lead -> quintic corner -> C2 body spline -> quintic corner -> lead.
+  // clamp/natural: straight lead A0->QA, C2 spline QA->QB, straight lead QB->endC.
+  auto curve = [&](Real t) -> Vec3<Real> {
+    if (seam_corner) {
+      if ((double)t <= (double)wLA) { const Real q = (double)wLA>1e-30 ? t/wLA : (Real)0; return add(A0, scal(q*Llead, uA)); }
+      if ((double)t <  (double)wCA) { const Real s = (t-wLA)/(wCA-wLA);         // corner A: stub(uA) -> body(teA)
+        return HybridAssembly<Real>::hermite5(QA, uA, hA0, PhA, teA, hA1, s); }
+      if ((double)t <= (double)wCB) { const Real tau = (t-wCA)/(wCB-wCA); return pf_eval(tau); }
+      if ((double)t <  (double)wLB) { const Real s = (t-wCB)/(wLB-wCB);         // corner B: body(teB) -> stub(fwdB)
+        return HybridAssembly<Real>::hermite5(PhB, teB, hB0, QB, fwdB, hB1, s); }
+      const Real q = (double)(1-wLB)>1e-30 ? (t-wLB)/((Real)1-wLB) : (Real)1; return add(QB, scal(q*Llead, fwdB));
+    }
+    if ((double)t <= (double)wLA) { const Real q = (double)wLA>1e-30 ? t/wLA : (Real)0; return add(A0, scal(q*Llead, uA)); }
+    if ((double)t >= (double)wLB) { const Real q = (double)(1-wLB)>1e-30 ? (t-wLB)/((Real)1-wLB) : (Real)1; return add(QB, scal(q*Llead, fwdB)); }
+    const Real tau = (t - wLA)/(wLB - wLA);
+    return pf_eval(tau);
+  };
+  auto radius_at = [&](Real t) -> Real { return rA + t*(rB - rA); };      // exact seam-conforming linear taper
+
+  // Honest fold report: min rho/r of the fitted body (SegPolyFit analytic derivs) + each quintic corner.
+  if (diag) {
+    const std::vector<double> rr = pfit.rho_over_r((double)r_arm, 1200);
+    const Real rho_body = (Real)(*std::min_element(rr.begin(), rr.end())) * r_arm;
+    auto corner_rho = [&](Real lo, Real hi) -> Real {
+      const Integer MC = 200; const Real span = hi - lo; if ((double)span <= 1e-12) return (Real)1e30;
+      const Real hh = span / (MC + 2); Real km = 0;
+      for (Integer i = 1; i < MC; i++) {
+        const Real tt = lo + span*(Real)i/MC;
+        const Vec3<Real> xm = curve(tt-hh), x0 = curve(tt), xp = curve(tt+hh);
+        const Vec3<Real> d1 = scal((Real)1/(2*hh), sub(xp, xm));
+        const Vec3<Real> d2 = scal((Real)1/(hh*hh), sub(add(xp, xm), scal((Real)2, x0)));
+        const Real sp = nrm(d1), cn2 = nrm(cross(d1, d2));
+        if ((double)sp > 1e-30) { const Real k = cn2/(sp*sp*sp); if ((double)k > (double)km) km = k; }
+      }
+      return (double)km > 1e-30 ? (Real)1/km : (Real)1e30;
+    };
+    const Real rho_cA = corner_rho(wLA, wCA), rho_cB = corner_rho(wCB, wLB);
+    std::cout << "    [corner rho/r] A=" << (double)(rho_cA/r_arm) << " body=" << (double)(rho_body/r_arm)
+              << " B=" << (double)(rho_cB/r_arm) << "\n";
+    const Real rho = std::min(rho_body, std::min(rho_cA, rho_cB));
+    std::cout << "  [downsample] " << (dump_tag?dump_tag:"") << (is_cap?" (cap)":"") << " polyfit S=" << pf_S
+              << " deg=" << pf_deg << " C" << pf_cont << " kA/kB=" << pwin.kA << "/" << pwin.kB
+              << " turn=" << pfit.total_turn_deg << "deg nbody=" << ctrl.size()
+              << " rho_min/r=" << (double)(rho/r_arm) << ((double)rho < (double)r_arm ? "  FOLD" : "") << "\n";
+  }
+
+  // ---- rotation-minimizing frame (double reflection), tabulated; closure-twist onto endE1 at t=1. ----
+  const Integer Ng = std::max<Integer>((Integer)200, (Integer)20*n);
+  auto tang = [&](Integer i) -> Vec3<Real> {
+    const Real h = (Real)1/Ng;
+    if (i <= 0)  return unit(sub(curve(h), curve((Real)0)));
+    if (i >= Ng) return unit(sub(curve((Real)1), curve((Real)1-h)));
+    return unit(sub(curve((i+1)*h), curve((i-1)*h)));
+  };
+  if (out_termC) *out_termC = curve((Real)1);
+  if (out_termU) *out_termU = tang(Ng);
+  std::vector<Vec3<Real>> Rtab((size_t)Ng+1);
+  Vec3<Real> ti = tang(0);
+  Vec3<Real> rr = unit(sub(seamA.e1, scal(dot(seamA.e1, ti), ti)));
+  if ((double)nrm(rr) < 1e-9) { Vec3<Real> a{1,0,0}; if (std::fabs((double)ti[0])>0.9) a = Vec3<Real>{0,1,0}; rr = unit(sub(a, scal(dot(a,ti), ti))); }
+  Rtab[0] = rr;
+  for (Integer i = 0; i < Ng; i++) {
+    const Vec3<Real> xi = curve(i/(Real)Ng), xi1 = curve((i+1)/(Real)Ng);
+    const Vec3<Real> ti1 = tang(i+1);
+    const Vec3<Real> v1 = sub(xi1, xi); const Real c1 = dot(v1, v1);
+    const Vec3<Real> rL = (double)c1>0 ? sub(rr, scal(2*dot(v1,rr)/c1, v1)) : rr;
+    const Vec3<Real> tL = (double)c1>0 ? sub(ti, scal(2*dot(v1,ti)/c1, v1)) : ti;
+    const Vec3<Real> v2 = sub(ti1, tL); const Real c2d = dot(v2, v2);
+    Vec3<Real> r1 = (double)c2d>0 ? sub(rL, scal(2*dot(v2,rL)/c2d, v2)) : rL;
+    r1 = unit(r1); Rtab[(size_t)i+1] = r1; rr = r1; ti = ti1;
+  }
+  // Uniform closure twist so the far ring matches endE1 (neighbour/cap frame); identical to the blend path.
+  Real phi = 0;
+  if (!constant_orient && ((double)endE1[0]!=0 || (double)endE1[1]!=0 || (double)endE1[2]!=0)) {
+    const Vec3<Real> tend = tang(Ng);
+    const Vec3<Real> e1t = unit(sub(endE1, scal(dot(endE1, tend), tend)));
+    const Vec3<Real> rend = Rtab[(size_t)Ng];
+    if ((double)nrm(e1t) > 1e-9) {
+      Real cph = dot(rend, e1t); cph = std::max((Real)-1, std::min((Real)1, cph));
+      phi = std::acos((double)cph);
+      if ((double)dot(cross(rend, e1t), tend) < 0) phi = -phi;
+    }
+  }
+  const Vec3<Real> r0const = Rtab[0];
+  auto orient_of = [&](Real t) -> Vec3<Real> {
+    if (constant_orient) return r0const;
+    Real g = t*Ng; if ((double)g < 0) g = 0; if (g > (Real)Ng) g = (Real)Ng;
+    Integer i = (Integer)g; if (i >= Ng) i = Ng-1; const Real f = g - i;
+    Vec3<Real> e1 = unit(add(scal((1-f), Rtab[(size_t)i]), scal(f, Rtab[(size_t)i+1])));
+    if ((double)phi != 0) {                              // rotate e1 by t*phi about the local tangent (Rodrigues)
+      const Vec3<Real> k = tang((Integer)std::lround((double)t*Ng));
+      const Real th = t*phi, ct = std::cos((double)th), st = std::sin((double)th);
+      e1 = add(add(scal(ct, e1), scal(st, cross(k, e1))), scal(dot(k,e1)*((Real)1-ct), k));
+      e1 = unit(e1);
+    }
+    return e1;
+  };
+
+  // ---- panel knot vector: uniform, lead pinned to panels [0,lp) and [n-lp,n); turn-refine the spline body.
+  std::vector<Real> tk; tk.reserve((size_t)n + 1);
+  for (Integer k = 0; k <= n; k++) tk.push_back((Real)k / (Real)n);
+  // POLYFIT panel layout: body = tk indices [lp+cp .. n-lp-cp] (nmid panels). Distribute them over the S wide
+  // segments proportional to segment width (>=1 each, largest-remainder), uniform within a segment, so EVERY
+  // segment knot is a panel boundary (each panel interior to one analytic degree-deg polynomial => exact).
+  // tau (body parameter) maps to t = wCA + tau*(wCB-wCA). Turn-refine below only subdivides WITHIN panels.
+  {
+    const Integer b0 = lp + cp; const Integer S_ = pf_S;
+    std::vector<Integer> nper((size_t)S_, 1); std::vector<std::pair<double,Integer>> frac;
+    Integer used = S_; const Integer extra = nmid - S_;
+    for (Integer i = 0; i < S_; i++) { const double x = (double)extra * (pf_f[(size_t)i+1]-pf_f[(size_t)i]);
+      const Integer fl = (Integer)std::floor(x); nper[(size_t)i] += fl; used += fl; frac.push_back({x-fl, i}); }
+    std::sort(frac.begin(), frac.end(), [](const std::pair<double,Integer>& a, const std::pair<double,Integer>& b){ return a.first > b.first; });
+    for (size_t q = 0; used < nmid && q < frac.size(); q++, used++) nper[(size_t)frac[q].second]++;
+    Integer k = 0;
+    for (Integer i = 0; i < S_; i++)
+      for (Integer m = 0; m < nper[(size_t)i]; m++, k++) {
+        if (k == 0) continue;                                   // tk[b0] stays wCA
+        const double tau = pf_f[(size_t)i] + (pf_f[(size_t)i+1]-pf_f[(size_t)i]) * (double)m / (double)nper[(size_t)i];
+        tk[(size_t)(b0 + k)] = wCA + (Real)tau * (wCB - wCA);
+      }
+  }
+  // Curvature-adaptive turn refinement (same lever as the blend path, default 6 deg / cap 24): split any
+  // panel whose tangent bends more than the cap into ceil(bend/cap) sub-panels (same curve, same radius).
+  const char* trc = std::getenv("QJ_ARM_TURN_REFINE") ? std::getenv("QJ_ARM_TURN_REFINE") : "6";
+  if (trc && std::atof(trc) <= 0.0) trc = nullptr;
+  const Integer turn_refine_max = std::getenv("QJ_ARM_TURN_REFINE_MAX") ? std::max<Integer>(1, (Integer)std::atoi(std::getenv("QJ_ARM_TURN_REFINE_MAX"))) : (Integer)24;
+  if (trc) {
+    const double cap = std::max(1.0, std::atof(trc));
+    auto tang_at = [&](Real t, int side) -> Vec3<Real> {
+      const Real d = (Real)1e-3;
+      return side < 0 ? unit(sub(curve(std::min<Real>((Real)1, t + d)), curve(t)))
+                      : unit(sub(curve(t), curve(std::max<Real>((Real)0, t - d))));
+    };
+    std::vector<Real> tk3; tk3.reserve(tk.size() * 2);
+    for (Integer p = 0; p + 1 < (Integer)tk.size(); p++) {
+      const Real ta = tk[(size_t)p], tb = tk[(size_t)p + 1];
+      const Vec3<Real> t0 = tang_at(ta, -1), t1 = tang_at(tb, +1);
+      double d = (double)dot(t0, t1); d = std::max(-1.0, std::min(1.0, d));
+      const double bend = std::acos(d) * 180.0 / M_PI;
+      Integer k = (Integer)std::ceil(bend / cap); if (k < 1) k = 1; if (k > turn_refine_max) k = turn_refine_max;
+      tk3.push_back(ta);
+      for (Integer sgi = 1; sgi < k; sgi++) tk3.push_back((Real)(ta + (tb - ta) * (Real)sgi / (Real)k));
+    }
+    tk3.push_back(tk.back());
+    tk.swap(tk3);
+  }
+  const Integer npanel = (Integer)tk.size() - 1;
+
+  // ---- Chebyshev interpolation error of the centerline (QJ_CORNER diag). CSBQ represents each panel's
+  // centerline by its values at the `cheb` Chebyshev nodes; the degree-(cheb-1) interpolant of those nodes
+  // is what the solver actually sees. The error = max_t |L_panel(t) - curve(t)| over each panel, i.e. how
+  // far the panel polynomial departs from the true geometry. A seam corner that is smooth within each panel
+  // drives this toward zero; a knot/curvature step inside a panel (the M8 straddle) spikes it. Report the
+  // overall max/r AND the max over the two SEAM panel-blocks (lead+corner on each end) separately, since the
+  // seam neighbourhood is what sets the junction cross-list free-edge. ----
+  if (diag) {
+    const Vector<Real>& cnd = SlenderElemList<Real>::CenterlineNodes(cheb);
+    auto lagrange = [&](const std::vector<Vec3<Real>>& fj, Real xi) -> Vec3<Real> {   // nodes at cnd[], sample xi in [0,1]
+      Vec3<Real> acc{(Real)0,(Real)0,(Real)0};
+      for (Long j = 0; j < cheb; j++) {
+        Real w = 1;
+        for (Long m = 0; m < cheb; m++) if (m != j) w *= (double)(xi - cnd[m]) / (double)(cnd[j] - cnd[m]);
+        acc = add(acc, scal(w, fj[(size_t)j]));
+      }
+      return acc;
+    };
+    Real emax = 0, eseam = 0; const Integer MS = 50;
+    for (Integer p = 0; p < npanel; p++) {
+      const Real ta = tk[(size_t)p], tb = tk[(size_t)p+1];
+      std::vector<Vec3<Real>> fj((size_t)cheb);
+      for (Long j = 0; j < cheb; j++) fj[(size_t)j] = curve(ta + cnd[j]*(tb-ta));
+      Real ep = 0;
+      for (Integer sgi = 0; sgi <= MS; sgi++) { const Real xi = (Real)sgi/MS;
+        const Real e = nrm(sub(lagrange(fj, xi), curve(ta + xi*(tb-ta)))); if ((double)e > (double)ep) ep = e; }
+      if ((double)ep > (double)emax) emax = ep;
+      const bool seam_block = seam_corner ? ((double)tb <= (double)wCA + 1e-9 || (double)ta >= (double)wCB - 1e-9)
+                                          : ((double)tb <= (double)wLA + 1e-9 || (double)ta >= (double)wLB - 1e-9);
+      if (seam_block && (double)ep > (double)eseam) eseam = ep;
+    }
+    std::cout << "    [cheb interp err/r] max=" << (double)(emax/r_arm) << " seam=" << (double)(eseam/r_arm)
+              << " (npanel=" << npanel << ")\n";
+  }
+
+  // ---- optional per-stage dump (QJ_DUMP_STAGES) so the verification artifact can draw this path too. ----
+  if (const char* dsf = std::getenv("QJ_DUMP_STAGES"); dsf && dsf[0] && dump_tag) {
+    std::ofstream dsout(dsf, std::ios::app);
+    if (dsout) {
+      dsout << std::setprecision(17);
+      dsout << "# ARM " << dump_tag << " is_cap=" << (is_cap ? 1 : 0) << " downsample=1 polyfit=1\n";
+      dsout << "SEAM A0 " << (double)A0[0] << " " << (double)A0[1] << " " << (double)A0[2]
+            << " uA " << (double)uA[0] << " " << (double)uA[1] << " " << (double)uA[2]
+            << " endC " << (double)endC[0] << " " << (double)endC[1] << " " << (double)endC[2]
+            << " uB " << (double)uB[0] << " " << (double)uB[1] << " " << (double)uB[2]
+            << " rA " << (double)rA << " rB " << (double)rB << "\n";
+      auto dump_pts = [&](const char* nm, const std::vector<Vec3<Real>>& P) {
+        dsout << "STAGE " << nm << " n=" << P.size() << "\n";
+        for (const auto& p : P) dsout << (double)p[0] << " " << (double)p[1] << " " << (double)p[2] << "\n";
+      };
+      dump_pts("raw", cl_in);
+      dump_pts("downsampled", ctrl);   // polyfit body points
+      const Integer Nf = std::max<Integer>((Integer)4*npanel, (Integer)64);
+      dsout << "STAGE final n=" << (Nf + 1) << "\n";
+      for (Integer k = 0; k <= Nf; k++) { const Real t=(Real)k/Nf; const Vec3<Real> c=curve(t);
+        dsout << (double)c[0] << " " << (double)c[1] << " " << (double)c[2] << " r=" << (double)radius_at(t) << "\n"; }
+      dsout << "# END ARM " << dump_tag << "\n";
+    }
+  }
+
+  // ---- emit CSBQ panels: Chebyshev-per-panel sampling of curve/radius/orient (never the panel endpoints). ----
+  const Vector<Real>& cn = SlenderElemList<Real>::CenterlineNodes(cheb);
+  const Long seam_c0 = coord.Dim();                             // node offset for the inter-panel seam check below
+  for (Integer p = 0; p < npanel; p++) {
+    const Real ta = tk[(size_t)p], tb = tk[(size_t)p + 1];
+    elem_order.PushBack(cheb); forder.PushBack(fourier);
+    for (Long j = 0; j < cheb; j++) {
+      const Real t = ta + cn[j] * (tb - ta);
+      const Vec3<Real> Pc = curve(t); const Vec3<Real> o = orient_of(t); const Real rv = radius_at(t);
+      coord.PushBack(Pc[0]); coord.PushBack(Pc[1]); coord.PushBack(Pc[2]);
+      radius.PushBack(rv);
+      orient.PushBack(o[0]); orient.PushBack(o[1]); orient.PushBack(o[2]);
+    }
+  }
+  // Inter-panel seam smoothness from the Chebyshev nodes CSBQ actually sees (QJ_ARM_SEAM_CHECK, default on):
+  // dpos (C0), dtang (C1), dkappa (C2). With panel_snap aligning panels to the C2 knots these should fall to
+  // the Chebyshev floor (dpos ~1e-10, dtang ~1e-6); a straddle keeps them at ~1e-4. Pure diagnostic.
+  report_arm_seam_smoothness<Real>(coord, seam_c0, npanel, cheb, dump_tag);
 }
 
 // A STRAIGHT constant/tapered fiber seamA.C -> endC (debug A/B vs the bent one; mirrors add_free_arm's

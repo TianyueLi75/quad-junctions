@@ -2,7 +2,7 @@
 """Truthful per-stage visuals of the arm-centerline construction for a node chain.
 All plotted curves/points are read from the C++ per-stage dump (STAGES) and the .graph;
 nothing is re-implemented (no Taubin/spline/Hermite math here).  Only simple
-diagnostics of dumped points (three-point circumradius rho, |dx|; labelled) are computed.  Theory: obj_to_quadrature_methods.tex
+diagnostics of dumped points (three-point circumradius rho, |dx|; labelled) are computed.  The arm builder is the poly-fit pipeline (append_polyfit_fiber in gen_network_geom.hpp).
 sec:smooth (curv-limit, Taubin eq:taubin1/2), sec:centerline (Hermite eq:hermite, tridiag
 eq:tridiag, spline eq:spline), sec:taper.
 
@@ -75,6 +75,10 @@ def parse_stages(path, tags):
             out[cur][blk].append([float(x) for x in s[:3]] + [float(s[3].split("=")[1])] + [float(v) for v in s[4].split("=")[1].split(",")])
         elif blk == "final":
             out[cur][blk].append([float(x) for x in s[:3]] + [float(s[3].split("=")[1])])
+        elif blk in ("panels_pre_knotsnap", "panels_post_knotsnap"):
+            out[cur][blk].append([float(x) for x in s[:3]] + [float(s[3].split("=")[1])])          # xyz + t
+        elif blk == "run_knots":
+            out[cur][blk].append([float(x) for x in s[:3]] + [float(s[3].split("=")[1]), float(s[4].split("=")[1])])  # xyz + t + in_run
         else: out[cur][blk].append([float(x) for x in s[:3]])
     for a in out.values():
         for k in list(a):
@@ -120,8 +124,8 @@ def plot_chain(chain, nodes, edges, st, path, title):
         rev = e["n0"] != owner     # stage raw is oriented from the owner
         gp = e["xyz"][::-1] if rev else e["xyz"]; gr = e["r"][::-1] if rev else e["r"]
         arms.append(dict(tag=tag, d=d, gp=gp, gr=gr, cap=tag.endswith("-1")))
-    fig = plt.figure(figsize=(21, 20))
-    gs = fig.add_gridspec(5, 4, height_ratios=[1.5, 1, 1, 1, 1], hspace=0.38, wspace=0.28)
+    fig = plt.figure(figsize=(21, 23))
+    gs = fig.add_gridspec(6, 4, height_ratios=[1.5, 1, 1, 1, 1, 1], hspace=0.42, wspace=0.28)
     fig.suptitle(title, fontsize=13, y=0.995)
     ax3 = fig.add_subplot(gs[0, 0], projection="3d")
     axs = {"xy": fig.add_subplot(gs[0, 1]), "xz": fig.add_subplot(gs[0, 2])}
@@ -197,6 +201,33 @@ def plot_chain(chain, nodes, edges, st, path, title):
                      "tridiag eq: h_(i-1)M_(i-1)+2(h_(i-1)+h_i)M_i+h_i M_(i+1)\n=6(dP_i/h_i - dP_(i-1)/h_(i-1)); max residual %.1e\n[STAGE spline_knots, eq:tridiag]"
                      % (len(kn), np.linalg.norm(Mm, axis=1).max(), np.linalg.norm(Mm[0]), np.linalg.norm(Mm[-1]), res), fontsize=7)
         a4.set_xlabel("knot arclength s")
+        # ---- row 5: knot-snap panel partition, pre vs post, vs arclength [STAGE panels_pre/post_knotsnap, run_knots]
+        a5 = fig.add_subplot(gs[5, k])
+        fin = d["final"][:, :3]; tg = np.linspace(0, 1, len(fin))
+        sfin = np.r_[0, np.cumsum(np.linalg.norm(np.diff(fin, axis=0), axis=1))]
+        t2s = lambda tt: np.interp(np.asarray(tt, float), tg, sfin)      # t in [0,1] -> arclength along the meshed curve
+        pre = d.get("panels_pre_knotsnap"); post = d.get("panels_post_knotsnap"); rk = d.get("run_knots")
+        if pre is not None and post is not None and len(pre) and len(post):
+            srun = None
+            if rk is not None and len(rk):
+                inr = rk[rk[:, 4] > 0.5]                                  # spline knots lying inside the run span
+                if len(inr):
+                    srun = t2s(inr[:, 3])
+                    for x in srun: a5.axvline(x, c=C_LOW, lw=0.7, alpha=0.55, zorder=0)
+            a5.axvline(np.nan)                                           # keep legend handles tidy
+            a5.eventplot([t2s(pre[:, 3])], lineoffsets=[1.0], linelengths=[0.7], colors=[C_RAW], linewidths=1.1)
+            a5.eventplot([t2s(post[:, 3])], lineoffsets=[0.0], linelengths=[0.7], colors=[col], linewidths=1.1)
+            a5.set_ylim(-0.6, 1.6); a5.set_yticks([0.0, 1.0])
+            a5.set_yticklabels(["post\n%d panels" % (len(post) - 1), "pre\n%d panels" % (len(pre) - 1)], fontsize=7)
+            nsplit = (len(post) - 1) - (len(pre) - 1)
+            nk = 0 if srun is None else len(srun)
+            a5.set_title("knot-snap panel boundaries pre (grey) vs post (color) on arclength;\n"
+                         "green lines = %d C2-spline knots inside the run (QJ_ARM_KNOT_SNAP);\n"
+                         "+%d splits -> post boundaries now sit on the knots (no straddle), long-arm density kept\n"
+                         "[STAGE panels_pre/post_knotsnap, run_knots]" % (nk, nsplit), fontsize=7)
+        else:
+            a5.text(0.5, 0.5, "no knot-snap stage dumped\n(rebuild + QJ_DUMP_STAGES)", ha="center", va="center", fontsize=8)
+        a5.set_xlabel("arclength s")
     fig.savefig(path, dpi=110, bbox_inches="tight"); plt.close(fig)
 
 

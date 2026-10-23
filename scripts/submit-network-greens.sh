@@ -14,12 +14,12 @@
 # so this is much cheaper than the old sweep -- one Laplace DL forward apply per config. 
 # When QJ_GREENS_DLONLY commented out, will run Green's identity test as well.
 #
-# ============ GEOMETRY: baseline = geom/n298_seamsettle_tr6 (production) ====================
+# ============ GEOMETRY: baseline = geom/n298_polyfit (production) ====================
 # Baseline bundle = seam-settle (coaxial quintic-Hermite settle of both merged arm terminals; removed the ~0.5
 # cross-list free-edge DL error) + arm turn-angle refinement (QJ_ARM_TURN_REFINE=6, cap QJ_ARM_TURN_REFINE_MAX=24:
 # arm panels bending >6 deg are split into ceil(bend/6) sub-panels; default-on). The production arm recipe is
 # baked into the code, so a bare build reproduces it -- NO QJ_* env needed:
-#     ./bin/bifurc-network-assemble data/vmtk/vessels_fixed_n298.graph geom/n298_seamsettle_tr6 12 1 1.5 0.4 3 12 10 24
+#     ./bin/bifurc-network-assemble data/vmtk/vessels_fixed_n298.graph geom/n298_polyfit 12 1 1.5 0.4 3 12 10 24
 # Full-network gate: DL const-density max rel err 1.33e-3, watertight rel closure 6.67e-8 (vs 4.46e-3 / 3.52e-7
 # for the same recipe without turn-refine, +~15% arm panels). The residual is the uniform geometry-conformity
 # floor; the next lever below that is QJ_RADIUS_SCALE=0.1 (the "nettenth" family, a separate radius-shrink knob).
@@ -49,7 +49,7 @@
 #
 # SUBMIT (override any var via --export=ALL,NAME=VAL at submit time):
 #   sbatch scripts/submit-network-greens.sh                                 # default config (baseline, below)
-#   sbatch --export=ALL,CONFIGS="geom/n298_seamsettle_tr6:1e-6",QJ_GREENS_DUMP=vis/n298_seamsettle_tr6 \
+#   sbatch --export=ALL,CONFIGS="geom/n298_polyfit:1e-6",QJ_GREENS_DUMP=vis/n298_polyfit \
 #       scripts/submit-network-greens.sh                                    # baseline + ParaView error map
 #   sbatch --export=ALL,KER=both   scripts/submit-network-greens.sh         # add Stokes DL const-density
 #   sbatch --export=ALL,CONFIGS="geom/nettenth_o12f16:1e-6"  scripts/submit-network-greens.sh   # old config
@@ -110,10 +110,10 @@ NCORE=$((NTASK*OMP_NUM_THREADS))
 KER=${KER:-laplace}                                # laplace | stokes | both (DL const-density kernel[s])
 # Config list: space-separated "bundle_prefix:tol" pairs. Each config pairs a discretization bundle with the
 # near-eval tol appropriate to it. Compile any missing bundle per the GEOMETRY banner above.
-# Default = production baseline (geom/n298_seamsettle_tr6: seam-settle + turn-refine 6/cap 24, gated ~1.3e-3 DL /
+# Default = production baseline (geom/n298_polyfit: seam-settle + turn-refine 6/cap 24, gated ~1.3e-3 DL /
 # 6.7e-8 closure; built with CLI params 12 1 1.5 0.4 3 12 10 24). Old nettenth configs still work,
 # e.g. CONFIGS="geom/nettenth_o12f16:1e-6 geom/nettenth_o16f36:1e-9".
-CONFIGS=${CONFIGS:-"geom/n298_seamsettle_tr6a16:1e-6"}
+CONFIGS=${CONFIGS:-"geom/n298_polyfit:1e-6"}
 
 export QJ_NET_MODE=greens
 # export QJ_GREENS_DLONLY=1                           # DL const-density identity only (NO Green's)

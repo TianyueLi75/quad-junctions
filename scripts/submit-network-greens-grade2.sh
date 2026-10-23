@@ -1,20 +1,25 @@
 #!/bin/bash
-# Slurm batch (PREPARED, NOT SUBMITTED): full-network geometry gate for the QJ_ARM_PANEL_GRADE=2 lever
-# (docs/next-avenue-panel-grading.md). Mirrors scripts/submit-network-greens.sh (same layout / rebuild / mpirun).
+# Slurm batch (PREPARED, NOT SUBMITTED): full-network geometry gate (DL-only) for the POLY-FIT arm pipeline
+# (the default arm builder: wide-knot piecewise degree-9 Chebyshev body; append_polyfit_fiber in gen_network_geom.hpp).
+# Mirrors scripts/submit-network-greens.sh (same layout / rebuild / mpirun). Gates a PREBUILT bundle only.
 #
-# Bundle geom/n298_tr6_grade2 is already built from the production graph (byte-identical to production when the
-# knob is off; verified 320/320 files):
-#   QJ_ARM_PANEL_GRADE=2 OMP_NUM_THREADS=4 ./bin/bifurc-network-assemble data/vmtk/vessels_fixed_n298.graph \
-#       geom/n298_tr6_grade2 12 1 1.5 0.4 3 12 10 24          # ~10 min serial; portable (no -march)
-# Subset anchor (hot5, 5 junctions, faithful via QJ_L10): DL max rel err 1.326e-3 -> 2.48e-4 (R=2). Expect the full
-# network to drop from 1.33e-3 toward ~2-3e-4 (floor then = junction side, ~7e-5 in the subset).
+# The bundle geom/n298_polyfit is assembled LOCALLY (not in this job) so the gate always sees a fixed
+# surface; rebuild it with:
+#   OMP_NUM_THREADS=8 ./bin/bifurc-network-assemble data/vmtk/vessels_fixed_n298.graph \
+#       geom/n298_polyfit 12 1 1.5 0.4 3 12 10 24     # append dumpVTU=1 as arg 16 for geometry VTU
 #
-# SUBMIT:  sbatch scripts/submit-network-greens-grade2.sh                          # DL identity only (cheap gate)
-#          sbatch --export=ALL,FULL=1 scripts/submit-network-greens-grade2.sh      # + Laplace Green's ext/int
-#          sbatch --export=ALL,CONFIGS="geom/n298_seamsettle_tr6:1e-6 geom/n298_tr6_grade2:1e-6" \
-#                 scripts/submit-network-greens-grade2.sh                          # in-job A/B vs production
+# Dumps produced (all under the one QJ_GREENS_DUMP prefix, no overwrite -- distinct name suffixes):
+#   * geometry VTU      geom/n298_polyfit-{junc,arms}.vtu          (from the local assemble above, dumpVTU=1)
+#   * DL-error VTU      vis/ds_greens-lap-{junc,arms}.vtu             (per-target DL const-density identity err;
+#                                                                      written in BOTH the DL-only and FULL gate)
+#   * Green's-error VTU vis/ds_greens-lap-<ext|int>-{junc,arms}.vtu   (only with FULL=1; Laplace Green's err)
+#
+# SUBMIT:  sbatch scripts/submit-network-greens-grade2.sh                        # DL identity gate (+ DL-error VTU)
+#          sbatch --export=ALL,FULL=1 scripts/submit-network-greens-grade2.sh    # + Laplace Green's ext/int (+ Green's VTU)
+#          sbatch --export=ALL,CONFIGS="geom/n298_polyfit:1e-6 geom/n298_polyfit:1e-6" \
+#                 scripts/submit-network-greens-grade2.sh                        # in-job A/B vs production
 
-#SBATCH --job-name=network-greens-g2
+#SBATCH --job-name=network-greens-ds
 #SBATCH --nodes=4
 #SBATCH --ntasks-per-node=2
 #SBATCH --cpus-per-task=32
@@ -41,9 +46,10 @@ mkdir -p "${PVFMM_DIR}"
 export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK}
 export NTASK=$((${SLURM_NNODES}*${SLURM_NTASKS_PER_NODE}))
 
-CONFIGS=${CONFIGS:-"geom/n298_tr6_grade2:1e-6"}
+CONFIGS=${CONFIGS:-"geom/n298_polyfit:1e-6"}
 export QJ_NET_MODE=greens
 export QJ_GREENS_KER=${KER:-laplace}
+export QJ_GREENS_DUMP=${QJ_GREENS_DUMP:-vis/ds_greens}
 if [ -z "${FULL}" ]; then export QJ_GREENS_DLONLY=1; else unset QJ_GREENS_DLONLY; fi
 
 for CFG in ${CONFIGS}; do
