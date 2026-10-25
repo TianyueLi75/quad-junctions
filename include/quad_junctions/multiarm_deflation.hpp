@@ -1,6 +1,6 @@
 #pragma once
 // Multi-arm / layered-block analytic standing-wave deflation basis (no PETSc dependency).
-// Self-contained generalization of analytic_deflation.hpp to several long arms: each requested block
+// Self-contained layered per-arm standing-wave basis (the production basis used by ybifurc-vessels-flow-bie.cpp): each requested block
 // (arm id) contributes columns cos(k_n s)*nhat and sin(k_n s)*nhat, k_n = n*pi/L_arm, with s the node's
 // arclength along THAT arm's centerline and nhat the node's outward normal; entries are ZERO on every
 // node not belonging to the arm. An optional single global flux column (nhat on all nodes) is appended.

@@ -133,15 +133,6 @@ INCDIR = ./include
 # noisy, but easy to misdiagnose, hence this comment.
 INCLUDES = -I$(INCDIR) -I$(CSBQ_INCLUDE_DIR) -I$(SCTL_INCLUDE_DIR) $(PVFMM_INCLUDES)
 
-# Opt-in PETSc build (deflated-GMRES investigation drivers: *-deflation). Dense linear algebra on
-# a dumped operator A; PETSc supplies the deflation projector mat-vecs. Links into MPI=0 only.
-PETSC ?= 0
-ifeq ($(PETSC),1)
-  PETSC_ROOT ?= /mnt/sw/nix/store/i7zf8ayjf4vhp7bl2kjf5mlcipzqyy3n-petsc-3.22.4
-  CXXFLAGS += -DQJ_HAVE_PETSC -I$(PETSC_ROOT)/include
-  PETSC_LIBS := -L$(PETSC_ROOT)/lib -lpetsc -Wl,-rpath,$(PETSC_ROOT)/lib
-endif
-
 TARGET_BIN = \
 	$(BINDIR)/bifurc-general-geom \
 	$(BINDIR)/bifurc-general-bie \
@@ -165,12 +156,6 @@ TARGET_BIN = \
 	$(BINDIR)/csbq-spectrum
 
 all: $(TARGET_BIN)
-
-# Deflation-investigation drivers (pure dense linear algebra on a dumped A; PETSc-linked).
-# Built by explicit target, e.g. `make bin/racetrack-deflation PETSC=1 MPI=0 PVFMM=0`.
-$(BINDIR)/capsule-deflation:   LDLIBS += $(PETSC_LIBS)
-$(BINDIR)/racetrack-deflation: LDLIBS += $(PETSC_LIBS)
-$(BINDIR)/curved-deflation:    LDLIBS += $(PETSC_LIBS)
 
 $(BINDIR)/%: $(OBJDIR)/%.o
 	-@$(MKDIRS) $(dir $@)

@@ -3,10 +3,9 @@
 // matrixfree_deflation.hpp -- MPI-distributed, MATRIX-FREE deflated GMRES
 // (Frank & Vuik 2001, DEF1) for the production interior-Stokes solve.
 //
-// deflation_precond.hpp solves a DENSE operator dumped to disk, serially, with
-// PETSc -- fine for the small racetrack study but hopeless at the vessels
-// production resolution (tens of millions of DOF, no dense A, PVFMM far field,
-// MPI). This header instead takes the operator A as the solve's OWN matrix-free
+// This is the standalone deflated-GMRES implementation: the MPI matrix-free DEF1 path, built for the
+// vessels production resolution (tens of millions of DOF, no dense A, PVFMM far field,
+// MPI). It takes the operator A as the solve's OWN matrix-free
 // matvec (a std::function, `ApplyK` with completion and all), and the deflation
 // basis W as THIS RANK's local column slice, so deflation rides inside the
 // distributed production GMRES. No dense A, no PETSc -- the only dense objects
@@ -22,7 +21,7 @@
 // M x M LU solve + one local W/AW gemv -- cheap next to a single A matvec.
 //
 // W is orthonormalized GLOBALLY by a Gram-matrix eigen-whitening, a
-// distributed-friendly surrogate for the dense QR in deflation_precond.hpp:
+// distributed-friendly surrogate for a dense QR:
 //   G = W^T W  (M x M, Allreduce);  G = V L V^T (dsyev);  keep L > rtol*Lmax;
 //   T = V_keep L_keep^{-1/2};  W <- W T   (local gemv, same T on every rank).
 // After this W^T W = I globally and rank-deficient raw columns are dropped
@@ -40,7 +39,7 @@
 #include <cmath>
 #include <algorithm>
 
-// MKL LAPACK (LP64, column-major) -- same linkage deflation_precond.hpp relies on.
+// MKL LAPACK (LP64, column-major) -- standard MKL LAPACK linkage.
 extern "C" {
   void dsyev_(const char* jobz, const char* uplo, const int* n, double* a, const int* lda,
               double* w, double* work, const int* lwork, int* info);
@@ -66,10 +65,12 @@ struct MatfreeDeflateResult {
 //   flux_first : column 0 of W is the global coupling (flux) column; the arm blocks follow it contiguously.
 //   cols[b]    : number of columns in arm block b (flux excluded); sum(cols) + flux_first == Mraw.
 //   dofs[b]    : this rank's LOCAL row indices (0..Nloc) where arm block b's columns are supported.
-//   uniform_blocks : every arm block is congruent (same aspect L/R -> same n_max -> same column count and
-//                    the same mode shapes in normalized arclength), so its Gram is block-independent. When
-//                    set, block_whiten computes the whitening transform ONCE from block 0 (one Gram + one
-//                    dsyev + one Allreduce) and reuses it for every arm, instead of repeating that per block.
+//   uniform_blocks : every arm block is congruent (uniform-LR sizing: same n_max -> same column count and
+//                    mode shapes in normalized arclength), so its Gram is block-independent. Block-structured
+//                    whitening is ALWAYS used for the vessels deflation; uniform_blocks is set only when
+//                    uniform-LR sizing AND the single-shared-transform approximation are both in effect
+//                    (env QJ_DEFLATE_UNIFORM_LR with QJ_DEFLATE_SHARED_WHITEN). Then block_whiten computes the
+//                    transform ONCE from block 0 (one Gram + one dsyev + one Allreduce) and reuses it per arm.
 struct DeflateBlocks {
   bool                            flux_first = false;
   bool                            uniform_blocks = false;

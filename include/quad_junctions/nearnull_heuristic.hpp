@@ -27,7 +27,6 @@
 // modes per arm, matching the n_max ~ 8 that was effective on the aspect-44 racetrack arms).
 //
 // Usage:  per-arm block n_max = nearnull_nmax(L_arm / R_arm)         (rungs, no flux)
-//         single-body nev     = nearnull_count(L / R)               (rungs + 1 flux mode)
 // ---------------------------------------------------------------------------
 #include <vector>
 #include <cmath>
@@ -51,16 +50,10 @@ inline long nearnull_nmax(double aspect, double theta = 0.05) {
   return n < 0 ? 0 : n;
 }
 
-// Total near-null count for a single capped body: the flux/incompressibility mode plus the
-// axial rungs. This is the deflation dimension nev for the single-arm (capsule) case.
-inline long nearnull_count(double aspect, double theta = 0.05) {
-  return 1 + nearnull_nmax(aspect, theta);
-}
-
 // Aspect ratio L/R of a capped tube from its collocation nodes X0 (AoS, length 3*np) and a
 // unit axis: L = axial extent (max-min of the axial projection), R = median off-axis radius
 // over the middle 80% of the axial span (so the caps don't bias R). Mirrors the L/R estimate
-// in analytic_deflation.hpp so the single-arm driver can size nev straight from <A>.X0.
+// in multiarm_deflation.hpp so a single-arm caller can size nev straight from <A>.X0.
 inline double capsule_aspect_from_nodes(const std::vector<double>& X0, const double axis[3]) {
   const long np = (long)X0.size() / 3;
   if (np <= 0) return 0.0;

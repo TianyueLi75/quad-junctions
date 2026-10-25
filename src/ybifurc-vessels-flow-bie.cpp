@@ -189,7 +189,9 @@ void write_box_vtu(const std::string& fname, const Vector<Real>& Xg, const Vecto
 // replicated vb.segs centerlines. Returns Mraw (0 if no connectors) and fills Wcm, this rank's LOCAL
 // column-major basis ((Nj+Na+No)*3 rows x Mraw), aligned with the combined-node density ordering.
 // Env: QJ_DEFLATE_NARM (keep K longest connectors; 0/unset = all), QJ_DEFLATE_THETA (near-null band, 0.05),
-//      QJ_DEFLATE_FLUX (append the flux column; default 1), QJ_DEFLATE_GATE (radius gate multiple; 1.3).
+//      QJ_DEFLATE_FLUX (append the flux column; default 1), QJ_DEFLATE_GATE (radius gate multiple; 1.3),
+//      QJ_DEFLATE_UNIFORM_LR (size all blocks to one uniform n_max from the mean aspect; default off),
+//      QJ_DEFLATE_SHARED_WHITEN (under UNIFORM_LR, one shared whitening transform for all arms; default 1).
 template <class Real>
 long build_vessels_deflation_basis(const VesselsBuild<Real>& vb, const Vector<Real>& X, const Vector<Real>& Xn,
                                    Long Nj, Long Na, Long No, const Comm& comm, std::vector<double>& Wcm,
@@ -254,6 +256,7 @@ long build_vessels_deflation_basis(const VesselsBuild<Real>& vb, const Vector<Re
   //    arm-correct. Fewer total columns (if mean n_max < the max) => fewer AW setup matvecs + lighter coarse
   //    apply; it also makes every block congruent, which the block-structured whitening then treats uniformly.
   const bool uniform_lr = std::getenv("QJ_DEFLATE_UNIFORM_LR") && atoi(std::getenv("QJ_DEFLATE_UNIFORM_LR")) != 0;
+  const bool shared_whiten = std::getenv("QJ_DEFLATE_SHARED_WHITEN") ? atoi(std::getenv("QJ_DEFLATE_SHARED_WHITEN")) != 0 : true;
   int nmax_uniform = 0;
   if (uniform_lr) {
     double sum_aspect = 0;
@@ -274,14 +277,15 @@ long build_vessels_deflation_basis(const VesselsBuild<Real>& vb, const Vector<Re
   std::vector<long> block_cols;
   const long Mraw = build_multiarm_modes(Xn0, np * 3, armid, sarc, blocks, flux, Wcm, &block_cols);
 
-  // Optional column-block partition for the block-structured whitening (QJ_DEFLATE_BLOCK_WHITEN): record the
+  // Column-block partition for the block-structured whitening (always used): record the
   // flux flag, per-arm column counts (flux excluded), and each arm's LOCAL dof support (3*p+{0,1,2} for the
   // nodes this rank assigned to that connector). The disjoint-support arm blocks let the whitening decouple.
   if (out_blocks) {
     out_blocks->flux_first = flux;
-    // Uniform L/R makes every arm block congruent (same n_max/columns, same mode shapes) -> its Gram is
-    // block-independent, so block_whiten can whiten block 0 once and reuse the transform for all arms.
-    out_blocks->uniform_blocks = uniform_lr;
+    // Block whitening is always applied. When QJ_DEFLATE_UNIFORM_LR makes the arm blocks congruent AND
+    // QJ_DEFLATE_SHARED_WHITEN is on (default), the transform is computed once from the first arm block and
+    // reused for all arms (single-block approximation); QJ_DEFLATE_SHARED_WHITEN=0 forces exact per-block whitening.
+    out_blocks->uniform_blocks = uniform_lr && shared_whiten;
     out_blocks->cols = block_cols;
     out_blocks->dofs.assign(conns.size(), std::vector<long>());
     for (size_t k = 0; k < conns.size(); k++) out_blocks->dofs[k].reserve((size_t)local_cnt[k] * 3);
@@ -881,17 +885,13 @@ int main(int argc, char** argv) {
     // Layered per-connector-arm standing-wave deflation (QJ_DEFLATE=1): built once from the geometry, applied
     // matrix-free inside the flow GMRES. Default OFF => bit-identical to the unpreconditioned baseline.
     std::vector<double> Wdefl; long Mdefl = 0;
-    DeflateBlocks Bdefl; bool block_whiten = false;
+    DeflateBlocks Bdefl;
     if (std::getenv("QJ_DEFLATE") && atoi(std::getenv("QJ_DEFLATE")) != 0) {
-      // QJ_DEFLATE_BLOCK_WHITEN=1: pass the layered column-block partition so the whitening uses one tiny
-      // per-arm dsyev (over that arm's dofs) instead of one dense Mraw x Mraw dsyev -- same deflation span,
-      // far cheaper setup linear algebra. Default OFF => the monolithic global whitening (unchanged).
-      block_whiten = std::getenv("QJ_DEFLATE_BLOCK_WHITEN") && atoi(std::getenv("QJ_DEFLATE_BLOCK_WHITEN")) != 0;
-      Mdefl = build_vessels_deflation_basis<Real>(vb, X, Xn, Nj, Na, No, comm, Wdefl, block_whiten ? &Bdefl : nullptr);
+      // Block-structured whitening is always applied: one tiny per-arm dsyev (over that arm's dofs) instead of
+      // one monolithic Mraw x Mraw dsyev -- same deflation span, far cheaper setup linear algebra.
+      Mdefl = build_vessels_deflation_basis<Real>(vb, X, Xn, Nj, Na, No, comm, Wdefl, &Bdefl);
       if (!comm.Rank())
-        std::cout << "  [deflate] ON (QJ_DEFLATE=1): matrix-free deflated GMRES, " << Mdefl << " basis columns"
-                  << (block_whiten ? (Bdefl.uniform_blocks ? " [block-structured whitening, one shared transform]"
-                                                           : " [block-structured whitening]") : "") << "\n";
+        std::cout << "  [deflate] ON (QJ_DEFLATE=1): matrix-free deflated GMRES, " << Mdefl << " basis columns [block-structured whitening" << (Bdefl.uniform_blocks ? ", one shared transform]" : "]") << "\n";
     } else if (!comm.Rank()) {
       std::cout << "  [deflate] OFF (set QJ_DEFLATE=1 to enable layered per-arm standing-wave deflation)\n";
     }
@@ -914,7 +914,7 @@ int main(int argc, char** argv) {
         Xgrid, &Ugrid, "stokes inflow/outflow", /*gmres_max_iter=*/gmaxit,
         /*precond=*/nullptr, /*arm_sl_eta=*/arm_sl_eta, /*obstacles=*/obst_ptr, &flow_iters, /*krylov=*/nullptr,
         /*deflation_W=*/(Mdefl > 0 ? &Wdefl : nullptr), /*deflation_M=*/Mdefl,
-        /*deflation_blocks=*/(block_whiten && Mdefl > 0 ? &Bdefl : nullptr));
+        /*deflation_blocks=*/(Mdefl > 0 ? &Bdefl : nullptr));
     if (!comm.Rank()) std::cout << "[FLOW] RESULT iters=" << flow_iters << "\n";
 
     // Cross-section flux probe mode: report the net-flux conservation check and exit. Must run on ALL ranks
