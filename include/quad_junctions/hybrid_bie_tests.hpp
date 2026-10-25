@@ -21,7 +21,9 @@
 #include <stokes_bio.hpp>                     // StokesBIO: combined-field Stokes op with PVFMM-safe FMM kernels
 #include <quad_junctions/fmm_kernels.hpp>     // SetPVFMMKer for the non-solve (Laplace + Stokes) operators
 #include <quad_junctions/junction_precond.hpp> // block-diagonal left preconditioner on the junction rows
+#include <quad_junctions/matrixfree_deflation.hpp> // MPI matrix-free deflated GMRES (standing-wave near-null)
 #include <cmath>
+#include <vector>
 #include <functional>
 #include <iomanip>
 #include <iostream>
@@ -120,6 +122,46 @@ void divergence_check(const QuadElemList<Real>& junc, const ArmList& arms, const
               << "  [watertight] area: junc=" << Aj << " arms=" << Aa << " total=" << (Aj+Aa) << "\n"
               << "  [watertight] |int n dA|: junc=" << nrm(fj) << " arms=" << nrm(fa)
               << "  COMBINED=" << nrm(fc) << "  (combined should be ~0 for a closed surface)\n";
+}
+
+// ---- RHS range / compatibility check for the INTERIOR Stokes Dirichlet problem ----
+//   Incompressibility forces the prescribed boundary velocity to be net-flux-free:
+//       Phi = ∮_Gamma u·n dA = 0.
+//   The combined-field interior operator is (near-)singular in exactly this flux direction -- its left
+//   null vector is the flux functional ∮ n·(·) dA, the origin of the isolated ~1e-8 interior eigenvalue
+//   (see the operator-spectrum / pspectrum study). An RHS with Phi != 0 therefore has a component
+//   OUTSIDE the operator's range: no interior Stokes flow has that boundary velocity, and GMRES either
+//   stalls or returns a density polluted by the (nearly unbounded) flux mode. This integrates the ACTUAL
+//   discrete RHS `bc` (combined_nodes layout, 3 comps/node) against the stored outward normals via each
+//   list's far-field smooth quadrature (the same quadrature divergence_check / combined_surface_mean use),
+//   MPI-reduced. It complements a purely analytic "inflow==outflow" assert by catching DISCRETE imbalance
+//   (a flipped cap normal, a quadrature/orientation defect) that the analytic flux cancellation misses.
+//     Phi      = ∮ b·n dA      (signed net flux; -> 0 for compatible data)
+//     abs_flux = ∮ |b·n| dA    (unsigned scale, so rel = |Phi|/abs_flux is scale-free in [0,1])
+//   Returns Phi; sets `area` and `abs_flux`.
+template <class Real, class ArmList>
+Real rhs_net_flux(const QuadElemList<Real>& junc, const ArmList& arms,
+                  const Vector<Real>& Xn, const Vector<Real>& bc, const Long Nj, const Long Na,
+                  const Real tol, const Comm& comm, Real& area, Real& abs_flux) {
+  double phi = 0, ar = 0, aphi = 0;
+  auto accum = [&](const auto& lst, const Long off, const Long Nn) {
+    Vector<Real> g(Nn);                                   // scalar nodal field b·n at the collocation nodes
+    for (Long i = 0; i < Nn; i++) { const Long j = off + i;
+      g[i] = bc[3*j]*Xn[3*j] + bc[3*j+1]*Xn[3*j+1] + bc[3*j+2]*Xn[3*j+2]; }
+    Vector<Real> Xff, Xnff, wts, dist, Gff; Vector<Long> cnt;
+    lst.GetFarFieldNodes(Xff, Xnff, wts, dist, cnt, tol);
+    lst.GetFarFieldDensity(Gff, g);                       // upsample the scalar to far nodes (empty => 1:1)
+    const Vector<Real>& d = (Gff.Dim() ? Gff : g);
+    const Long Nq = wts.Dim();
+    SCTL_ASSERT_MSG(d.Dim() == Nq, "rhs_net_flux: far-field density/weight size mismatch");
+    for (Long i = 0; i < Nq; i++) { ar += (double)wts[i]; phi += (double)(wts[i]*d[i]);
+      aphi += (double)wts[i]*std::fabs((double)d[i]); }
+  };
+  accum(junc, 0, Nj);
+  accum(arms, Nj, Na);
+  area     = (Real)GlobalReduce(ar,   comm, CommOp::SUM);
+  abs_flux = (Real)GlobalReduce(aphi, comm, CommOp::SUM);
+  return (Real)GlobalReduce(phi, comm, CommOp::SUM);
 }
 
 // ---- DL constant-density identity: -1/2 on a closed surface with outward normals ----
@@ -342,7 +384,10 @@ Vector<Real> solve_dirichlet_bvp(const QuadElemList<Real>& junc, const ArmList& 
                                  const std::string& name, const Long gmres_max_iter = 400,
                                  const JunctionPrecondSpec<Real>* precond = nullptr,
                                  const Vector<Real>& arm_sl_eta = Vector<Real>(),
-                                 const ArmList* obstacles = nullptr, Long* n_iter = nullptr) {
+                                 const ArmList* obstacles = nullptr, Long* n_iter = nullptr,
+                                 KrylovPrecond<Real>* krylov = nullptr,
+                                 const std::vector<double>* deflation_W = nullptr, long deflation_M = 0,
+                                 const quad_junctions::DeflateBlocks* deflation_blocks = nullptr) {
   // Solved through StokesBIO (Stokes3D kernels only); KerSL/KerDL remain in the signature because every
   // caller names them explicitly (ybifurc-flow / -vessels-flow / -channel all pass the Stokes pair).
   static_assert(std::is_same<KerSL, Stokes3D_FxU>::value && std::is_same<KerDL, Stokes3D_DxU>::value,
@@ -391,6 +436,32 @@ Vector<Real> solve_dirichlet_bvp(const QuadElemList<Real>& junc, const ArmList& 
   }
   const Long KDIM = KerSL::SrcDim();
 
+  // ---- Optional rank-1 net-flux completion of the interior operator (env QJ_COMPLETION) ----
+  // The interior combined-field operator carries one isolated near-null singular value whose LEFT null
+  // vector is the flux functional l[.] = ∮ n·(.) dA (see the rhs_net_flux comment above; this is the
+  // origin of the ~1e-8 interior eigenvalue that makes interior GMRES slower than exterior). Add the
+  // one-body (Power-Miranda) rank-1 term
+  //     A'[σ] = A[σ] + completion_w * (1/area) * n(x) * ( ∮ n·σ dA )
+  // to the GMRES matvec ONLY (NOT the off-surface field evaluation), which lifts that mode from ~0 to
+  // O(1) (with σ≈n the added field is ≈ n, since ∮ n·n dA = area). On a compatible RHS (∮ b·n dA ≈ 0,
+  // asserted by the caller before the solve) the converged density satisfies ∮ n·σ dA ≈ 0, so the
+  // completion term vanishes at the solution -- the physical density and represented field are
+  // unchanged; it only reshapes the spectrum GMRES sees. Interior only. DEFAULT ON for interior (set
+  // QJ_COMPLETION=0 to disable and recover the exact pre-change A/B baseline); it is field-preserving,
+  // so the off-surface eval and (on compatible RHS) the converged density are unaffected. Exterior
+  // solves never get it. QJ_COMPLETION_W scales the term.
+  const char* comp_env = std::getenv("QJ_COMPLETION");
+  const bool completion = interior && (comp_env ? atoi(comp_env) != 0 : true);
+  const char* compw_env = std::getenv("QJ_COMPLETION_W");
+  const Real completion_w = compw_env ? (Real)atof(compw_env) : (Real)1;
+  if (interior && !comm.Rank()) {
+    if (completion)
+      std::cout << "    [" << name << "] net-flux completion ON (default for interior; rank-1 "
+                << "n (x) int n.sigma dA, w=" << completion_w << "; set QJ_COMPLETION=0 to disable)\n";
+    else
+      std::cout << "    [" << name << "] net-flux completion OFF (QJ_COMPLETION=0; A/B baseline)\n";
+  }
+
   // Add the (possibly per-block-signed) DL self-jump term jump*sigma into an on-surface field U.
   const auto add_jump = [&](Vector<Real>& U, const Vector<Real>& sigma) {
     if (!has_obst) { for (Long i = 0; i < U.Dim(); i++) U[i] += jump*sigma[i]; return; }
@@ -421,7 +492,18 @@ Vector<Real> solve_dirichlet_bvp(const QuadElemList<Real>& junc, const ArmList& 
     (*U) = Us + Ud*DL_scal;
     if (with_jump) add_jump(*U, sigma);
   };
-  const auto ApplyK = [&](Vector<Real>* U, const Vector<Real>& sigma) { apply_field(U, sigma, true); };
+  const auto ApplyK = [&](Vector<Real>* U, const Vector<Real>& sigma) {
+    apply_field(U, sigma, true);
+    if (completion) {
+      // Scalar l[sigma] = int n.sigma dA via the far-field flux quadrature (junc+arms blocks only;
+      // the obstacle block is skipped).
+      Real area = 0, absf = 0;
+      const Real phi = rhs_net_flux<Real>(junc, arms, Xn0, sigma, Nb, Ns, tol, comm, area, absf);
+      const Real c = (area > (Real)0 ? completion_w * phi / area : (Real)0);
+      for (Long n = 0; n < Nb + Ns; n++)
+        for (Long k = 0; k < KDIM; k++) (*U)[n*KDIM+k] += c * Xn0[n*KDIM+k];
+    }
+  };
 
   // ---- Optional block-diagonal LEFT preconditioner on the junction rows (see
   // ---- quad_junctions/junction_precond.hpp). Left-preconditioning means we solve
@@ -456,8 +538,32 @@ Vector<Real> solve_dirichlet_bvp(const QuadElemList<Real>& junc, const ArmList& 
   const Real gmres_tol = tol * (Real)10;
   Profile::Enable(true); Profile::reset();
   Profile::Tic("gmres solve", &comm);
-  if (P.active()) solver(&sigma, ApplyK_precond, bc_use, gmres_tol, gmres_max_iter, false, &iter);
-  else            solver(&sigma, ApplyK,         bc_use, gmres_tol, gmres_max_iter, false, &iter);
+  // `krylov` (optional, caller-owned): SCTL KrylovPrecond that accumulates the Krylov subspaces of every solve
+  // passed the SAME pointer and uses them to precondition the next one. Valid ONLY while the operator is
+  // unchanged (same geometry/tol/kernel/SL-DL scalings/completion) and only the RHS differs.
+  //
+  // `deflation_W` (optional): a layered per-arm standing-wave DEFLATION basis, this rank's LOCAL column slice
+  // (col-major, (Nb+Ns+No)*3 rows x deflation_M cols), aligned with the combined-node density ordering. When
+  // supplied (and no block preconditioner is active) the solve runs MATRIX-FREE deflated GMRES
+  // (matrixfree_deflation.hpp): it projects A away from the near-null standing-wave modes those columns span,
+  // using ApplyK itself as the operator -- so it works at production resolution under MPI+PVFMM with no dense
+  // A. Mutually exclusive with the block preconditioner `P`; `krylov` recycling is not used on this path.
+  const bool deflate = (deflation_W != nullptr) && (deflation_M > 0) && !P.active();
+  if (deflate) {
+    std::vector<double> Wloc = *deflation_W;   // copied: deflated_gmres_matfree orthonormalizes in place
+    const long Nrow = (Nb + Ns + No) * (long)KDIM;
+    SCTL_ASSERT_MSG((long)Wloc.size() == Nrow * deflation_M, "solve_dirichlet_bvp: deflation_W size mismatch");
+    MatfreeDeflateResult DR = deflated_gmres_matfree<Real>(
+        ApplyK, bc_use, Wloc, deflation_M, sigma, (double)gmres_tol, (long)gmres_max_iter, comm, /*verbose=*/true,
+        /*blocks=*/deflation_blocks);
+    iter = DR.iters;
+    if (!comm.Rank())
+      std::cout << "    [" << name << "] deflated GMRES: " << DR.Mdefl << " orthonormal modes (of "
+                << deflation_M << " requested), rel_resid=" << std::scientific << std::setprecision(3)
+                << DR.rel_resid << std::defaultfloat << "\n";
+  }
+  else if (P.active()) solver(&sigma, ApplyK_precond, bc_use, gmres_tol, gmres_max_iter, false, &iter);
+  else                 solver(&sigma, ApplyK,         bc_use, gmres_tol, gmres_max_iter, false, &iter, krylov);
   Profile::Toc();
   Profile::print(&comm, {"t_avg", "f/s_avg"});
   Profile::reset();

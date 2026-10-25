@@ -63,10 +63,14 @@
 #include <quad_junctions/vessels_build.hpp>          // shared build_vessels_network (+ dot3 etc.)
 #include <quad_junctions/quad_scheme.hpp>            // QJDefaultScheme (Duffy default, SCTL_SELF_SCHEME=hybrid opt-out)
 #include <quad_junctions/vessels_network_solve.hpp>  // reduced Hagen-Poiseuille resistance-network solve
+#include <quad_junctions/flux_disk_quad.hpp>        // build_flux_disk (GL-radial x trapezoid-angular flux disk)
 #include <quad_junctions/interior_viz.hpp>           // build_arm_panel_targets / build_box_targets (interior viz)
 #include <quad_junctions/sphere_obstacles.hpp>       // spherical obstacles near the centerlines (QJ_OBSTACLE)
 #include <quad_junctions/hybrid_bie_tests.hpp>       // combined_nodes + solve_dirichlet_bvp
 #include <quad_junctions/vessels_tree_data.hpp>      // arterial/venous topology tables
+#include <quad_junctions/multiarm_deflation.hpp>     // build_multiarm_modes (layered per-arm standing-wave basis)
+#include <quad_junctions/nearnull_heuristic.hpp>     // nearnull_nmax (per-arm n_max from aspect L/R)
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -171,6 +175,142 @@ void write_box_vtu(const std::string& fname, const Vector<Real>& Xg, const Vecto
   vtu.WriteVTK(fname, Comm::Self());
 }
 
+// ----------------------------------------------------------------------------------------------
+// Layered per-connector-arm standing-wave DEFLATION basis for the vessels flow solve (QJ_DEFLATE=1).
+// The genus-10 lumen's slow GMRES modes are dominated by the axial pressure standing waves on the long
+// arterial<->venous CONNECTOR arms (the longest connecting arms). We deflate exactly those: one block per
+// kept connector of cos(k_n s) n_hat / sin(k_n s) n_hat columns (k_n = n*pi/L, s = arclength along THAT
+// connector's centerline, n_hat the node's outward normal), zero on every node not on that connector, plus
+// one global flux column (n_hat over junc+arms). Per-arm n_max is read from the arm's aspect L/R via the
+// near-null heuristic. NO global x-direction / junction modes -- only the connecting arms carry blocks.
+//
+// Node -> arm assignment is GEOMETRIC (nearest connector centerline, gated by tube radius), so it is robust
+// to the arm panel emission order and to the MPI partition: each rank labels its OWN local nodes using the
+// replicated vb.segs centerlines. Returns Mraw (0 if no connectors) and fills Wcm, this rank's LOCAL
+// column-major basis ((Nj+Na+No)*3 rows x Mraw), aligned with the combined-node density ordering.
+// Env: QJ_DEFLATE_NARM (keep K longest connectors; 0/unset = all), QJ_DEFLATE_THETA (near-null band, 0.05),
+//      QJ_DEFLATE_FLUX (append the flux column; default 1), QJ_DEFLATE_GATE (radius gate multiple; 1.3).
+template <class Real>
+long build_vessels_deflation_basis(const VesselsBuild<Real>& vb, const Vector<Real>& X, const Vector<Real>& Xn,
+                                   Long Nj, Long Na, Long No, const Comm& comm, std::vector<double>& Wcm,
+                                   DeflateBlocks* out_blocks = nullptr) {
+  const Long np = Nj + Na + No;
+  // 1. Connector segments: one arterial (id<10) + one venous (id>=10) endpoint, with arclength polylines.
+  struct Conn { int seg; double L, R; std::vector<double> cum; const std::vector<Vec3<Real>>* cl; };
+  std::vector<Conn> conns;
+  for (size_t s = 0; s < vb.segs.size(); s++) {
+    const ArmSeg<Real>& sg = vb.segs[s];
+    const bool is_conn = (sg.j0 >= 0 && sg.j1 >= 0) && ((sg.j0 < 10) != (sg.j1 < 10));
+    if (!is_conn || sg.cl.size() < 2) continue;
+    Conn c; c.seg = (int)s; c.cl = &sg.cl; c.R = (double)sg.rtube;
+    c.cum.assign(sg.cl.size(), 0.0);
+    for (size_t v = 1; v < sg.cl.size(); v++) c.cum[v] = c.cum[v-1] + (double)nrm3(sub3(sg.cl[v], sg.cl[v-1]));
+    c.L = c.cum.back();
+    conns.push_back(std::move(c));
+  }
+  std::sort(conns.begin(), conns.end(), [](const Conn& a, const Conn& b){ return a.L > b.L; });
+  long keep = (long)conns.size();
+  if (const char* e = std::getenv("QJ_DEFLATE_NARM")) { const long k = atol(e); if (k > 0 && k < keep) keep = k; }
+  if ((long)conns.size() > keep) conns.resize((size_t)keep);
+  if (conns.empty()) { Wcm.clear(); return 0; }
+
+  const double theta = std::getenv("QJ_DEFLATE_THETA") ? atof(std::getenv("QJ_DEFLATE_THETA")) : 0.05;
+  const double gate  = std::getenv("QJ_DEFLATE_GATE")  ? atof(std::getenv("QJ_DEFLATE_GATE"))  : 1.3;
+  const bool   flux  = std::getenv("QJ_DEFLATE_FLUX")  ? atoi(std::getenv("QJ_DEFLATE_FLUX")) != 0 : true;
+
+  // 2. Label this rank's LOCAL arm nodes by nearest connector centerline (gated by tube radius).
+  std::vector<int> armid((size_t)np, -1);
+  std::vector<double> sarc((size_t)np, 0.0);
+  std::vector<long> local_cnt(conns.size(), 0);
+  for (Long p = Nj; p < Nj + Na; p++) {                     // arm nodes only
+    const Vec3<Real> xp{X[3*p], X[3*p+1], X[3*p+2]};
+    int best_k = -1; double best_d2 = 1e300, best_s = 0;
+    for (size_t k = 0; k < conns.size(); k++) {
+      const auto& cl = *conns[k].cl; const auto& cum = conns[k].cum;
+      for (size_t v = 0; v + 1 < cl.size(); v++) {
+        const Vec3<Real> a = cl[v], d = sub3(cl[v+1], cl[v]);
+        const double dd = (double)dot3(d, d);
+        double t = dd > 0 ? (double)dot3(sub3(xp, a), d) / dd : 0.0;
+        t = std::min(1.0, std::max(0.0, t));
+        const Vec3<Real> q{a[0]+(Real)t*d[0], a[1]+(Real)t*d[1], a[2]+(Real)t*d[2]};
+        const double dist2 = (double)dot3(sub3(xp, q), sub3(xp, q));
+        if (dist2 < best_d2) { best_d2 = dist2; best_k = (int)k; best_s = cum[v] + t*(cum[v+1]-cum[v]); }
+      }
+    }
+    if (best_k >= 0 && std::sqrt(best_d2) < gate * conns[(size_t)best_k].R) {
+      armid[(size_t)p] = best_k; sarc[(size_t)p] = best_s; local_cnt[(size_t)best_k]++;
+    }
+  }
+
+  // 3. Masked normals for the flux column: outward normal over junc+arms, ZERO on the obstacle block.
+  std::vector<double> Xn0((size_t)np * 3, 0.0);
+  for (Long i = 0; i < (Nj + Na) * 3; i++) Xn0[(size_t)i] = (double)Xn[i];
+
+  // 4. Per-connector blocks + build the raw basis. Default: each arm sizes its OWN block from its OWN aspect
+  //    L/R. QJ_DEFLATE_UNIFORM_LR=1: size ALL blocks from the MEAN aspect over the kept connectors and copy
+  //    that single n_max onto every arm. The connectors are near-equal length (the short leads/corners/stems
+  //    aside), so this trims the longest arms' over-deflation and equalizes the block sizes -- each arm still
+  //    uses its OWN L for k_n = n*pi/L, so only the rung COUNT is shared, the physical frequencies stay
+  //    arm-correct. Fewer total columns (if mean n_max < the max) => fewer AW setup matvecs + lighter coarse
+  //    apply; it also makes every block congruent, which the block-structured whitening then treats uniformly.
+  const bool uniform_lr = std::getenv("QJ_DEFLATE_UNIFORM_LR") && atoi(std::getenv("QJ_DEFLATE_UNIFORM_LR")) != 0;
+  int nmax_uniform = 0;
+  if (uniform_lr) {
+    double sum_aspect = 0;
+    for (const auto& c : conns) sum_aspect += c.L / std::max(c.R, 1e-30);
+    const double mean_aspect = sum_aspect / (double)conns.size();
+    nmax_uniform = (int)nearnull_nmax(mean_aspect, theta);
+    if (!comm.Rank())
+      std::cout << "    [uniform-LR] mean aspect L/R=" << std::setprecision(4) << mean_aspect
+                << std::setprecision(6) << " -> uniform n_max=" << nmax_uniform << " (" << 2*nmax_uniform
+                << " cols) on all " << conns.size() << " connector arms\n";
+  }
+  std::vector<ArmBlockSpec> blocks;
+  for (size_t k = 0; k < conns.size(); k++) {
+    const int nmax = uniform_lr ? nmax_uniform
+                                : (int)nearnull_nmax(conns[k].L / std::max(conns[k].R, 1e-30), theta);
+    blocks.push_back({(int)k, conns[k].L, nmax});
+  }
+  std::vector<long> block_cols;
+  const long Mraw = build_multiarm_modes(Xn0, np * 3, armid, sarc, blocks, flux, Wcm, &block_cols);
+
+  // Optional column-block partition for the block-structured whitening (QJ_DEFLATE_BLOCK_WHITEN): record the
+  // flux flag, per-arm column counts (flux excluded), and each arm's LOCAL dof support (3*p+{0,1,2} for the
+  // nodes this rank assigned to that connector). The disjoint-support arm blocks let the whitening decouple.
+  if (out_blocks) {
+    out_blocks->flux_first = flux;
+    // Uniform L/R makes every arm block congruent (same n_max/columns, same mode shapes) -> its Gram is
+    // block-independent, so block_whiten can whiten block 0 once and reuse the transform for all arms.
+    out_blocks->uniform_blocks = uniform_lr;
+    out_blocks->cols = block_cols;
+    out_blocks->dofs.assign(conns.size(), std::vector<long>());
+    for (size_t k = 0; k < conns.size(); k++) out_blocks->dofs[k].reserve((size_t)local_cnt[k] * 3);
+    for (Long p = 0; p < np; p++) {
+      const int k = armid[(size_t)p];
+      if (k < 0) continue;
+      std::vector<long>& dl = out_blocks->dofs[(size_t)k];
+      dl.push_back(3*p); dl.push_back(3*p+1); dl.push_back(3*p+2);
+    }
+  }
+
+  if (!comm.Rank()) {
+    std::cout << "\n  [deflate] layered per-connector-arm standing-wave basis (theta=" << theta
+              << ", gate=" << gate << ", flux=" << (flux ? "on" : "off") << "):\n";
+    std::cout << "    kept " << conns.size() << " longest connector arm(s) of "
+              << vessels_data::n_conn << " connectors; flux col=" << (flux ? 1 : 0) << ", Mraw=" << Mraw << "\n";
+  }
+  // Global node count per arm (each rank owns a slice) so the printed sizing is meaningful under MPI.
+  for (size_t k = 0; k < conns.size(); k++) {
+    const long g = (long)GlobalReduce((Long)local_cnt[k], comm, CommOp::SUM);
+    if (!comm.Rank())
+      std::cout << "    conn " << k << " (seg " << conns[k].seg << "): L=" << std::setprecision(4) << conns[k].L
+                << " R=" << conns[k].R << " L/R=" << conns[k].L/conns[k].R
+                << " -> n_max=" << blocks[k].n_max << " (" << 2*blocks[k].n_max << " cols), nodes=" << g
+                << std::setprecision(6) << "\n";
+  }
+  return Mraw;
+}
+
 } // anonymous namespace
 
 int main(int argc, char** argv) {
@@ -244,9 +384,15 @@ int main(int argc, char** argv) {
     junc.SetQuadScheme(quad_junctions::QJDefaultScheme<Real>(), cov_q, Nbeta, maxdep);
     const char* obenv = std::getenv("QJ_OBSTACLE");
     const bool obstacle = obenv && atoi(obenv) != 0;   // add spherical obstacles near the centerlines
+    // QJ_XSECTION_ONLY=1: cross-section flux probe mode -- solve the interior BVP, integrate the mid-arm
+    // cross-section flux of each arterial<->venous connector and of the two root-cap stubs, report
+    // Q_inlet / Q_outlet / Q_conn_sum (the [NETFLUX] conservation check), then exit before the viz
+    // steps 7-9. Disk order: QJ_XS_NRAD (Gauss-Legendre radial) / QJ_XS_NANG (periodic-trapezoid angular).
+    const bool xs_only = (std::getenv("QJ_XSECTION_ONLY") && atoi(std::getenv("QJ_XSECTION_ONLY")) != 0);
     const std::string tag = "vis/ybifurc-vessels-flow-ord" + std::to_string((long)ord) + "-nref" + std::to_string((long)nref)
         + (sphereDeg > 0 ? "-sph" + std::to_string((long)sphereDeg) : "")   // distinct tag so sph90 doesn't clobber planar
-        + (obstacle ? "-obst" : "");
+        + (obstacle ? "-obst" : "")
+        + (std::getenv("QJ_TAG_SUFFIX") ? std::string("-") + std::getenv("QJ_TAG_SUFFIX") : std::string());   // scan runs
 
     {
       // GLOBAL panel/node counts: GetNodeCoord/Size() return this rank's LOCAL slice, so sum across the comm
@@ -495,12 +641,20 @@ int main(int argc, char** argv) {
     // ----------------------------------------------------------------------------------------------
     // Per-connector probe metadata (rank 0 only; carried to the post-solve check in step 9).
     struct Probe {
-      int cidx; Real r, Qpred; Vec3<Real> mid, t;
-      Long disk_off, disk_n; std::vector<Real> disk_w;    // disk points: flux = sum (u.t)*w
+      int cidx; Real r, L, Qpred; Vec3<Real> mid, t;
+      int seg = -1; bool is_conn = true;
+      int cap_role = 0;   // 0 = interior connector; -1 = inlet root-cap stub; +1 = outlet root-cap stub
+      Long disk_off, disk_n; std::vector<Real> disk_w, disk_rho;    // disk points: flux = sum (u.t)*w
       Long line_off, line_n; std::vector<Real> line_rho;  // radial line points (signed rho along e1)
     };
     std::vector<Probe> probes;
-    const Long Nring = 8, Nang = 16, Nrad = 21;
+    // Flux-disk quadrature (flux_disk_quad.hpp): QJ_XS_NRAD = Gauss-Legendre RADIAL order, QJ_XS_NANG =
+    // periodic-trapezoid ANGULAR count (GL converges by ~4 on a parabolic profile, 6 is margin). The disk is
+    // no longer the flux-error limiter; the residual pins ~9e-8 = flux-MEASUREMENT floor (near-wall
+    // near-singular interior eval + probe-disk geometry), NOT disk/tol/discretization (field is ~1e-10).
+    const Long Nring = xs_only ? (std::getenv("QJ_XS_NRAD") ? (Long)atoi(std::getenv("QJ_XS_NRAD")) : 6) : 8;
+    const Long Nang  = xs_only ? (std::getenv("QJ_XS_NANG") ? (Long)atoi(std::getenv("QJ_XS_NANG")) : 12) : 16;
+    const Long Nrad  = 21;
 
     // The resistance-network reference + mid-arm Poiseuille probes describe the arterial<->venous CONNECTOR
     // flow; arterial-only has no connectors, so this whole verification (and step 9) is skipped -- `probes`
@@ -519,37 +673,78 @@ int main(int argc, char** argv) {
       for (int i = 0; i < vessels_data::n_junc; i++)
         std::cout << " " << std::setprecision(4) << net.P[(size_t)i] << (i%10==9 ? "\n     " : "");
       std::cout << "\n    arterial<->venous connectors (arm i:  jA->jV   r      L       dP        Q_pred):\n";
-      for (const NetEdge<Real>& e : net.edges) {
-        if (!e.is_conn) continue;
-        Qsum += e.Q; nconn++;
+      // Locate the straightest interior point of a connector centerline: the center of the longest run of
+      // samples (restricted to the central 2/3, away from the two seam-adjacent leads) whose per-step
+      // turning angle stays below ~1 deg -- the connector's straight "run" between the two racetrack
+      // corners. Probing a corner (or a seam-adjacent lead) tilts the cross-section plane and breaks the
+      // fully-developed Poiseuille assumption. Falls back to the single straightest sample if no
+      // sub-tolerance run exists.
+      auto straight_mid = [](const std::vector<Vec3<Real>>& c) -> Long {
+        const Long n = (Long)c.size();
+        if (n < 7) return n/2;
+        const Long lo0 = n/6, hi0 = n - n/6;
+        const Real ang_tol = (Real)(1.0*const_pi<Real>()/180);
+        Long best_c = (lo0+hi0)/2, best_len = -1, run_lo = lo0, minc = (lo0+hi0)/2;
+        Real min_turn = (Real)1e30;
+        for (Long i = lo0; i < hi0; i++) {
+          const Vec3<Real> a = unit3(sub3(c[i], c[i-1])), b = unit3(sub3(c[i+1], c[i]));
+          Real cang = dot3(a,b); cang = std::max<Real>((Real)-1, std::min<Real>((Real)1, cang));
+          const Real turn = (Real)std::acos((double)cang);
+          if (turn < min_turn) { min_turn = turn; minc = i; }
+          if (turn <= ang_tol) { if (i - run_lo > best_len) { best_len = i - run_lo; best_c = (run_lo + i)/2; } }
+          else run_lo = i + 1;
+        }
+        return (best_len >= 0) ? best_c : minc;
+      };
+      // Probe set for the NET-FLUX conservation check: the arterial<->venous CONNECTOR arms, plus the two
+      // root-cap stubs (segments with j0==j1): the single INLET arm (arterial root) and single OUTLET arm
+      // (venous root). The net-flux test compares the inlet-arm flux and outlet-arm flux against the
+      // connector-sum (incompressibility: all three equal the imposed throughput p_in).
+      std::vector<NetEdge<Real>> edges_to_probe;
+      for (const NetEdge<Real>& e : net.edges) if (e.is_conn) edges_to_probe.push_back(e);
+      for (size_t s = 0; s < vb.segs.size(); s++) {
+        const ArmSeg<Real>& sg = vb.segs[s];
+        if (sg.j0 != sg.j1) continue;                      // only the two root-cap stubs (inlet/outlet ports)
+        NetEdge<Real> ne; ne.seg = (int)s; ne.j0 = sg.j0; ne.j1 = sg.j1; ne.is_conn = false; ne.r = sg.rtube;
+        Real Ll = 0; for (size_t v = 1; v < sg.cl.size(); v++) Ll += nrm3(sub3(sg.cl[v], sg.cl[v-1]));
+        if (Ll <= (Real)0) Ll = nrm3(sub3(sg.B, sg.A));
+        ne.L = Ll; ne.Q = (Real)((sg.j0 < 10) ? -p_in : p_in);   // signed single-port throughput
+        edges_to_probe.push_back(ne);
+      }
+      for (const NetEdge<Real>& e : edges_to_probe) {
+        const bool is_stub  = (e.j0 == e.j1);                    // root-cap stub = inlet/outlet arm
+        const int  cap_role = is_stub ? ((e.j0 < 10) ? -1 : +1) : 0;
+        if (e.is_conn) { Qsum += e.Q; nconn++; }
+        if (e.is_conn)
         std::cout << "      conn " << std::setw(2) << nconn-1 << ":  " << std::setw(2) << e.j0 << "->"
                   << std::setw(2) << e.j1 << "  " << std::setprecision(4) << e.r << "  " << std::setw(7) << e.L
                   << "  " << std::setw(9) << e.dP << "  " << std::setw(9) << e.Q << "\n";
 
-        // Build the mid-arm cross-section frame from the connector's centerline polyline.
+        // One mid cross-section per arm. Stub: geometric midpoint, tangent oriented to POSITIVE physical
+        // throughput. Connector: the straightest constant-radius interior point (straight_mid), away from
+        // the racetrack corners/seam leads where a tilted cut would break the fully-developed assumption.
         const std::vector<Vec3<Real>>& cl = vb.segs[(size_t)e.seg].cl;
-        if ((Long)cl.size() < 3) continue;
-        const Long m = (Long)cl.size()/2;
-        const Vec3<Real> mid = cl[m];
-        Vec3<Real> t = unit3(sub3(cl[m+1], cl[m-1]));
+        if ((Long)cl.size() < (is_stub ? 2 : 3)) continue;
+        Vec3<Real> mid, t;
+        if (is_stub) {
+          mid = mul3((Real)0.5, add3(cl.front(), cl.back()));
+          const Vec3<Real> axis = unit3(sub3(cl.back(), cl.front()));   // outward (junction -> cap)
+          t = (cap_role < 0) ? mul3((Real)-1, axis) : axis;            // inlet: +inflow; outlet: +outflow
+        } else {
+          const Long m = straight_mid(cl);
+          mid = cl[m]; t = unit3(sub3(cl[m+1], cl[m-1]));
+        }
         Vec3<Real> ref = (std::fabs((double)t[2]) < 0.9) ? Vec3<Real>{0,0,1} : Vec3<Real>{1,0,0};
         const Vec3<Real> e1 = unit3(sub3(ref, mul3(dot3(ref,t), t)));
         const Vec3<Real> e2 = Vec3<Real>{t[1]*e1[2]-t[2]*e1[1], t[2]*e1[0]-t[0]*e1[2], t[0]*e1[1]-t[1]*e1[0]};
-        Probe pr; pr.cidx = nconn-1; pr.r = e.r; pr.Qpred = e.Q; pr.mid = mid; pr.t = t;
+        Probe pr; pr.cidx = e.is_conn ? nconn-1 : -1; pr.r = e.r; pr.L = e.L; pr.Qpred = e.Q; pr.mid = mid; pr.t = t;
+        pr.seg = e.seg; pr.is_conn = e.is_conn; pr.cap_role = cap_role;
 
-        // Cross-section disk (polar midpoint rule): rho_i=(i+0.5)*r/Nr, weight = rho_i*(r/Nr)*(2pi/Na).
-        pr.disk_off = Xgrid.Dim()/3; pr.disk_n = Nring*Nang;
-        const Real dr = e.r/(Real)Nring, dth = (Real)2*const_pi<Real>()/(Real)Nang;
-        for (Long ir = 0; ir < Nring; ir++) {
-          const Real rho = ((Real)ir + (Real)0.5)*dr;
-          for (Long ia = 0; ia < Nang; ia++) {
-            const Real th = (Real)ia*dth, cph = std::cos((double)th), sph = std::sin((double)th);
-            const Vec3<Real> X = add3(mid, add3(mul3(rho*cph, e1), mul3(rho*sph, e2)));
-            Xgrid.PushBack(X[0]); Xgrid.PushBack(X[1]); Xgrid.PushBack(X[2]);
-            pr.disk_w.push_back(rho*dr*dth);
-          }
-        }
-        // Radial line along e1 across the diameter (for the CSV profile plot).
+        // Cross-section disk: Gauss-Legendre radial x periodic-trapezoid angular (flux_disk_quad.hpp).
+        pr.disk_off = Xgrid.Dim()/3;
+        build_flux_disk<Real>(mid, e1, e2, pr.r, Nring, Nang, Xgrid, pr.disk_w, pr.disk_rho);
+        pr.disk_n = (Long)pr.disk_w.size();
+        // Radial line along e1 across the diameter (profile check in step 9).
         pr.line_off = Xgrid.Dim()/3; pr.line_n = Nrad;
         for (Long j = 0; j < Nrad; j++) {
           const Real rho = ((Real)-0.9 + (Real)1.8*j/(Nrad-1))*e.r;
@@ -612,11 +807,155 @@ int main(int argc, char** argv) {
         std::cout << "  [slender-scaling] OFF (set QJ_SLENDER_SCALING=1 to enable CSBQ Eq.33 arm SL scaling)\n";
       }
     }
-    Vector<Real> Ugrid;
+    // ----------------------------------------------------------------------------------------------
+    // (5c) QJ_MFS=1: MANUFACTURED interior Stokes solve with EXTERIOR Stokeslet sources, run FIRST on the
+    //      SAME operator the flow solve uses (same geometry, tol, SL/DL scalings, net-flux completion).
+    //      The exterior sources give a field that is smooth and divergence-free inside the lumen (so the RHS is
+    //      flux-compatible); its SL trace is the Dirichlet data, and the represented velocity at the interior
+    //      arm cross-section targets (Xarm) is compared to the exact field. Krylov recycling is OFF
+    //      (krylov=nullptr on both solves): the recycled MFS subspace did not speed up the flow solve.
+    //      Output: "[MFS] ..." lines (parsed by python/parse_vessels_scan.py).
+    // ----------------------------------------------------------------------------------------------
+    const bool do_mfs = (std::getenv("QJ_MFS") && atoi(std::getenv("QJ_MFS")) != 0);
+    if (do_mfs) {
+      const YField<Real> fld;
+      const int NJa = arterialOnly ? vessels_data::n_junc/2 : vessels_data::n_junc;
+      auto exterior = [&](const Vec3<Real>& Xs) -> bool {
+        for (int i = 0; i < NJa; i++) if (fld.f(vb.P[(size_t)i].apply_inverse_point(Xs)) >= level) return false;
+        for (const ArmSeg<Real>& sg : vb.segs) {   // clear of the ACTUAL (bent) arm centerline polylines
+          for (size_t m = 0; m + 1 < sg.cl.size(); m++) {
+            const Vec3<Real> d = sub3(sg.cl[m+1], sg.cl[m]), r = sub3(Xs, sg.cl[m]);
+            const Real dd = dot3(d,d);
+            const Real t = dd > 0 ? std::min<Real>(1, std::max<Real>(0, dot3(r,d)/dd)) : (Real)0;
+            if (nrm3(sub3(r, mul3(t,d))) <= (Real)2*sg.rtube) return false;
+          }
+        }
+        return true;
+      };
+      Vector<Real> Xsrc;
+      for (int i = 0; i < NJa; i++) {
+        const Vec3<Real> Xs = vb.P[(size_t)i].apply_point(Vec3<Real>{1.6, 1.4, 0.9});
+        if (exterior(Xs)) { Xsrc.PushBack(Xs[0]); Xsrc.PushBack(Xs[1]); Xsrc.PushBack(Xs[2]); }
+      }
+      SCTL_ASSERT_MSG(Xsrc.Dim() > 0, "QJ_MFS: no exterior Stokeslet source survived validation.");
+
+      // ---- Geometry acceptance, in sequence BEFORE the manufactured solve (same geometry/tol/near-eval):
+      //      (a) watertightness, (b) Stokes DL constant-density identity, (c) Stokes Green's identity with
+      //      the exterior sources above (on-surface). Tagged "[GEOM]" lines are parsed by parse_vessels_scan.py.
+      if (!comm.Rank()) std::cout << "\n[GEOM] watertightness (divergence check):\n";
+      divergence_check<Real>(junc, arms, tol, comm);
+      if (!comm.Rank()) std::cout << "[GEOM] Stokes DL constant-density identity:\n";
+      test_DLIdentity<Real, Stokes3D_DxU>(junc, arms, comm, tol);
+      if (!comm.Rank()) std::cout << "[GEOM] Stokes Green's identity, " << Xsrc.Dim()/3 << " exterior sources (on-surface):\n";
+      test_greens_identity<Real, Stokes3D_FxU, Stokes3D_DxU, Stokes3D_FxT>(junc, arms, comm, tol, Xsrc);
+
+      srand48(12345);   // fixed strengths => the same manufactured field for every parameter set
+      Vector<Real> Fsrc(Xsrc.Dim()); for (Long i = 0; i < Fsrc.Dim(); i++) Fsrc[i] = (Real)(drand48()-0.5);
+      Stokes3D_FxU ker_sl;
+      Vector<Real> bc_mfs; ker_sl.Eval(bc_mfs, X, Xsrc, Xsrc, Fsrc);   // X = combined node coords (local slice)
+      Vector<Real> Xtrg_mfs; if (!comm.Rank()) Xtrg_mfs = Xarm;   // rank 0 only => each target counted once
+      Vector<Real> U_mfs; Long it_mfs = 0;
+      if (!comm.Rank())
+        std::cout << "\n[MFS] interior Stokes solve, " << Xsrc.Dim()/3 << " exterior Stokeslets, "
+                  << Xarm.Dim()/3 << " interior arm targets, tol=" << std::setprecision(3) << tol << "\n";
+      solve_dirichlet_bvp<Real, Stokes3D_FxU, Stokes3D_DxU>(
+          junc, arms, comm, tol, bc_mfs, /*interior=*/true, (Real)-1., (Real)1., Xtrg_mfs, &U_mfs,
+          "stokes mfs-ext", gmaxit, nullptr, arm_sl_eta, obst_ptr, &it_mfs, /*krylov=*/nullptr);   // arm_sl_eta: SAME operator as the flow solve
+      Vector<Real> Uref; ker_sl.Eval(Uref, Xtrg_mfs, Xsrc, Xsrc, Fsrc);
+      double e2 = 0, r2 = 0, emax = 0, rmax = 0;
+      for (Long i = 0; i < U_mfs.Dim() && i < Uref.Dim(); i++) {
+        const double e = (double)(U_mfs[i]-Uref[i]);
+        e2 += e*e; r2 += (double)Uref[i]*(double)Uref[i];
+        emax = std::max(emax, std::fabs(e)); rmax = std::max(rmax, std::fabs((double)Uref[i]));
+      }
+      e2 = GlobalReduce(e2, comm, CommOp::SUM); r2 = GlobalReduce(r2, comm, CommOp::SUM);
+      emax = GlobalReduce(emax, comm, CommOp::MAX); rmax = GlobalReduce(rmax, comm, CommOp::MAX);
+      if (!comm.Rank())
+        std::cout << std::scientific << std::setprecision(6)
+                  << "[MFS] RESULT iters=" << it_mfs << " rel_L2=" << std::sqrt(e2/r2) << " rel_max=" << emax/rmax
+                  << std::defaultfloat << "\n";
+    }
+    if (!comm.Rank())
+      std::cout << "[KRYLOV] flow solve starts cold (recycling off; krylov=nullptr)\n";
+
+    // Layered per-connector-arm standing-wave deflation (QJ_DEFLATE=1): built once from the geometry, applied
+    // matrix-free inside the flow GMRES. Default OFF => bit-identical to the unpreconditioned baseline.
+    std::vector<double> Wdefl; long Mdefl = 0;
+    DeflateBlocks Bdefl; bool block_whiten = false;
+    if (std::getenv("QJ_DEFLATE") && atoi(std::getenv("QJ_DEFLATE")) != 0) {
+      // QJ_DEFLATE_BLOCK_WHITEN=1: pass the layered column-block partition so the whitening uses one tiny
+      // per-arm dsyev (over that arm's dofs) instead of one dense Mraw x Mraw dsyev -- same deflation span,
+      // far cheaper setup linear algebra. Default OFF => the monolithic global whitening (unchanged).
+      block_whiten = std::getenv("QJ_DEFLATE_BLOCK_WHITEN") && atoi(std::getenv("QJ_DEFLATE_BLOCK_WHITEN")) != 0;
+      Mdefl = build_vessels_deflation_basis<Real>(vb, X, Xn, Nj, Na, No, comm, Wdefl, block_whiten ? &Bdefl : nullptr);
+      if (!comm.Rank())
+        std::cout << "  [deflate] ON (QJ_DEFLATE=1): matrix-free deflated GMRES, " << Mdefl << " basis columns"
+                  << (block_whiten ? (Bdefl.uniform_blocks ? " [block-structured whitening, one shared transform]"
+                                                           : " [block-structured whitening]") : "") << "\n";
+    } else if (!comm.Rank()) {
+      std::cout << "  [deflate] OFF (set QJ_DEFLATE=1 to enable layered per-arm standing-wave deflation)\n";
+    }
+
+    // Formulation for the flow solve. DEFAULT here is DL-only (single layer dropped, SL_scal=0): the interior
+    // double layer -1/2 I + D closed by the rank-1 net-flux completion (QJ_COMPLETION, on by default) -- the
+    // S-free "dlflux" operator, whose only near-null mode the deflation then removes. QJ_DL_ONLY=0 restores the
+    // combined-field SL_scal=-1 operator. (DL_scal stays +1 either way; the interior jump is -1/2.)
+    const char* dlo = std::getenv("QJ_DL_ONLY");
+    const bool dl_only = (dlo == nullptr) || (atoi(dlo) != 0);   // default ON for this driver
+    const Real sl_scal = dl_only ? (Real)0. : (Real)-1.;
+    if (!comm.Rank())
+      std::cout << "  [formulation] " << (dl_only ? "DL-only (SL_scal=0, +net-flux completion)"
+                                                  : "combined-field (SL_scal=-1)")
+                << " [QJ_DL_ONLY=" << (dl_only ? 1 : 0) << "]\n";
+
+    Vector<Real> Ugrid; Long flow_iters = 0;
     const Vector<Real> sigma = solve_dirichlet_bvp<Real, Stokes3D_FxU, Stokes3D_DxU>(
-        junc, arms, comm, tol, bc, /*interior=*/true, /*SL_scal=*/(Real)-1., /*DL_scal=*/(Real)1.,
+        junc, arms, comm, tol, bc, /*interior=*/true, /*SL_scal=*/sl_scal, /*DL_scal=*/(Real)1.,
         Xgrid, &Ugrid, "stokes inflow/outflow", /*gmres_max_iter=*/gmaxit,
-        /*precond=*/nullptr, /*arm_sl_eta=*/arm_sl_eta, /*obstacles=*/obst_ptr);
+        /*precond=*/nullptr, /*arm_sl_eta=*/arm_sl_eta, /*obstacles=*/obst_ptr, &flow_iters, /*krylov=*/nullptr,
+        /*deflation_W=*/(Mdefl > 0 ? &Wdefl : nullptr), /*deflation_M=*/Mdefl,
+        /*deflation_blocks=*/(block_whiten && Mdefl > 0 ? &Bdefl : nullptr));
+    if (!comm.Rank()) std::cout << "[FLOW] RESULT iters=" << flow_iters << "\n";
+
+    // Cross-section flux probe mode: report the net-flux conservation check and exit. Must run on ALL ranks
+    // (steps 7/8 are collective, and we skip them uniformly). Only rank 0 holds probes.
+    if (xs_only) {
+      if (!comm.Rank()) {
+        // NET-FLUX CONSERVATION check: mid INLET arm vs mid OUTLET arm vs SUM over CONNECTOR arms.
+        // By incompressibility all three equal the imposed throughput p_in. Tangents are oriented so a
+        // positive flux is physical throughput (inlet: inflow; outlet: outflow; connector: arterial->venous),
+        // so the three should simply match.
+        auto disk_flux = [&](const Probe& pr) {
+          double q = 0; for (Long k = 0; k < pr.disk_n; k++) { const Long i = pr.disk_off + k;
+            q += (double)(Ugrid[3*i]*pr.t[0] + Ugrid[3*i+1]*pr.t[1] + Ugrid[3*i+2]*pr.t[2]) * (double)pr.disk_w[(size_t)k]; }
+          return q;
+        };
+        double Qconn = 0, Qin = 0, Qout = 0, worst = 0; int nc = 0;
+        for (const Probe& pr : probes) {
+          if (pr.cap_role == 0 && pr.cidx < 0) continue;   // interior non-connector arms are not probed
+          const double q = disk_flux(pr);
+          if      (pr.cap_role < 0) Qin  = q;     // inlet arm  (arterial root-cap stub)
+          else if (pr.cap_role > 0) Qout = q;     // outlet arm (venous   root-cap stub)
+          else {                                   // arterial<->venous connector arm
+            Qconn += q; nc++;
+            if (std::fabs((double)pr.Qpred) > 0) worst = std::max(worst, std::fabs(q-(double)pr.Qpred)/std::fabs((double)pr.Qpred));
+          }
+        }
+        const double ref = (double)p_in;
+        auto rel = [](double a, double b){ return std::fabs(b) > 0 ? std::fabs(a-b)/std::fabs(b) : 0.0; };
+        std::cout << std::scientific << std::setprecision(6)
+                  << "[NETFLUX] Q_inlet="    << Qin   << " rel_err=" << rel(Qin,  ref) << "\n"
+                  << "[NETFLUX] Q_outlet="   << Qout  << " rel_err=" << rel(Qout, ref) << "\n"
+                  << "[NETFLUX] Q_conn_sum=" << Qconn << " rel_err=" << rel(Qconn,ref) << "  (" << nc << " connectors)\n"
+                  << "[NETFLUX] RESULT p_in=" << ref << " Q_inlet=" << Qin << " Q_outlet=" << Qout
+                  << " Q_conn_sum=" << Qconn
+                  << " inlet_vs_conn=" << rel(Qin, Qconn) << " outlet_vs_conn=" << rel(Qout, Qconn)
+                  << " inlet_vs_outlet=" << rel(Qin, Qout) << " worst_conn_rel_err=" << worst
+                  << std::defaultfloat << "\n";
+      }
+      Comm::MPI_Finalize();
+      return 0;
+    }
 
     // ----------------------------------------------------------------------------------------------
     // (7) Interior filter: Laplace DL constant-density indicator (~ -1 interior, ~0 exterior) at the viz
@@ -708,8 +1047,8 @@ int main(int argc, char** argv) {
           const Real ut = ux*pr.t[0] + uy*pr.t[1] + uz*pr.t[2];
           const Real rho2 = ux*ux+uy*uy+uz*uz - ut*ut;               // transverse speed^2
           tmax = std::max<Real>(tmax, sqrt<Real>(rho2 < 0 ? 0 : rho2));
-          // radius of this disk point from ring index: rho = ((k/Nang)+0.5)*r/Nring
-          const Real rho = (((Real)(k/Nang)) + (Real)0.5)*pr.r/(Real)Nring;
+          // radius of this disk point (Gauss-Legendre radial node, from build_flux_disk)
+          const Real rho = pr.disk_rho[(size_t)k];
           const Real uex = umax_m*((Real)1 - (rho*rho)/(pr.r*pr.r));
           const Real d = ut - uex; e2 += d*d; ref2 += uex*uex;
         }

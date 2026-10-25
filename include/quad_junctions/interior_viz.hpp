@@ -96,6 +96,33 @@ void build_arm_panel_targets(const SlenderElemList<Real>& arms, const Comm& comm
   comm.Allgatherv(Xloc.begin(), Xloc.Dim(), Xout.begin(), rcounts.begin(), rdispls.begin());
 }
 
+// Per-panel (centerline point, as-built cross-section radius) at the panel's MID centerline node,
+// gathered (replicated) on every rank. 4 Reals/panel: Cx,Cy,Cz,r. Used to compare the nominal network
+// tube radius against the radius the CSBQ SlenderElemList actually built at mid-arm. COLLECTIVE.
+template <class Real>
+void arm_panel_centers_radii(const SlenderElemList<Real>& arms, const Comm& comm, const Long cheb,
+                             Vector<Real>& out) {
+  const Vector<Real>& cnodes = SlenderElemList<Real>::CenterlineNodes((Integer)cheb);
+  Vector<Real> s_param(1); s_param[0] = cnodes[(Integer)cheb/2];   // mid centerline node
+  Vector<Real> sin_th(4), cos_th(4);
+  for (Integer a = 0; a < 4; a++) { const double th = 0.5*M_PI*(double)a; sin_th[a] = (Real)std::sin(th); cos_th[a] = (Real)std::cos(th); }
+  Vector<Real> loc;
+  const Long np = arms.Size();
+  for (Long e = 0; e < np; e++) {
+    Vector<Real> Xs; arms.GetGeom(&Xs, nullptr, nullptr, nullptr, nullptr, s_param, sin_th, cos_th, e);
+    Real C[3]; for (Integer k = 0; k < 3; k++) C[k] = (Xs[k] + Xs[3+k] + Xs[6+k] + Xs[9+k]) * (Real)0.25;
+    Real r2 = 0; for (Integer k = 0; k < 3; k++) { const Real d = Xs[k] - C[k]; r2 += d*d; }
+    const Real r = sqrt<Real>(r2);
+    loc.PushBack(C[0]); loc.PushBack(C[1]); loc.PushBack(C[2]); loc.PushBack(r);
+  }
+  const Integer nranks = comm.Size();
+  Vector<Long> scv(1); scv[0] = loc.Dim();
+  Vector<Long> rc((Long)nranks); comm.Allgather(scv.begin(), 1, rc.begin(), 1);
+  Vector<Long> rd((Long)nranks); Long tot = 0; for (Integer i = 0; i < nranks; i++) { rd[i] = tot; tot += rc[i]; }
+  out.ReInit(tot);
+  if (tot) comm.Allgatherv(loc.begin(), loc.Dim(), out.begin(), rc.begin(), rd.begin());
+}
+
 // ---- DENSE UNIFORM interior fill of the slender arms (mirrors ../stokes-periodize-numtest VolumeVis).
 // ---- Per panel: s_order axial stations x t_order azimuth x r_order radial layers, interpolated from the
 // ---- cross-section CENTROID (k=0) out to ~the surface (k=r_order-1, at (1-1e-3) of the radius). The

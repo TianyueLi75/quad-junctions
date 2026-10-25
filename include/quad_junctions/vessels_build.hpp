@@ -109,17 +109,30 @@ VesselsBuild<Real> build_vessels_network(HybridAssembly<Real>& A, const Real lev
   const char* taper_env = std::getenv("QJ_VESSELS_TAPER");
   const Real taper = (flat_env && atoi(flat_env) != 0) ? (Real)1
                    : (taper_env ? (Real)atof(taper_env) : (Real)0.8);
+  // QJ_VESSELS_NAX_MULT=<m> (integer >= 1, default 1 = production): multiply every bent-arm axial panel count
+  // `ns` (intra-tree + leaf connectors) by m. lead/corner panel counts are scaled by m too (leadE/cornerE):
+  // bent_centerline sizes the lead/corner windows as lp/n, cp/n of the parameter range, so leaving them fixed
+  // would shrink the physical lead/corner (and curvature radius) by 1/m and change the surface. With them
+  // scaled the centerline is IDENTICAL and only the panelization is refined. Unset => byte-identical geometry.
+  const Integer nax_mult = std::getenv("QJ_VESSELS_NAX_MULT")
+      ? std::max<Integer>(1, (Integer)atoi(std::getenv("QJ_VESSELS_NAX_MULT"))) : (Integer)1;
+  const Integer leadE = nax_mult*leadP, cornerE = nax_mult*cornerP;   // effective lead/corner panel counts
+  if (nax_mult != 1 && !comm.Rank()) std::cout << "  [QJ_VESSELS_NAX_MULT] bent-arm axial panels x" << nax_mult << "\n";
+  // Max generation depth (for the QJ_VESSELS_TAPER size-spread diagnostic below).
+  int genmax = 0;
+  for (int i = 0; i < NJ; i++) genmax = std::max(genmax, vd::juncs[i].gen);
+
   std::vector<Vec3<Real>> center(NJ);
   std::vector<Real>       scale(NJ);
-  int genmax = 0;
   for (int i = 0; i < NJ; i++) {
     center[i] = world((Real)vd::juncs[i].x, (Real)vd::juncs[i].y);
     scale[i]  = std::pow(taper, (Real)vd::juncs[i].gen) * gscale;
-    genmax    = std::max(genmax, vd::juncs[i].gen);
   }
-  if (taper != (Real)0.8 && !comm.Rank())
-    std::cout << "  [QJ_VESSELS_TAPER] scale = " << taper << "^gen * " << gscale << " (production 0.8^gen); "
-              << "max gen " << genmax << " -> size spread " << std::pow((double)taper, genmax) << ":1\n";
+  if (!comm.Rank()) {
+    if (taper != (Real)0.8)
+      std::cout << "  [QJ_VESSELS_TAPER] scale = " << taper << "^gen * " << gscale << " (production 0.8^gen); "
+                << "max gen " << genmax << " -> size spread " << std::pow((double)taper, genmax) << ":1\n";
+  }
 
   // --- Sphere drape (sphere_deg > 0). The planar blueprint is kept, but every junction is placed RIGIDLY
   //     tangent to a sphere whose radius R makes the network's overall length span `sphere_deg` degrees of
@@ -243,10 +256,10 @@ VesselsBuild<Real> build_vessels_network(HybridAssembly<Real>& A, const Real lev
     std::vector<Vec3<Real>> cl; const int M = 48; cl.reserve(M+1);
     for (int m = 0; m <= M; m++) {
       const Real t = (Real)m/M;
-      Vec3<Real> p = HybridAssembly<Real>::bent_centerline(a, b, t, leadP, cornerP, ns, sc, armtrans);
+      Vec3<Real> p = HybridAssembly<Real>::bent_centerline(a, b, t, leadE, cornerE, ns, sc, armtrans);
       Real e = std::sin((double)(const_pi<Real>()*t)); e *= e;             // sin^2(pi t) mid-arm bump
       p = Vec3<Real>{p[0]+tilt[0]*e, p[1]+tilt[1]*e, p[2]+tilt[2]*e};
-      if (onsphere) p = HybridAssembly<Real>::hug_to_sphere(p, a.C, b.C, t, leadP, cornerP, ns, Osph);
+      if (onsphere) p = HybridAssembly<Real>::hug_to_sphere(p, a.C, b.C, t, leadE, cornerE, ns, Osph);
       cl.push_back(p);
     }
     return cl;
@@ -273,8 +286,8 @@ VesselsBuild<Real> build_vessels_network(HybridAssembly<Real>& A, const Real lev
     }
     const Real pspac = (Real)1.5*std::max(a.R0, b.R0);
     const Integer nmin = 2*(leadP + cornerP) + 4;   // room for either single (2*lead+corner) or racetrack
-    const Integer ns = std::max<Integer>(nmin, (Integer)std::lround((double)chord/pspac));
-    A.add_bent_arm(a, b, ns, cheb, fourier, leadP, cornerP, sc, /*transported*/armtrans,
+    const Integer ns = nax_mult * std::max<Integer>(nmin, (Integer)std::lround((double)chord/pspac));
+    A.add_bent_arm(a, b, ns, cheb, fourier, leadE, cornerE, sc, /*transported*/armtrans,
                    Vec3<Real>{0,0,0}, /*hug_O*/hugP);
     consumed[pj][pk] = true; consumed[c][0] = true;
     segs.push_back(ArmSeg<Real>{a.C, b.C, std::max(a.R0,b.R0), pj, c, sample_cl(a,b,ns,sc)});
@@ -290,7 +303,7 @@ VesselsBuild<Real> build_vessels_network(HybridAssembly<Real>& A, const Real lev
     const Real chord = nrm3(sub3(b.C, a.C));
     const Real pspac = (Real)1.5*std::max(a.R0, b.R0);
     const Integer nmin = 2*(leadP + cornerP) + 4;
-    const Integer ns = std::max<Integer>(nmin, (Integer)std::lround((double)chord/pspac));
+    const Integer ns = nax_mult * std::max<Integer>(nmin, (Integer)std::lround((double)chord/pspac));
     // The two MIDDLE connectors (4: A4<->V4 above centre, 5: A5<->V5 below) run closest and touch when the
     // network is tightly draped. Nudge them apart out of the local tangent plane: connector 4 "up" (+radial,
     // away from the sphere centre) and connector 5 "down" (-radial), by sphere_tilt_deg. The bump vanishes
@@ -307,7 +320,7 @@ VesselsBuild<Real> build_vessels_network(HybridAssembly<Real>& A, const Real lev
       if (!comm.Rank()) std::cout << "  [sphere] tilt connector " << ci << " by " << (ci==4?"+":"-")
                                   << sphere_tilt_deg << " deg (|offset|=" << std::fabs((double)amp) << ")\n";
     }
-    A.add_bent_arm(a, b, ns, cheb, fourier, leadP, cornerP, /*single_corner*/false, /*transported*/armtrans, tilt, /*hug_O*/hugP);
+    A.add_bent_arm(a, b, ns, cheb, fourier, leadE, cornerE, /*single_corner*/false, /*transported*/armtrans, tilt, /*hug_O*/hugP);
     consumed[llnkJ[ci][0]][llnkK[ci][0]] = true; consumed[llnkJ[ci][1]][llnkK[ci][1]] = true;
     segs.push_back(ArmSeg<Real>{a.C, b.C, std::max(a.R0,b.R0), llnkJ[ci][0], llnkJ[ci][1], sample_cl(a,b,ns,false,tilt)});
   }

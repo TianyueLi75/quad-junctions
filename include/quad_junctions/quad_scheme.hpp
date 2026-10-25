@@ -9,8 +9,12 @@
 // the uniform default. Set env SCTL_SELF_SCHEME=hybrid to opt any driver back to the old Hybrid path.
 //
 // Drivers pass the returned scheme straight into QuadElemList::SetQuadScheme(scheme, q, Nbeta, max_depth);
-// the Duffy path ignores q/Nbeta (its self/near orders come from the operator tol / runtime digits) but
-// still honours max_depth, so existing (q, Nbeta, max_depth) call arguments remain valid.
+// under Duffy the self AND near phases are driven SOLELY by the operator tol -> digits, so q, Nbeta, AND
+// max_depth are ALL IGNORED (earlier note here wrongly said Duffy "honours max_depth" -- it does not; the
+// Duffy near path NearInteracBlockSplitDuffy takes only `digits`). max_depth is still VALIDATED to
+// {4,8,12,30} by SetQuadScheme (so an out-of-set value like 14 still asserts) but has NO effect on the
+// result -- a Nbeta/max_depth/cov_q sweep is bit-identical. Existing (q, Nbeta, max_depth) call arguments
+// remain valid and inert. To change Duffy near/self accuracy, change the tol, not these knobs.
 #include <sctl/experimental/quad_element.hpp>
 #include <cstdlib>
 #include <cstring>

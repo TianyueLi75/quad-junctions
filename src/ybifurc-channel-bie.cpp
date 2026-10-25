@@ -74,6 +74,7 @@
 #include <quad_junctions/interior_viz.hpp>           // dense arm-volume + junction-box hex interior viz
 #include <quad_junctions/sphere_obstacles.hpp>       // spherical obstacles near the centerlines (QJ_OBSTACLE)
 #include <quad_junctions/hybrid_bie_tests.hpp>       // shared BIE identity / watertightness tests
+#include <algorithm>
 #include <array>
 #include <cctype>
 #include <cmath>
@@ -504,7 +505,7 @@ void run_flow(QuadElemList<Real>& junc, SlenderElemList<Real>& arms, const Comm&
   const Vector<Real> sigma = solve_dirichlet_bvp<Real, Stokes3D_FxU, Stokes3D_DxU>(
       junc, arms, comm, tol, bc, /*interior=*/true, SL_scal, DL_scal,
       Xgrid, &Ugrid, "stokes pressure-drop (interior)", gmres_max_iter, precond,
-      /*arm_sl_eta=*/Vector<Real>(), obstacles);
+      /*arm_sl_eta=*/Vector<Real>(), obstacles, nullptr, nullptr);
 
   // Interior mask: Laplace-DL const-density indicator (~ -1 interior, ~0 exterior). U is ZEROED in place
   // (points KEPT so the structured hex volumes stay intact) wherever a target is outside the fluid
@@ -596,7 +597,8 @@ int main(int argc, char** argv) {
     const Integer cov_q   = argi(6);
     const bool    mfg     = (mode == "mfg");
     const bool    flow    = (mode == "flow");
-    const bool    lens    = (mode == "lens" || mfg || flow);     // mfg/flow build the SAME lens racetrack surface
+    const bool    dump    = (mode == "dump");                    // dense interior A + physical b + Bint (deflation study)
+    const bool    lens    = (mode == "lens" || mfg || flow || dump);     // mfg/flow/dump build the SAME lens racetrack surface
     const Real    sep     = argf(lens ? (Real)9.6 : (Real)18);  // junction-center separation (lens: shorter run)
     const Real    tiltDeg = argf((Real)25);                      // tilt-mode bend angle (deg)
     const Integer nBentA  = argi(-1);                            // bent-arm axial panels (auto if <=0)
@@ -615,7 +617,7 @@ int main(int argc, char** argv) {
     pou_kind() = 1;   // smootherstep POU (order-exact)
 
     SCTL_ASSERT_MSG(ord >= 4 && ord <= 48 && ord % 4 == 0, "order must be a multiple of 4 in {4,...,48}.");
-    SCTL_ASSERT_MSG(mode == "lens" || mode == "tilt" || mode == "mfg" || mode == "flow", "mode must be 'lens', 'tilt', 'mfg', or 'flow'.");
+    SCTL_ASSERT_MSG(mode == "lens" || mode == "tilt" || mode == "mfg" || mode == "flow" || mode == "dump", "mode must be 'lens', 'tilt', 'mfg', 'flow', or 'dump'.");
 
     if (!comm.Rank()) {
       std::cout << "\n=== BENT-CONNECTOR hybrid Y-bifurcation [" << mode << "] ===\n";
@@ -663,6 +665,8 @@ int main(int argc, char** argv) {
 
     // Emit bent arms; collect a sampled polyline of each for the exterior-source / collision checks.
     std::vector<ArmPoly<Real>> polys;
+    std::vector<Integer> bent_ns;                                  // axial panels per bent arm (dump mode)
+    std::vector<std::pair<ArmSeam<Real>,ArmSeam<Real>>> bent_seams;
     for (auto& pr : bent) {
       const ArmSeam<Real>& sa = pr.first; const ArmSeam<Real>& sb = pr.second;
       const Real dx=sb.C[0]-sa.C[0], dy=sb.C[1]-sa.C[1], dz=sb.C[2]-sa.C[2];
@@ -676,6 +680,7 @@ int main(int argc, char** argv) {
       const Integer nmin = 2*(leadP+cornerP) + 4;   // >=4 run panels (fits single 2*lead+corner or racetrack)
       const Integer ns = (nBentA > 0) ? nBentA : std::max<Integer>(nmin, (Integer)std::lround((double)len/pspac));
       A.add_bent_arm(sa, sb, ns, cheb, fourier, leadP, cornerP, sc);
+      bent_ns.push_back(ns); bent_seams.push_back(pr);
       ArmPoly<Real> pl; pl.rtube = std::max(sa.R0, sb.R0);
       const Integer Nsamp = 400;
       for (Integer i = 0; i <= Nsamp; i++) pl.pts.push_back(HybridAssembly<Real>::bent_centerline(sa, sb, (Real)i/Nsamp, leadP, cornerP, ns, sc));
@@ -758,6 +763,155 @@ int main(int argc, char** argv) {
 
     if (geomOnly) {
       if (!comm.Rank()) std::cout << "  [geom-only] wrote " << tag << "-{junc,arms}.vtu; skipping BIE.\n";
+      Comm::MPI_Finalize();
+      return 0;
+    }
+
+    if (dump) {
+      // Dense interior DL + rank-1 flux-completion operator A = (-1/2 I + D) + (w/area) Xn l^T (sl_scal=0),
+      // the PHYSICAL p_in/p_out Dirichlet RHS b (identical to run_flow's bc), and a field-evaluation matrix
+      // Bint (DL only, no jump/completion) at 10 interior targets on the horizontal run of bent arm 0.
+      // Files: <A>, .X0, .Xn0, .arm, .s, .armL, .b, .Bint, .tgt (Matrix<Real>::Write binary).
+      SCTL_ASSERT_MSG(comm.Size() == 1, "dump: serial only");
+      const char* dp = std::getenv("QJ_DUMP_A"); SCTL_ASSERT_MSG(dp, "dump: set QJ_DUMP_A=<path>");
+      Vector<Real> X, Xn; Long Nj, Na; combined_nodes(junc, arms, X, Xn, Nj, Na);
+      const Long N = X.Dim(), Nn = N/3;
+      junc.SetQuadScheme(QJDefaultScheme<Real>(), cov_q, Nbeta, md);
+      const Long maxdof = std::getenv("QJ_SPECTRUM_MAXDOF") ? std::atol(std::getenv("QJ_SPECTRUM_MAXDOF")) : (Long)12000;
+      std::cout << "  [dump] Nj=" << Nj << " Na=" << Na << " N(dof)=" << N << " dense=" << (double)N*N*8/1073741824.0 << " GB\n";
+      SCTL_ASSERT_MSG(N <= maxdof, "dump: N exceeds QJ_SPECTRUM_MAXDOF guard");
+      // Per-node arm id + arclength (see stash): arm nodes follow junction nodes, panels in emission order.
+      Matrix<Real> armid(1, Nn), sarc(1, Nn); for (Long q = 0; q < Nn; q++) { armid[0][q] = -1; sarc[0][q] = 0; }
+      Matrix<Real> armL((Long)bent.size(), 3);
+      Vector<Real> Xtrg; Long nt = 0;
+      Long node0 = Nj;
+      for (size_t k = 0; k < bent.size(); k++) {
+        const auto& sa = bent_seams[k].first; const auto& sb = bent_seams[k].second; const Integer ns = bent_ns[k];
+        const Integer M = 20*ns;   // polyline samples
+        std::vector<Vec3<Real>> pt(M+1); std::vector<Real> cum(M+1, 0);
+        for (Integer i = 0; i <= M; i++) {
+          pt[i] = HybridAssembly<Real>::bent_centerline(sa, sb, (Real)i/M, leadP, cornerP, ns, false);
+          if (i) { const Real dx=pt[i][0]-pt[i-1][0], dy=pt[i][1]-pt[i-1][1], dz=pt[i][2]-pt[i-1][2]; cum[i] = cum[i-1] + std::sqrt(dx*dx+dy*dy+dz*dz); }
+        }
+        armL[(Long)k][0] = cum[M]; armL[(Long)k][1] = std::max(sa.R0, sb.R0); armL[(Long)k][2] = ns;
+        if (k == 0) {
+          // Interior targets: 10 stations along the longest contiguous horizontal (|t.xhat|>0.99) stretch
+          // of the dense polyline, + 0.15 R random cross-section offset.
+          Integer bs = 0, bl = 0, cs = -1;   // best start / length (in segments), current start
+          for (Integer i = 0; i < M; i++) {
+            const Real dx=pt[i+1][0]-pt[i][0], dy=pt[i+1][1]-pt[i][1], dz=pt[i+1][2]-pt[i][2];
+            const Real nn = std::sqrt(dx*dx+dy*dy+dz*dz);
+            const bool hor = nn > 0 && std::fabs(dx/nn) > (Real)0.99;
+            if (hor) { if (cs < 0) cs = i; if (i-cs+1 > bl) { bl = i-cs+1; bs = cs; } } else cs = -1;
+          }
+          SCTL_ASSERT_MSG(bl > 0, "dump: no horizontal stretch found on bent arm 0");
+          const Real x_lo = std::min(pt[bs][0], pt[bs+bl][0]), x_hi = std::max(pt[bs][0], pt[bs+bl][0]);
+          nt = 10; Xtrg.ReInit(3*nt);
+          std::srand(12345);
+          const Real Rarm = armL[0][1];
+          for (Long q = 0; q < nt; q++) {
+            const Real xk = x_lo + ((Real)q+(Real)0.5)/nt*(x_hi-x_lo);
+            Vec3<Real> c = pt[bs];
+            for (Integer i = bs; i < bs+bl; i++) {
+              const Real a = pt[i][0], b2 = pt[i+1][0];
+              if ((xk-a)*(xk-b2) <= 0 && a != b2) { const Real f = (xk-a)/(b2-a);
+                for (int d = 0; d < 3; d++) c[d] = pt[i][d] + f*(pt[i+1][d]-pt[i][d]); break; }
+            }
+            const Real xy = (Real)2*std::rand()/RAND_MAX - 1, xz = (Real)2*std::rand()/RAND_MAX - 1;
+            Xtrg[3*q] = xk; Xtrg[3*q+1] = c[1] + (Real)0.15*Rarm*xy; Xtrg[3*q+2] = c[2] + (Real)0.15*Rarm*xz;
+          }
+          std::cout << "  [dump] targets: horizontal stretch x in [" << x_lo << "," << x_hi << "], nt=" << nt << "\n";
+        }
+        for (Integer p = 0; p < ns; p++) for (Long q = 0; q < cheb*fourier; q++, node0++) {
+          const Integer i0 = std::max<Integer>(0, (p-1)*20), i1 = std::min<Integer>(M, (p+2)*20);
+          Real best = 1e300; Integer bi = i0;
+          for (Integer i = i0; i <= i1; i++) {
+            const Real dx=X[3*node0]-pt[i][0], dy=X[3*node0+1]-pt[i][1], dz=X[3*node0+2]-pt[i][2];
+            const Real d = dx*dx+dy*dy+dz*dz; if (d < best) { best = d; bi = i; }
+          }
+          armid[0][node0] = (Real)k; sarc[0][node0] = cum[bi];
+        }
+      }
+      // ---- Operator A: DL + jump(-1/2) + rank-1 flux completion (sl_scal = 0) ----
+      StokesBIO<Real> Op((Real)0, (Real)1, comm); Op.SetAccuracy(tol);
+      Op.AddElemList(junc, "0_junc"); Op.AddElemList(arms, "1_arms"); Op.SetTargetCoord(X);
+      Matrix<Real> Am(N, N); Vector<Real> e(N), col; std::vector<double> lflux(N, 0.0); Real area = 0;
+      for (Long c = 0; c < N; c++) {
+        e = 0; e[c] = 1;
+        Op.ComputePotential(col, e); SCTL_ASSERT(col.Dim() == N);
+        for (Long r = 0; r < N; r++) Am(r, c) = col[r];
+        Am(c, c) += (Real)-0.5;
+        Real area_c = 0, absf_c = 0;
+        const Real phi = rhs_net_flux<Real>(junc, arms, Xn, e, Nj, Na, tol, comm, area_c, absf_c);
+        lflux[c] = (double)phi; area = area_c;
+        if (N >= 20 && (c+1) % (N/20) == 0) std::cout << "  [dump] A col " << (100*(c+1)/N) << "%\r" << std::flush;
+      }
+      const char* compw_env = std::getenv("QJ_COMPLETION_W");
+      const Real completion_w = compw_env ? (Real)atof(compw_env) : (Real)1;
+      const Real cscale = (area > 0 ? completion_w/area : 0);
+      for (Long r = 0; r < N; r++) for (Long c2 = 0; c2 < N; c2++) Am(r, c2) += cscale * Xn[r] * (Real)lflux[c2];
+
+      // ---- Physical RHS b: same cap setup as run_flow ----
+      std::vector<FlowCap<Real>> caps;
+      for (const ArmSeam<Real>* s : {&JA.seam(0), &JB.seam(0)}) {
+        FlowCap<Real> c;
+        c.C = Vec3<Real>{s->C[0]+(s_cap-s->a0)*s->u[0], s->C[1]+(s_cap-s->a0)*s->u[1], s->C[2]+(s_cap-s->a0)*s->u[2]};
+        c.u = s->u; c.R0 = s->R0;
+        if (c.C[0] < 0) { c.sgn = -1; c.p = p_in;  }
+        else            { c.sgn = +1; c.p = p_out; }
+        caps.push_back(c);
+      }
+      {
+        Vector<Real> Xf, Xnf, wts, dist; Vector<Long> cnt;
+        junc.GetFarFieldNodes(Xf, Xnf, wts, dist, cnt, tol);
+        const Long Nf = wts.Dim();
+        Vector<Real> g((Long)caps.size()); g = 0;
+        for (Long i = 0; i < Nf; i++) {
+          const Vec3<Real> Xp{Xf[3*i], Xf[3*i+1], Xf[3*i+2]}, nrm{Xnf[3*i], Xnf[3*i+1], Xnf[3*i+2]};
+          for (size_t c = 0; c < caps.size(); c++) { Real prof;
+            if (cap_profile<Real>(Xp, caps[c], prof)) { g[(Long)c] += wts[i]*prof*dot3(caps[c].u, nrm); break; } }
+        }
+        for (size_t c = 0; c < caps.size(); c++) {
+          SCTL_ASSERT_MSG(std::fabs((double)g[(Long)c]) > 1e-30, "degenerate cap flux factor");
+          caps[c].amp = (Real)caps[c].sgn * caps[c].p / g[(Long)c];
+        }
+      }
+      Vector<Real> bvec(N);
+      for (Long i = 0; i < Nn; i++) {
+        const Vec3<Real> v = flow_bc_vel<Real>(Vec3<Real>{X[3*i], X[3*i+1], X[3*i+2]}, caps);
+        bvec[3*i] = v[0]; bvec[3*i+1] = v[1]; bvec[3*i+2] = v[2];
+      }
+      {
+        Real ar_b = 0, af_b = 0;
+        const Real phi_b = rhs_net_flux<Real>(junc, arms, Xn, bvec, Nj, Na, tol, comm, ar_b, af_b);
+        std::cout << "  [dump] b net flux = " << phi_b << " (abs " << af_b << ")\n";
+        SCTL_ASSERT_MSG(std::fabs((double)phi_b) < 1e-6, "net flux not zero -- interior Stokes BVP incompatible");
+      }
+
+      // ---- Eval matrix Bint: DL-only potential at the interior targets (no jump, no completion) ----
+      StokesBIO<Real> Op2((Real)0, (Real)1, comm); Op2.SetAccuracy(tol);
+      Op2.AddElemList(junc, "0_junc"); Op2.AddElemList(arms, "1_arms"); Op2.SetTargetCoord(Xtrg);
+      Matrix<Real> Bm(3*nt, N); Vector<Real> e2(N), uc;
+      for (Long c = 0; c < N; c++) {
+        e2 = 0; e2[c] = 1; Op2.ComputePotential(uc, e2); SCTL_ASSERT(uc.Dim() == 3*nt);
+        for (Long r = 0; r < 3*nt; r++) Bm(r, c) = uc[r];
+      }
+
+      Am.Write(dp);
+      Matrix<Real> Xm(1, N), Xnm(1, N), bm(1, N), tm(1, 3*nt);
+      for (Long q = 0; q < N; q++) { Xm[0][q] = X[q]; Xnm[0][q] = Xn[q]; bm[0][q] = bvec[q]; }
+      for (Long q = 0; q < 3*nt; q++) tm[0][q] = Xtrg[q];
+      Xm.Write((std::string(dp)+".X0").c_str()); Xnm.Write((std::string(dp)+".Xn0").c_str());
+      armid.Write((std::string(dp)+".arm").c_str()); sarc.Write((std::string(dp)+".s").c_str());
+      armL.Write((std::string(dp)+".armL").c_str());
+      bm.Write((std::string(dp)+".b").c_str());
+      Bm.Write((std::string(dp)+".Bint").c_str());
+      tm.Write((std::string(dp)+".tgt").c_str());
+      for (size_t k = 0; k < bent.size(); k++)
+        std::cout << "\n  [dump] arm " << k << ": L=" << armL[(Long)k][0] << " R=" << armL[(Long)k][1]
+                  << " L/R=" << armL[(Long)k][0]/armL[(Long)k][1] << " panels=" << bent_ns[k];
+      std::cout << "\n  [dump] N=" << N << " nt=" << nt << " area=" << area << " size=" << (double)N*N*8/1073741824.0
+                << " GB\n  [dump] wrote " << dp << "{,.X0,.Xn0,.arm,.s,.armL,.b,.Bint,.tgt}\n  [dump] dump complete\n";
       Comm::MPI_Finalize();
       return 0;
     }

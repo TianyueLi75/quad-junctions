@@ -82,13 +82,27 @@ namespace sctl {
 
       /**
        * Set the singular-quadrature scheme.
-       * @param[in] s scheme (see QuadScheme; default Adaptive).
-       * @param[in] q derivative-flattening parameter for RectPolar (ignored for Adaptive).
-       * @param[in] cov_order RectPolar GL points per direction (Nbeta, Bruno 2018);
-       * decoupled from field order. 0 falls back to the tolerance-derived order.
-       * @param[in] max_depth adaptive dyadic-refinement depth cap for the Adaptive scheme
-       * (self + near) and the near phase of Hybrid; must be one of {4,8,12,30}. Ignored by
-       * the RectPolar self/near phases.
+       *
+       * DEFAULT SCHEME (quad-junctions): the project uses QuadScheme::Duffy everywhere via
+       * quad_junctions::QJDefaultScheme() (opt out only with env SCTL_SELF_SCHEME=hybrid).
+       * ===> Under Duffy, ALL THREE of `q`, `cov_order`/Nbeta, and `max_depth` DO NOTHING. <===
+       * Both the Duffy self phase (SelfInteracBlockDuffy) and the Duffy near phase
+       * (NearInteracBlockSplitDuffy) are driven SOLELY by the operator tolerance -> `digits`
+       * (via DuffyTOrder); none of q/cov_order/max_depth is read on the Duffy code path (see the
+       * dispatch at SelfUsesDuffy() in quad_element.cpp). They can still be PASSED (so existing
+       * (q, Nbeta, max_depth) call sites stay valid), and `max_depth` is still VALIDATED to
+       * {4,8,12,30} by the assert below -- but passing a different value changes the result by
+       * EXACTLY NOTHING under Duffy (bit-identical; verified by a Nbeta/max_depth/cov_q sweep).
+       * So to improve Duffy near/self accuracy, change the operator TOLERANCE, never these knobs.
+       *
+       * The parameters below matter ONLY for the non-Duffy schemes (Adaptive / RectPolar / Hybrid):
+       * @param[in] s scheme (see QuadScheme; library default Adaptive, project default Duffy).
+       * @param[in] q derivative-flattening parameter for RectPolar (ignored for Adaptive AND Duffy).
+       * @param[in] cov_order RectPolar GL points per direction (Nbeta, Bruno 2018); decoupled from
+       * field order. 0 falls back to the tolerance-derived order. (ignored for Adaptive AND Duffy).
+       * @param[in] max_depth adaptive dyadic-refinement depth cap for the Adaptive scheme (self +
+       * near) and the near phase of Hybrid; must be one of {4,8,12,30}. Ignored by the RectPolar
+       * self/near phases AND by Duffy (validated but unused -- Duffy is tol/digits-driven).
        */
       void SetQuadScheme(QuadScheme s, Integer q = 6, Integer cov_order = 0, Integer max_depth = 30) {
         SCTL_ASSERT_MSG(max_depth == 4 || max_depth == 8 || max_depth == 12 || max_depth == 30, "Adaptive max_depth must be one of {4,8,12,30}.");
